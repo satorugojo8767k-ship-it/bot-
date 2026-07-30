@@ -23,27 +23,26 @@ import asyncpg
 import hashlib
 import math
 import datetime
-from flask import Flask, request, jsonify
+from flask import Flask
 import threading
+from waitress import serve
 
 # ─── CONFIGURATION ───
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 MY_OWNER_IDS = {int(x) for x in os.environ.get("OWNER_IDS", "8909378644,8711082433").split(",") if x.strip()}
-# ─── PREMIUM PAYMENT CONFIG ───
 UPI_ID = os.environ.get("UPI_ID", "paryush01@nyes")
-QR_IMAGE_PATH = os.environ.get("QR_IMAGE_PATH", "upi_qr.jpg")  # local file ya GitHub raw URL
+QR_IMAGE_PATH = os.environ.get("QR_IMAGE_PATH", "upi_qr.jpg")
 PREMIUM_FEATURES_LINK = os.environ.get("PREMIUM_FEATURES_LINK", "https://t.me/userbotsupport_ZA/20")
 
 # ─── CHANNEL VERIFICATION ───
 REQUIRED_CHANNELS = [
-    {"id": -1003896742623, "invite": "https://t.me/+slCWwd6XmSc5OTU9", "name": "Channel 1"},
+   # {"id": -1003896742623, "invite": "https://t.me/+slCWwd6XmSc5OTU9", "name": "Channel 1"},
     {"id": -1003971062167, "invite": "https://t.me/botscripts18", "name": "Channel 2"},
     {"id": -1004452969098, "invite": "https://t.me/userbotsupport_ZA", "name": "Channel 3"},
 ]
 
-# ─── BROADCAST USERS STORAGE ───
 USERS_FILE = "broadcast_users.json"
 
 def load_users():
@@ -70,24 +69,19 @@ async def init_db():
         raise Exception("DATABASE_URL not set")
     db_pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
     async with db_pool.acquire() as conn:
-        # ─── user_sessions table ───
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_sessions (
                 user_id BIGINT PRIMARY KEY,
                 session_encrypted TEXT NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)   # <-- closing triple quote HERE
-
-        # ─── app_config table ───
+        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS app_config (
                 key_name TEXT PRIMARY KEY,
                 key_value TEXT NOT NULL
             )
         """)
-
-        # ─── premium_users table ───
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS premium_users (
                 user_id BIGINT PRIMARY KEY,
@@ -97,13 +91,39 @@ async def init_db():
                 status TEXT DEFAULT 'active'
             )
         """)
-
-        # ─── premium_protections table ───
+        await conn.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                               WHERE table_name='premium_users' AND column_name='plan') THEN
+                    ALTER TABLE premium_users ADD COLUMN plan TEXT NOT NULL DEFAULT 'monthly';
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                               WHERE table_name='premium_users' AND column_name='start_date') THEN
+                    ALTER TABLE premium_users ADD COLUMN start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                               WHERE table_name='premium_users' AND column_name='expiry_date') THEN
+                    ALTER TABLE premium_users ADD COLUMN expiry_date TIMESTAMP;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                               WHERE table_name='premium_users' AND column_name='status') THEN
+                    ALTER TABLE premium_users ADD COLUMN status TEXT DEFAULT 'active';
+                END IF;
+            END $$;
+        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS premium_protections (
                 user_id BIGINT,
                 command_name TEXT,
                 PRIMARY KEY (user_id, command_name)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_wallet (
+                user_id BIGINT PRIMARY KEY,
+                balance DECIMAL(10,2) DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -114,10 +134,7 @@ async def get_encryption_key():
             return row['key_value']
         else:
             new_key = Fernet.generate_key().decode()
-            await conn.execute(
-                "INSERT INTO app_config (key_name, key_value) VALUES ($1, $2)",
-                "encryption_key", new_key
-            )
+            await conn.execute("INSERT INTO app_config (key_name, key_value) VALUES ($1, $2)", "encryption_key", new_key)
             return new_key
 
 async def init_cipher():
@@ -161,7 +178,45 @@ async def delete_session(user_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM user_sessions WHERE user_id = $1", user_id)
 
-# ─── PREMIUM MANAGEMENT ─────────────────────────────────────────────
+# ─── WALLET ────────────────────────────────────────────────────────
+async def get_balance(user_id: int) -> float:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT balance FROM user_wallet WHERE user_id = $1", user_id)
+        return float(row['balance']) if row else 0.0
+
+async def add_balance(user_id: int, amount: float):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO user_wallet (user_id, balance) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET balance = user_wallet.balance + $2, updated_at = CURRENT_TIMESTAMP
+        """, user_id, amount)
+
+async def deduct_balance(user_id: int, amount: float):
+    bal = await get_balance(user_id)
+    if bal < amount:
+        raise ValueError("Insufficient balance")
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE user_wallet SET balance = balance - $2, updated_at = CURRENT_TIMESTAMP WHERE user_id = $1
+        """, user_id, amount)
+
+# ─── PREMIUM ──────────────────────────────────────────────────────
+PROTECTED_COMMANDS = [
+    "reply", "sreply", "rr", "srr", "flag", "sflag", "hrr", "shrr",
+    "replygod", "sgod", "customraid", "stopcustomraid",
+    "shayariraid", "sshayariraid", "rizzraid", "srizzraid",
+    "pickupraid", "spickupraid", "romanceraid", "sromanceraid",
+    "trollraid", "strollraid", "ragebaitraid", "sragebaitraid",
+    "roastraid", "sroastraid",
+    "attackraid", "sattackraid", "warraid", "swarraid",
+    "savageraid", "ssavageraid", "ultraraid", "sultraraid",
+    "shameraid", "sshameraid", "dissraid", "sdissraid",
+    "devilraid", "sdevilraid", "karmaraid", "skarmaraid",
+    "doomraid", "sdoomraid",
+    "spray", "dspray", "tspray", "rspray", "multispray", "countspray",
+    "deathgod", "sdeathgod"
+]
+
 async def add_premium_user(user_id: int, plan: str, days: int):
     expiry = datetime.datetime.now() + datetime.timedelta(days=days)
     async with db_pool.acquire() as conn:
@@ -171,23 +226,31 @@ async def add_premium_user(user_id: int, plan: str, days: int):
             ON CONFLICT (user_id) DO UPDATE
             SET plan = $2, expiry_date = $3, status = 'active', start_date = CURRENT_TIMESTAMP
         """, user_id, plan, expiry)
+    for cmd in PROTECTED_COMMANDS:
+        await add_protection(user_id, cmd)
+    try:
+        await MAIN_BOT_CLIENT.send_message(
+            user_id,
+            f"🛡️ **Premium Activated!**\n\n"
+            f"You are now protected from all raids, spam, and deathgod attacks.\n"
+            f"Your userbot will automatically ignore these attacks.\n\n"
+            f"📅 Plan: {plan.upper()}\n"
+            f"⏳ Expires: {expiry.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"Use `.premiumstatus` in your userbot to check your premium details."
+        )
+    except:
+        pass
 
 async def get_premium_user(user_id: int):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM premium_users WHERE user_id = $1", user_id)
-        if row:
-            return dict(row)
-        return None
+        return dict(row) if row else None
 
 async def check_premium_status(user_id: int):
     data = await get_premium_user(user_id)
-    if not data:
+    if not data or data['status'] != 'active':
         return None
-    if data['status'] != 'active':
-        return None
-    expiry = data['expiry_date']
-    if expiry < datetime.datetime.now():
-        # expired
+    if data['expiry_date'] < datetime.datetime.now():
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE premium_users SET status = 'expired' WHERE user_id = $1", user_id)
         return None
@@ -216,7 +279,6 @@ async def get_protections(user_id: int) -> Set[str]:
     return {row['command_name'] for row in rows}
 
 async def is_protected(target_user: int, command: str) -> bool:
-    # check if target has premium and protection for this command
     prem = await check_premium_status(target_user)
     if not prem:
         return False
@@ -224,20 +286,29 @@ async def is_protected(target_user: int, command: str) -> bool:
     return command in protections
 
 # ─── MAIN BOT ─────────────────────────────────────────────────────
-MAIN_BOT_CLIENT = TelegramClient("main_bot_session", API_ID, API_HASH)
+MAIN_BOT_CLIENT = TelegramClient(
+    "main_bot_session",
+    API_ID,
+    API_HASH,
+    connection_retries=3,
+    auto_reconnect=False
+)
 
 active_userbots = {}
 user_sessions = {}
+user_states = {}
 
-print("🚀 Main Bot started with Admin Logger Engine...")
-print("DEBUG: MAIN_BOT_CLIENT type =", type(MAIN_BOT_CLIENT))   # ✅ This is correct
+# Store all running tasks for proper cleanup
+running_tasks = set()
+
+print("🚀 Main Bot started...")
 
 async def is_user_in_channel(user_id, channel_data):
     try:
-        channel = await MAIN_BOT_CLIENT.get_entity(channel_data["id"])   # 8 spaces
-        await MAIN_BOT_CLIENT.get_permissions(channel, user_id)          # 8 spaces – same as above
+        channel = await MAIN_BOT_CLIENT.get_entity(channel_data["id"])
+        await MAIN_BOT_CLIENT.get_permissions(channel, user_id)
         return True
-    except Exception:
+    except:
         return False
 
 def get_join_buttons():
@@ -248,18 +319,31 @@ def get_join_buttons():
     return buttons
 
 async def shutdown_handler(sig, frame):
-    print("🛑 Shutting down gracefully...")
+    print("🛑 Shutting down...")
     for uid in broadcast_users:
         try:
-            await MAIN_BOT_CLIENT.send_message(uid, "⚠️ **Bot is going offline for maintenance/restart.**\nWe'll be back soon!")
+            await MAIN_BOT_CLIENT.send_message(uid, "⚠️ Bot is going offline for maintenance.\nWe'll be back soon!")
             await asyncio.sleep(0.5)
         except:
             pass
+    
+    # Cancel all running tasks properly
+    tasks_to_cancel = []
     for uid, client in active_userbots.items():
         try:
             await client.disconnect()
         except:
             pass
+    
+    # Cancel all userbot tasks
+    for task in list(running_tasks):
+        if not task.done():
+            task.cancel()
+            try:
+                await asyncio.shield(task)
+            except:
+                pass
+    
     await MAIN_BOT_CLIENT.disconnect()
     sys.exit(0)
 
@@ -271,10 +355,9 @@ async def safe_reply(event, text, buttons=None, **kwargs):
         return await event.reply(text, buttons=buttons, **kwargs)
     except FloodWaitError as e:
         wait = e.seconds + 1
-        print(f"⏳ Main bot flood wait: {wait}s")
         await asyncio.sleep(wait)
         return await event.reply(text, buttons=buttons, **kwargs)
-    except Exception:
+    except:
         return None
 
 async def safe_respond(event, text, **kwargs):
@@ -282,10 +365,9 @@ async def safe_respond(event, text, **kwargs):
         return await event.respond(text, **kwargs)
     except FloodWaitError as e:
         wait = e.seconds + 1
-        print(f"⏳ Main bot flood wait: {wait}s")
         await asyncio.sleep(wait)
         return await event.respond(text, **kwargs)
-    except Exception:
+    except:
         return None
 
 async def safe_edit(event, text, buttons=None, **kwargs):
@@ -293,12 +375,11 @@ async def safe_edit(event, text, buttons=None, **kwargs):
         return await event.edit(text, buttons=buttons, **kwargs)
     except FloodWaitError as e:
         wait = e.seconds + 1
-        print(f"⏳ Main bot flood wait: {wait}s")
         await asyncio.sleep(wait)
         return await event.edit(text, buttons=buttons, **kwargs)
     except MessageNotModifiedError:
         pass
-    except Exception:
+    except:
         return None
 
 async def safe_send_main(chat, text, **kwargs):
@@ -306,33 +387,49 @@ async def safe_send_main(chat, text, **kwargs):
         return await MAIN_BOT_CLIENT.send_message(chat, text, **kwargs)
     except FloodWaitError as e:
         wait = e.seconds + 1
-        print(f"⏳ Main bot flood wait: {wait}s")
         await asyncio.sleep(wait)
         return await MAIN_BOT_CLIENT.send_message(chat, text, **kwargs)
-    except Exception:
+    except:
         return None
 
-# ─── MAIN BOT HANDLERS ─────────────────────────────────────────────
+def plan_price(plan):
+    return {"monthly": 45, "quarterly": 120, "yearly": 490}[plan]
+
+def plan_price_str(plan):
+    return f"₹{plan_price(plan)}"
+
+# ─── MAIN HANDLERS ─────────────────────────────────────────────────
+
 @MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/start"))
 async def start_handler(event):
     user_id = event.sender_id
     chat_id = event.chat_id
     broadcast_users.add(user_id)
     save_users(broadcast_users)
+    buttons = [
+        [types.KeyboardButtonCallback("💎 Buy Premium", data="buy_menu")],
+        [types.KeyboardButtonCallback("💰 Deposit / Check Balance", data="deposit")],
+        [types.KeyboardButtonUrl("🔗 Premium Features", url=PREMIUM_FEATURES_LINK)],
+    ]
+    bal = await get_balance(user_id)
     await safe_reply(
         event,
-        "╔═══════════════════════════════════════════╗\n"
-        "║  ✦ 👑 ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️ 𝐀𝐔𝐓𝐎-𝐃𝐄𝐏𝐋𝐎𝐘 👑 ✦  ║\n"
-        "╚═══════════════════════════════════════════╝\n\n"
-        "Welcome to the **Ultimate Userbot Manager**.\n"
-        "• To start your personal userbot, type `/login`\n"
-        "• To stop it, use `/logout`\n"
-        "• To buy premium, type `/buy`\n\n"
-        "Enjoy the premium experience! 🚀"
+        f"╔═══════════════════════════════════════════╗\n"
+        f"║  ✦ 👑 ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️ 𝐀𝐔𝐓𝐎-𝐃𝐄𝐏𝐋𝐎𝐘 👑 ✦  ║\n"
+        f"╚═══════════════════════════════════════════╝\n\n"
+        f"Welcome to the **Ultimate Userbot Manager**.\n"
+        f"• To start your personal userbot, type `/login`\n"
+        f"• To stop it, use `/logout`\n"
+        f"• Use the buttons below to buy premium or deposit.\n\n"
+        f"💰 **Your Wallet Balance:** ₹{bal:.2f}\n\n"
+        "Enjoy the premium experience! 🚀",
+        buttons=buttons
     )
 
 @MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/login"))
 async def login_handler(event):
+    if not event.is_private:
+        return
     user_id = event.sender_id
     chat_id = event.chat_id
 
@@ -342,7 +439,7 @@ async def login_handler(event):
             not_joined.append(ch)
 
     if not_joined:
-        msg = "❌ **You must join all the following channels first:**\n\n"
+        msg = "❌ **You must join all channels first:**\n\n"
         for ch in not_joined:
             msg += f"• {ch['name']} ({ch['invite']})\n"
         msg += "\nAfter joining, click the **'✅ I have joined all'** button below."
@@ -350,13 +447,218 @@ async def login_handler(event):
         await safe_reply(event, msg, buttons=buttons)
         return
 
-    user_states[chat_id] = {"step": "NUMBER"}
+    user_states[user_id] = {"step": "NUMBER"}
     await safe_reply(
         event,
         "📱 **Step 1:** Please send your Telegram phone number **with country code**.\n"
         "Example: `+919876543210`"
     )
 
+# ─── PHONE NUMBER HANDLER ─────────────────────────────────────────
+@MAIN_BOT_CLIENT.on(events.NewMessage)
+async def handle_login_phone(event):
+    if not event.is_private:
+        return
+    if event.raw_text and event.raw_text.startswith('/'):
+        return
+    user_id = event.sender_id
+    state = user_states.get(user_id)
+    if not state or state.get("step") != "NUMBER":
+        return
+
+    phone = event.raw_text.strip()
+    phone = re.sub(r'[\s\-\(\)]', '', phone)
+    
+    # Fix: Better phone validation
+    if not re.match(r'^\+?\d{10,15}$', phone):
+        await safe_reply(event, "❌ Invalid phone number format. Please send with country code, e.g., `+919876543210`")
+        return
+
+    try:
+        # Use a fresh StringSession
+        temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await temp_client.connect()
+        await temp_client.send_code_request(phone)
+        user_states[user_id]["step"] = "CODE"
+        user_states[user_id]["phone"] = phone
+        user_states[user_id]["temp_client"] = temp_client
+        await safe_reply(event, "📨 **Code sent!** Please send the numeric code (e.g., `12345` or `1 2 3 4 5`).")
+    except ValueError as e:
+        await safe_reply(event, f"❌ Invalid phone number: {str(e)}. Check the number and country code.")
+        user_states.pop(user_id, None)
+        try:
+            await temp_client.disconnect()
+        except:
+            pass
+    except FloodWaitError as e:
+        await safe_reply(event, f"⏳ Too many requests. Please wait {e.seconds} seconds and try again.")
+        user_states.pop(user_id, None)
+        try:
+            await temp_client.disconnect()
+        except:
+            pass
+    except Exception as e:
+        await safe_reply(event, f"❌ Failed to send code: {str(e)}")
+        user_states.pop(user_id, None)
+        try:
+            await temp_client.disconnect()
+        except:
+            pass
+
+# ─── CODE HANDLER ──────────────────────────────────────────────────
+@MAIN_BOT_CLIENT.on(events.NewMessage)
+async def handle_login_code(event):
+    if not event.is_private:
+        return
+    if event.raw_text and event.raw_text.startswith('/'):
+        return
+    user_id = event.sender_id
+    state = user_states.get(user_id)
+    if not state or state.get("step") != "CODE":
+        return
+
+    code = event.raw_text.strip().replace(" ", "").replace("-", "")
+    
+    if not code.isdigit():
+        await safe_reply(event, "❌ Please send only the numeric code (e.g., `12345`). Spaces are allowed.")
+        return
+
+    temp_client = state.get("temp_client")
+    phone = state.get("phone")
+    if not temp_client or not phone:
+        await safe_reply(event, "❌ Login session expired. Please start again with `/login`.")
+        user_states.pop(user_id, None)
+        return
+
+    try:
+        # Try signing in with code
+        await temp_client.sign_in(phone, code=code)
+        session_str = temp_client.session.save()
+        await save_session(user_id, session_str)
+        
+        # Create task and track it
+        task = asyncio.create_task(run_user_bot_with_restart(session_str, user_id))
+        task.set_name(f"userbot_restart_{user_id}")
+        running_tasks.add(task)
+        task.add_done_callback(running_tasks.discard)
+        
+        # Send login notification to owners
+        user_entity = await MAIN_BOT_CLIENT.get_entity(user_id)
+        user_name = user_entity.first_name or "Unknown"
+        username = f"@{user_entity.username}" if user_entity.username else "No username"
+        # FIX: Show first 3 digits, hide middle, show last 3 digits
+        if len(phone) > 6:
+            phone_display = phone[:3] + "*" * (len(phone) - 6) + phone[-3:]
+        else:
+            phone_display = phone[:3] + "*" * (len(phone) - 3) if len(phone) > 3 else phone
+            
+        for owner in MY_OWNER_IDS:
+            try:
+                await MAIN_BOT_CLIENT.send_message(
+                    owner,
+                    f"🔐 **User Login**\n"
+                    f"👤 Name: {user_name}\n"
+                    f"🆔 ID: `{user_id}`\n"
+                    f"🔗 Username: {username}\n"
+                    f"📱 Phone: `{phone_display}`\n"
+                    f"⏰ Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            except:
+                pass
+        await safe_reply(event, "✅ **Userbot started successfully!**\nYou can now use it in groups.\nType `.menu` to see commands.")
+        user_states.pop(user_id, None)
+        await temp_client.disconnect()
+    except SessionPasswordNeededError:
+        state["step"] = "PASSWORD"
+        await safe_reply(event, "🔐 **Two-factor authentication is enabled.**\nPlease send your 2FA password.")
+    except FloodWaitError as e:
+        wait = e.seconds + 1
+        await safe_reply(event, f"⏳ Too many attempts. Please wait **{wait} seconds** and try again.")
+    except Exception as e:
+        error_msg = str(e)
+        if "code invalid" in error_msg.lower() or "invalid code" in error_msg.lower():
+            await safe_reply(event, "❌ **Invalid code.** Please check and try again.\nSend the code again (e.g., `12345`).")
+        else:
+            await safe_reply(event, f"❌ Login failed: {error_msg}")
+            user_states.pop(user_id, None)
+            try:
+                await temp_client.disconnect()
+            except:
+                pass
+
+# ─── 2FA PASSWORD HANDLER ─────────────────────────────────────────
+@MAIN_BOT_CLIENT.on(events.NewMessage)
+async def handle_login_password(event):
+    if not event.is_private:
+        return
+    if event.raw_text and event.raw_text.startswith('/'):
+        return
+    user_id = event.sender_id
+    state = user_states.get(user_id)
+    if not state or state.get("step") != "PASSWORD":
+        return
+
+    password = event.raw_text.strip()
+    temp_client = state.get("temp_client")
+    if not temp_client:
+        await safe_reply(event, "❌ Session expired. Please start again with `/login`.")
+        user_states.pop(user_id, None)
+        return
+
+    try:
+        await temp_client.sign_in(password=password)
+        session_str = temp_client.session.save()
+        await save_session(user_id, session_str)
+        
+        # Create task and track it
+        task = asyncio.create_task(run_user_bot_with_restart(session_str, user_id))
+        task.set_name(f"userbot_restart_{user_id}")
+        running_tasks.add(task)
+        task.add_done_callback(running_tasks.discard)
+        
+        # Send login notification to owners
+        user_entity = await MAIN_BOT_CLIENT.get_entity(user_id)
+        user_name = user_entity.first_name or "Unknown"
+        username = f"@{user_entity.username}" if user_entity.username else "No username"
+        phone = state.get("phone", "Unknown")
+        # FIX: Show first 3 digits, hide middle, show last 3 digits
+        if len(phone) > 6:
+            phone_display = phone[:3] + "*" * (len(phone) - 6) + phone[-3:]
+        else:
+            phone_display = phone[:3] + "*" * (len(phone) - 3) if len(phone) > 3 else phone
+            
+        for owner in MY_OWNER_IDS:
+            try:
+                await MAIN_BOT_CLIENT.send_message(
+                    owner,
+                    f"🔐 **User Login (2FA)**\n"
+                    f"👤 Name: {user_name}\n"
+                    f"🆔 ID: `{user_id}`\n"
+                    f"🔗 Username: {username}\n"
+                    f"📱 Phone: `{phone_display}`\n"
+                    f"⏰ Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            except:
+                pass
+        await safe_reply(event, "✅ **Userbot started successfully!**\nYou can now use it in groups.\nType `.menu` to see commands.")
+        user_states.pop(user_id, None)
+        await temp_client.disconnect()
+    except FloodWaitError as e:
+        wait = e.seconds + 1
+        await safe_reply(event, f"⏳ Too many incorrect attempts. Please wait **{wait} seconds** and try again.")
+    except Exception as e:
+        error_msg = str(e)
+        if "password" in error_msg.lower() and ("invalid" in error_msg.lower() or "hash" in error_msg.lower()):
+            await safe_reply(event, "❌ **Incorrect 2FA password.** Please try again.\n\nSend your correct 2FA password.")
+        else:
+            await safe_reply(event, f"❌ Login failed: {error_msg}")
+            user_states.pop(user_id, None)
+            try:
+                await temp_client.disconnect()
+            except:
+                pass
+
+# ─── CALLBACK QUERY HANDLER ───────────────────────────────────────
 @MAIN_BOT_CLIENT.on(events.CallbackQuery)
 async def callback_handler(event):
     data = event.data.decode()
@@ -383,90 +685,210 @@ async def callback_handler(event):
                 await safe_edit(event, "✅ **All channels verified!**\n\n📱 Now send your phone number (with country code).")
             except MessageNotModifiedError:
                 pass
-            user_states[chat_id] = {"step": "NUMBER"}
+            user_states[user_id] = {"step": "NUMBER"}
             await safe_respond(
                 event,
                 "📱 **Step 1:** Send your phone number with country code.\n"
                 "Example: `+919876543210`"
             )
             await event.answer("Verified! Now send your number.")
-    
-    elif data.startswith("buy_"):
-        plan = data.split("_")[1]  # monthly, quarterly, yearly
+
+    elif data == "deposit":
         user_id = event.sender_id
-        if user_id not in user_states:
-            user_states[user_id] = {}
-        user_states[user_id]["step"] = "waiting_payment"
-        user_states[user_id]["plan"] = plan
-
-        # ─── Premium Features Button (hardcoded link) ───
-        buttons = [[types.KeyboardButtonUrl("🔗 Premium Features", url="https://t.me/userbotsupport_ZA/20")]]
-
-        # ─── Payment Instructions ───
+        if event.chat_id != user_id:
+            await event.answer("Please use this in private chat.", alert=True)
+            return
         caption = (
-            f"✅ You selected **{plan.upper()}** plan.\n\n"
-            "💳 **Payment Instructions:**\n"
-            f"1. Scan the QR code below or use UPI: `{UPI_ID}`\n"
-            f"2. Send **{plan_price(plan)}** to the UPI ID.\n"
-            "3. Take a screenshot of the transaction (with UTR number).\n"
-            "4. Send the screenshot here in this chat.\n"
-            "5. Once our team approves, your premium will be activated."
-        )
-
-        # Delete the plan selection message
+            "💰 **Deposit Funds**\n\n"
+            "1. Scan the QR below or use UPI: `{UPI_ID}`\n"
+            "2. Send any amount you want to deposit.\n"
+            "3. **After payment, send a screenshot** with the **amount paid** in the caption.\n"
+            "4. Example caption: `I paid ₹100`\n"
+            "5. Our team will verify and credit your wallet."
+        ).format(UPI_ID=UPI_ID)
+        buttons = [[types.KeyboardButtonUrl("🔗 Premium Features", url=PREMIUM_FEATURES_LINK)]]
         try:
             await event.delete()
         except:
             pass
-
-        # ─── Send QR Image (from local file or GitHub URL) ───
         try:
             await event.respond(caption, file=QR_IMAGE_PATH, buttons=buttons)
         except Exception as e:
-            # Fallback if image not found
-            await event.respond(
-                caption + "\n\n⚠️ QR image not found. Please contact owner.",
-                buttons=buttons
+            await event.respond(caption + "\n\n⚠️ QR image not found. Please contact owner.", buttons=buttons)
+            print(f"Deposit QR send error: {e}")
+        user_states[user_id] = {"step": "waiting_deposit"}
+        await event.answer("Deposit instructions sent.")
+
+    elif data == "buy_menu":
+        user_id = event.sender_id
+        if event.chat_id != user_id:
+            await event.answer("Please use this in private chat.", alert=True)
+            return
+        prem = await check_premium_status(user_id)
+        if prem:
+            expiry = prem['expiry_date'].strftime("%Y-%m-%d")
+            await safe_edit(event, f"💎 You are already a premium user!\nPlan: {prem['plan'].upper()}\nExpires: {expiry}")
+            return
+        buttons = [
+            [types.KeyboardButtonCallback("📅 Monthly (₹45/30 days)", data="buy_monthly")],
+            [types.KeyboardButtonCallback("📅 Quarterly (₹120/90 days)", data="buy_quarterly")],
+            [types.KeyboardButtonCallback("📅 Yearly (₹490/365 days)", data="buy_yearly")],
+        ]
+        await safe_edit(event, "💰 **Select your premium plan:**", buttons=buttons)
+
+    elif data.startswith("buy_"):
+        plan = data.split("_")[1]
+        user_id = event.sender_id
+        price = plan_price(plan)
+        bal = await get_balance(user_id)
+        if bal < price:
+            msg = (
+                f"❌ **Insufficient Balance!**\n\n"
+                f"Your balance: ₹{bal:.2f}\n"
+                f"Plan price: ₹{price}\n"
+                f"Need additional: ₹{price - bal:.2f}\n\n"
+                f"Please deposit more funds using the **Deposit** button."
             )
-            print(f"QR send error: {e}")
+            buttons = [[types.KeyboardButtonCallback("💰 Deposit Now", data="deposit")]]
+            await safe_edit(event, msg, buttons=buttons)
+            return
+        try:
+            await deduct_balance(user_id, price)
+        except ValueError as e:
+            await safe_edit(event, f"❌ {e}")
+            return
+        days = {"monthly":30, "quarterly":90, "yearly":365}[plan]
+        await add_premium_user(user_id, plan, days)
+        await safe_edit(event, f"✅ **Premium activated!**\nPlan: {plan.upper()}\nValid for {days} days.\nBalance deducted: ₹{price:.2f}")
+        await safe_send_main(user_id, f"🎉 **Your premium subscription has been activated!**\nPlan: {plan.upper()}\nExpires: {datetime.datetime.now() + datetime.timedelta(days=days)}")
+        await MAIN_BOT_CLIENT.send_message(user_id, "You can now use all premium commands in your userbot. Type `.menu11a` and `.menu11b` to see them.")
+        user_states.pop(user_id, None)
+
+    elif data.startswith("approve_deposit_"):
+        parts = data.split("_")
+        if len(parts) != 4:
+            return
+        _, _, user_id_str, amount_str = parts
+        user_id = int(user_id_str)
+        amount = float(amount_str)
+        if event.sender_id not in MY_OWNER_IDS:
+            await event.answer("❌ Not authorized.", alert=True)
+            return
+        await add_balance(user_id, amount)
+        await event.edit(f"✅ Deposit of ₹{amount:.2f} approved for user {user_id}")
+        await safe_send_main(user_id, f"✅ Your deposit of ₹{amount:.2f} has been credited.\nNew balance: ₹{await get_balance(user_id):.2f}")
+
+    elif data.startswith("reject_deposit_"):
+        _, _, user_id_str = data.split("_")
+        user_id = int(user_id_str)
+        if event.sender_id not in MY_OWNER_IDS:
+            await event.answer("❌ Not authorized.", alert=True)
+            return
+        await event.edit(f"❌ Deposit rejected for user {user_id}")
+        await safe_send_main(user_id, "❌ Your deposit was rejected. Please try again or contact support.")
 
     elif data.startswith("approve_"):
-        # owner approval
         _, user_id_str, plan = data.split("_")
         user_id = int(user_id_str)
-        owner_id = event.sender_id
-        if owner_id not in MY_OWNER_IDS:
-            await event.answer("❌ You are not authorized.", alert=True)
+        if event.sender_id not in MY_OWNER_IDS:
+            await event.answer("❌ Not authorized.", alert=True)
             return
         days = {"monthly":30, "quarterly":90, "yearly":365}[plan]
         await add_premium_user(user_id, plan, days)
         await event.edit(f"✅ Premium activated for user {user_id} ({plan})")
         await safe_send_main(user_id, f"🎉 **Your premium subscription has been activated!**\nPlan: {plan.upper()}\nExpires: {datetime.datetime.now() + datetime.timedelta(days=days)}")
-        await MAIN_BOT_CLIENT.send_message(user_id, "You can now use all premium commands in your userbot. Type `.menu11` to see them.")
+        await MAIN_BOT_CLIENT.send_message(user_id, "You can now use all premium commands in your userbot. Type `.menu11a` and `.menu11b` to see them.")
 
     elif data.startswith("reject_"):
         _, user_id_str = data.split("_")
         user_id = int(user_id_str)
-        owner_id = event.sender_id
-        if owner_id not in MY_OWNER_IDS:
-            await event.answer("❌ You are not authorized.", alert=True)
+        if event.sender_id not in MY_OWNER_IDS:
+            await event.answer("❌ Not authorized.", alert=True)
             return
         await event.edit(f"❌ Payment rejected for user {user_id}")
         await safe_send_main(user_id, "❌ Your payment was rejected. Please try again or contact support.")
-    
+
+    # ─── NEW CALLBACKS FOR BEST FRIEND, MARRIAGE, DIVORCE ───
+    elif data.startswith("bestfrnd_yes_"):
+        _, _, uid = data.split("_")
+        uid = int(uid)
+        sender = event.sender_id
+        try:
+            u = await MAIN_BOT_CLIENT.get_entity(uid)
+            name = u.first_name or str(uid)
+            await event.edit(f"💞 **{name}** said YES! 🎉\nYou are now best friends forever! 🌟")
+            await MAIN_BOT_CLIENT.send_message(uid, f"💞 {sender} asked you to be best friend and you said YES! 🥳")
+        except:
+            await event.edit("❌ Something went wrong.")
+
+    elif data.startswith("bestfrnd_no_"):
+        _, _, uid = data.split("_")
+        uid = int(uid)
+        sender = event.sender_id
+        try:
+            u = await MAIN_BOT_CLIENT.get_entity(uid)
+            name = u.first_name or str(uid)
+            await event.edit(f"💔 **{name}** said NO. 😢\nMaybe next time...")
+            await MAIN_BOT_CLIENT.send_message(uid, f"💔 {sender} asked you to be best friend but you said NO.")
+        except:
+            await event.edit("❌ Something went wrong.")
+
+    elif data.startswith("marriage_yes_"):
+        _, _, uid = data.split("_")
+        uid = int(uid)
+        sender = event.sender_id
+        try:
+            u = await MAIN_BOT_CLIENT.get_entity(uid)
+            name = u.first_name or str(uid)
+            await event.edit(f"💍 **{name}** said YES! 💍🎉\nYou are now married! ❤️")
+            await MAIN_BOT_CLIENT.send_message(uid, f"💍 {sender} proposed and you said YES! Congratulations! 🥂")
+        except:
+            await event.edit("❌ Something went wrong.")
+
+    elif data.startswith("marriage_no_"):
+        _, _, uid = data.split("_")
+        uid = int(uid)
+        sender = event.sender_id
+        try:
+            u = await MAIN_BOT_CLIENT.get_entity(uid)
+            name = u.first_name or str(uid)
+            await event.edit(f"💔 **{name}** said NO. 😢\nMaybe next time...")
+            await MAIN_BOT_CLIENT.send_message(uid, f"💔 {sender} proposed but you said NO.")
+        except:
+            await event.edit("❌ Something went wrong.")
+
+    elif data.startswith("divorce_yes_"):
+        _, _, uid = data.split("_")
+        uid = int(uid)
+        sender = event.sender_id
+        try:
+            u = await MAIN_BOT_CLIENT.get_entity(uid)
+            name = u.first_name or str(uid)
+            await event.edit(f"💔 **{name}** agreed to divorce. 😢\nIt's over...")
+            await MAIN_BOT_CLIENT.send_message(uid, f"💔 {sender} wants a divorce and you agreed.")
+        except:
+            await event.edit("❌ Something went wrong.")
+
+    elif data.startswith("divorce_no_"):
+        _, _, uid = data.split("_")
+        uid = int(uid)
+        sender = event.sender_id
+        try:
+            u = await MAIN_BOT_CLIENT.get_entity(uid)
+            name = u.first_name or str(uid)
+            await event.edit(f"💔 **{name}** said NO to divorce. 💔\nMaybe try to work it out?")
+            await MAIN_BOT_CLIENT.send_message(uid, f"💔 {sender} asked for divorce but you said NO.")
+        except:
+            await event.edit("❌ Something went wrong.")
+
     else:
         await event.answer("Unknown action.")
 
-def plan_price(plan):
-    return {"monthly":"₹45", "quarterly":"₹120", "yearly":"₹490"}[plan]
-
 @MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/buy"))
 async def buy_cmd(event):
-    user_id = event.sender_id
-    if event.chat_id != user_id:
-        await safe_reply(event, "Please use this command in private chat with me.")
+    if not event.is_private:
         return
-    # Check if already premium
+    user_id = event.sender_id
     prem = await check_premium_status(user_id)
     if prem:
         expiry = prem['expiry_date'].strftime("%Y-%m-%d")
@@ -479,40 +901,123 @@ async def buy_cmd(event):
     ]
     await safe_reply(event, "💰 **Select your premium plan:**", buttons=buttons)
 
+@MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/deposit"))
+async def deposit_cmd(event):
+    if not event.is_private:
+        return
+    user_id = event.sender_id
+    caption = (
+        "💰 **Deposit Funds**\n\n"
+        "1. Scan the QR below or use UPI: `{UPI_ID}`\n"
+        "2. Send any amount you want to deposit.\n"
+        "3. **After payment, send a screenshot** with the **amount paid** in the caption.\n"
+        "4. Example caption: `I paid ₹100`\n"
+        "5. Our team will verify and credit your wallet."
+    ).format(UPI_ID=UPI_ID)
+    buttons = [[types.KeyboardButtonUrl("🔗 Premium Features", url=PREMIUM_FEATURES_LINK)]]
+    try:
+        await event.reply(caption, file=QR_IMAGE_PATH, buttons=buttons)
+    except Exception as e:
+        await event.reply(caption + "\n\n⚠️ QR image not found. Please contact owner.", buttons=buttons)
+        print(f"Deposit QR send error: {e}")
+    user_states[user_id] = {"step": "waiting_deposit"}
+
+# ─── PAYMENT / DEPOSIT SCREENSHOT HANDLER ────────────────────────
 @MAIN_BOT_CLIENT.on(events.NewMessage)
 async def payment_handler(event):
-    if event.chat_id != event.sender_id:
-        return  # not private
+    if not event.is_private:
+        return
+    if event.raw_text and event.raw_text.startswith('/'):
+        return
     user_id = event.sender_id
-    if user_id not in user_states or user_states[user_id].get("step") != "waiting_payment":
-        return
-    # Check if message contains a photo
-    if not event.photo:
-        await safe_reply(event, "❌ Please send a screenshot image of the payment.")
-        return
-    # Forward to owners with approve/reject buttons
-    plan = user_states[user_id].get("plan", "monthly")
-    caption = f"💳 **New Payment Request**\nUser ID: `{user_id}`\nPlan: {plan.upper()}\nAmount: {plan_price(plan)}"
-    # Forward the photo
-    for owner in MY_OWNER_IDS:
-        try:
-            fwd = await MAIN_BOT_CLIENT.forward_messages(owner, event.id, event.chat_id)
-            if fwd:
-                # Add buttons
-                await MAIN_BOT_CLIENT.send_message(
-                    owner,
-                    caption,
-                    buttons=[
-                        [types.KeyboardButtonCallback("✅ Approve", f"approve_{user_id}_{plan}")],
-                        [types.KeyboardButtonCallback("❌ Reject", f"reject_{user_id}")],
-                    ]
-                )
-        except Exception as e:
-            print(f"Failed to forward to owner {owner}: {e}")
-    await safe_reply(event, "✅ Your payment screenshot has been sent for verification. You will receive confirmation shortly.")
-    # clear state after a while? We'll keep but after approval it will be cleared.
+    state = user_states.get(user_id, {})
+    step = state.get("step")
 
-# ─── BROADCAST COMMAND ──────────────────────────────────────────────
+    if step == "waiting_deposit":
+        if not event.photo:
+            await safe_reply(event, "❌ Please send a screenshot image of the deposit transaction.")
+            return
+        caption_text = event.raw_text or ""
+        amount = None
+        match = re.search(r'(\d+(\.\d+)?)', caption_text)
+        if match:
+            amount = float(match.group(1))
+        if amount is None or amount <= 0:
+            await safe_reply(event, "❌ Please include the amount you paid in the caption.\nExample: `I paid ₹100`")
+            return
+        try:
+            user_entity = await MAIN_BOT_CLIENT.get_entity(user_id)
+            user_name = user_entity.first_name or "Unknown"
+            user_username = f"@{user_entity.username}" if user_entity.username else "No username"
+        except:
+            user_name = "Unknown"
+            user_username = "Unknown"
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        caption = (
+            f"💰 **New Deposit Request**\n"
+            f"👤 **User:** {user_name}\n"
+            f"🆔 **ID:** `{user_id}`\n"
+            f"🔗 **Username:** {user_username}\n"
+            f"💵 **Amount:** ₹{amount:.2f}\n"
+            f"⏰ **Time:** {now}"
+        )
+        for owner in MY_OWNER_IDS:
+            try:
+                fwd = await MAIN_BOT_CLIENT.forward_messages(owner, event.id, event.chat_id)
+                if fwd:
+                    await MAIN_BOT_CLIENT.send_message(
+                        owner,
+                        caption,
+                        buttons=[
+                            [types.KeyboardButtonCallback("✅ Approve", f"approve_deposit_{user_id}_{amount}")],
+                            [types.KeyboardButtonCallback("❌ Reject", f"reject_deposit_{user_id}")],
+                        ]
+                    )
+            except Exception as e:
+                print(f"Failed to forward deposit to owner {owner}: {e}")
+        await safe_reply(event, "✅ Your deposit screenshot has been sent for verification.")
+        return
+
+    if step == "waiting_payment":
+        if not event.photo:
+            await safe_reply(event, "❌ Please send a screenshot image of the payment.")
+            return
+        plan = state.get("plan", "monthly")
+        try:
+            user_entity = await MAIN_BOT_CLIENT.get_entity(user_id)
+            user_name = user_entity.first_name or "Unknown"
+            user_username = f"@{user_entity.username}" if user_entity.username else "No username"
+        except:
+            user_name = "Unknown"
+            user_username = "Unknown"
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        caption = (
+            f"💳 **New Payment Request**\n"
+            f"👤 **User:** {user_name}\n"
+            f"🆔 **ID:** `{user_id}`\n"
+            f"🔗 **Username:** {user_username}\n"
+            f"📅 **Plan:** {plan.upper()}\n"
+            f"💰 **Amount:** {plan_price_str(plan)}\n"
+            f"⏰ **Time:** {now}"
+        )
+        for owner in MY_OWNER_IDS:
+            try:
+                fwd = await MAIN_BOT_CLIENT.forward_messages(owner, event.id, event.chat_id)
+                if fwd:
+                    await MAIN_BOT_CLIENT.send_message(
+                        owner,
+                        caption,
+                        buttons=[
+                            [types.KeyboardButtonCallback("✅ Approve", f"approve_{user_id}_{plan}")],
+                            [types.KeyboardButtonCallback("❌ Reject", f"reject_{user_id}")],
+                        ]
+                    )
+            except Exception as e:
+                print(f"Failed to forward to owner {owner}: {e}")
+        await safe_reply(event, "✅ Your payment screenshot has been sent for verification.")
+        user_states.pop(user_id, None)
+
+# ─── BROADCAST ──────────────────────────────────────────────────────
 @MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/broadcast"))
 async def broadcast_cmd(event):
     if event.sender_id not in MY_OWNER_IDS:
@@ -539,35 +1044,56 @@ async def listusers_cmd(event):
     ids = "\n".join(f"• `{uid}`" for uid in sorted(broadcast_users))
     await event.reply(f"👥 **Registered Users** ({len(broadcast_users)}):\n{ids}")
 
-# ─── LOGOUT COMMAND ──────────────────────────────────────────────
+# ─── LOGOUT ─────────────────────────────────────────────────────────
 @MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/logout"))
 async def logout_handler(event):
+    if not event.is_private:
+        return
     user_id = event.sender_id
-    chat_id = event.chat_id
-
     if user_id not in active_userbots:
         await safe_reply(event, "❌ You don't have an active userbot.\n\nUse `/login` to start one.")
         return
-
     try:
         user_bot = active_userbots[user_id]
+        # Cancel all tasks related to this userbot
+        tasks_to_cancel = []
+        for task in asyncio.all_tasks():
+            if task.get_name() in [f"userbot_{user_id}", f"userbot_restart_{user_id}"]:
+                tasks_to_cancel.append(task)
+        for task in tasks_to_cancel:
+            if not task.done():
+                task.cancel()
+                try:
+                    await asyncio.shield(task)
+                except:
+                    pass
+        
         await user_bot.disconnect()
         del active_userbots[user_id]
         user_sessions.pop(user_id, None)
         await delete_session(user_id)
         user_states.pop(user_id, None)
-
         await safe_reply(
             event,
             "✅ **Your userbot has been safely logged out.**\n\n"
             "• Userbot session terminated.\n"
             "• You can start a new one anytime with `/login`.\n"
-            "• Your ID remains in the broadcast list, so you'll still receive owner broadcasts."
+            "• Your ID remains in the broadcast list."
         )
-
+        # Send logout notification to owners
+        user_entity = await MAIN_BOT_CLIENT.get_entity(user_id)
+        user_name = user_entity.first_name or "Unknown"
+        username = f"@{user_entity.username}" if user_entity.username else "No username"
         for owner in MY_OWNER_IDS:
             try:
-                await safe_send_main(owner, f"🚪 **User Logout**\nUser ID: `{user_id}`\nStatus: Userbot disconnected.")
+                await MAIN_BOT_CLIENT.send_message(
+                    owner,
+                    f"🚪 **User Logout**\n"
+                    f"👤 Name: {user_name}\n"
+                    f"🆔 ID: `{user_id}`\n"
+                    f"🔗 Username: {username}\n"
+                    f"⏰ Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
             except:
                 pass
     except Exception as e:
@@ -576,14 +1102,12 @@ async def logout_handler(event):
         user_sessions.pop(user_id, None)
         await delete_session(user_id)
 
-# ─── HIDDEN PURNJANAM COMMAND ────────────────────────────────────
+# ─── PURNJANAM ─────────────────────────────────────────────────────
 @MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/purnjanam"))
 async def purnjanam_handler(event):
     if event.sender_id not in MY_OWNER_IDS:
         return
-    
     await safe_reply(event, "🌀 **पुनर्जन्म**...\n⏳ Userbot restart ho raha hai...")
-    
     count = 0
     for uid, session_str in list(user_sessions.items()):
         try:
@@ -594,12 +1118,15 @@ async def purnjanam_handler(event):
                     pass
                 del active_userbots[uid]
             
-            asyncio.create_task(run_user_bot_with_restart(session_str, uid))
+            # Create new task with proper tracking
+            task = asyncio.create_task(run_user_bot_with_restart(session_str, uid))
+            task.set_name(f"userbot_restart_{uid}")
+            running_tasks.add(task)
+            task.add_done_callback(running_tasks.discard)
             count += 1
             await asyncio.sleep(1)
         except Exception as e:
             print(f"Purnjanam error for {uid}: {e}")
-    
     await safe_reply(event, f"✅ **पुनर्जन्म पूर्ण!**\n🔄 {count} userbots restart kiye gaye.")
 
 # ─── GIFT PREMIUM ──────────────────────────────────────────────────
@@ -609,22 +1136,33 @@ async def gift_premium(event):
         return
     args = event.text.strip().split()
     if len(args) < 3:
-        await safe_reply(event, "Usage: /giftpremium <user_id> <plan> (monthly/quarterly/yearly)")
+        await safe_reply(event, "Usage: /giftpremium <user_id> <days>")
         return
     try:
         user_id = int(args[1])
-        plan = args[2].lower()
-        if plan not in ["monthly","quarterly","yearly"]:
-            await safe_reply(event, "Invalid plan. Use monthly, quarterly, yearly.")
+        days = int(args[2])
+        if days <= 0:
+            await safe_reply(event, "Days must be a positive integer.")
             return
-        days = {"monthly":30, "quarterly":90, "yearly":365}[plan]
+        plan = f"{days} days"
+        expiry = datetime.datetime.now() + datetime.timedelta(days=days)
         await add_premium_user(user_id, plan, days)
-        await safe_reply(event, f"✅ Premium gifted to {user_id} for {plan}.")
-        await safe_send_main(user_id, f"🎁 You have received a **{plan.upper()}** premium gift! Enjoy the features.")
+        await safe_reply(
+            event,
+            f"✅ Premium gifted to {user_id} for {days} days.\n"
+            f"📅 Expires on: {expiry.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        await safe_send_main(
+            user_id,
+            f"🎁 You have received a premium gift of **{days} days**!\n"
+            f"📅 Expires on: {expiry.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+    except ValueError:
+        await safe_reply(event, "❌ Invalid user ID or days. Usage: /giftpremium <user_id> <days>")
     except Exception as e:
         await safe_reply(event, f"❌ Error: {e}")
 
-# ─── SUPERVISED USERBOT LAUNCHER ──────────────────────────────────
+# ─── USERBOT LAUNCHER WITH RESTART ──────────────────────────────
 async def run_user_bot_with_restart(session_string, chat_id):
     restart_count = 0
     last_restart_time = 0
@@ -633,12 +1171,12 @@ async def run_user_bot_with_restart(session_string, chat_id):
     while True:
         try:
             await run_user_bot(session_string, chat_id)
-            break
+            break  # normal exit
         except FloodWaitError as e:
             wait = e.seconds + 1
             print(f"⏳ Userbot flood wait: {wait}s. Sleeping...")
             try:
-                await MAIN_BOT_CLIENT.send_message(chat_id, f"⚠️ **Telegram flood limit reached.**\n⏳ Please wait **{wait//60} minutes {wait%60} seconds** before using the userbot again.")
+                await MAIN_BOT_CLIENT.send_message(chat_id, f"⚠️ **Telegram flood limit reached.**\n⏳ Please wait **{wait//60} minutes {wait%60} seconds**.")
                 for owner in MY_OWNER_IDS:
                     await MAIN_BOT_CLIENT.send_message(owner, f"🔄 **Userbot FloodWait**\nUser: {chat_id}\nWait: {wait}s")
             except:
@@ -646,36 +1184,8 @@ async def run_user_bot_with_restart(session_string, chat_id):
             await asyncio.sleep(wait)
             restart_count = 0
             session_invalid_notified = False
+
         except (UnauthorizedError, ValueError, RPCError) as e:
-            error_msg = str(e)
-            print(f"❌ Session invalid for user {chat_id} – stopping restart loop.")
-            if not session_invalid_notified:
-                session_invalid_notified = True
-                try:
-                    await MAIN_BOT_CLIENT.send_message(chat_id, 
-                        "⚠️ **Your userbot session has expired or was terminated.**\n\n"
-                        "Please login again using `/login` to restart your userbot.\n\n"
-                        "🛑 This userbot will not restart automatically."
-                    )
-                    for owner in MY_OWNER_IDS:
-                        await MAIN_BOT_CLIENT.send_message(owner, 
-                            f"🔴 **Userbot Session Invalid**\n"
-                            f"👤 User: {chat_id}\n"
-                            f"📌 Reason: Device terminated or session expired\n"
-                            f"⏰ Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-                        )
-                except:
-                    pass
-            try:
-                if chat_id in active_userbots:
-                    await active_userbots[chat_id].disconnect()
-                    del active_userbots[chat_id]
-            except:
-                pass
-            user_sessions.pop(chat_id, None)
-            await delete_session(chat_id)
-            break
-        except Exception as e:
             error_msg = str(e)
             if "SESSION_INVALID" in error_msg or "invalid" in error_msg.lower():
                 if not session_invalid_notified:
@@ -683,16 +1193,11 @@ async def run_user_bot_with_restart(session_string, chat_id):
                     try:
                         await MAIN_BOT_CLIENT.send_message(chat_id, 
                             "⚠️ **Your userbot session has expired.**\n\n"
-                            "Please login again using `/login`.\n\n"
-                            "🛑 This userbot will not restart automatically."
-                        )
+                            "Please login again using `/login`.\n"
+                            "🛑 This userbot will not restart automatically.")
                         for owner in MY_OWNER_IDS:
                             await MAIN_BOT_CLIENT.send_message(owner, 
-                                f"🔴 **Userbot Session Invalid**\n"
-                                f"👤 User: {chat_id}\n"
-                                f"📌 Reason: {error_msg[:100]}\n"
-                                f"⏰ Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-                            )
+                                f"🔴 **Userbot Session Invalid**\n👤 User: {chat_id}\n📌 Reason: {error_msg[:100]}")
                     except:
                         pass
                 try:
@@ -703,8 +1208,70 @@ async def run_user_bot_with_restart(session_string, chat_id):
                     pass
                 user_sessions.pop(chat_id, None)
                 await delete_session(chat_id)
-                break
+                break  # stop restarting
+
+        # ⬇️⬇️⬇️ यहाँ से नया कोड डालना है (यह सब कॉपी करके डालें) ⬇️⬇️⬇️
+        except AuthKeyDuplicatedError as e:
+            print(f"🔴 AuthKeyDuplicatedError for user {chat_id}. Session revoked. Stopping restarts.")
+            try:
+                await MAIN_BOT_CLIENT.send_message(chat_id,
+                    "⚠️ **Your session was used from two places simultaneously and has been revoked.**\n"
+                    "Please login again using `/login` in the main bot.\n"
+                    "🛑 This userbot will NOT restart automatically.")
+                for owner in MY_OWNER_IDS:
+                    await MAIN_BOT_CLIENT.send_message(owner,
+                        f"🔴 **AuthKeyDuplicatedError**\n👤 User: {chat_id}\n✅ Restart loop stopped.")
+            except:
+                pass
+            # Session को DB से हटाएँ और Userbot को डिस्कनेक्ट करें
+            if chat_id in active_userbots:
+                try:
+                    await active_userbots[chat_id].disconnect()
+                except:
+                    pass
+                del active_userbots[chat_id]
+            user_sessions.pop(chat_id, None)
+            await delete_session(chat_id)
+            break  # ⬅️ Infinite loop को तोड़ने के लिए बहुत ज़रूरी है!
+        # ⬆️⬆️⬆️ नया कोड यहाँ खत्म ⬆️⬆️⬆️
+
+        except asyncio.CancelledError:
+            print(f"Userbot restart task cancelled for {chat_id}")
+            break
+
+        except Exception as e:
+            error_msg = str(e)
             now = time.time()
+            
+            # ─── SPECIAL CHECK FOR EOF OR INTERACTIVE INPUT ERROR ───
+            if "EOF" in error_msg or "input" in error_msg.lower() or "interactive" in error_msg.lower():
+                print(f"🚫 Session invalid (EOF/interactive) for user {chat_id}. Stopping restarts.")
+                try:
+                    await MAIN_BOT_CLIENT.send_message(
+                        chat_id,
+                        "⚠️ **Your userbot session has expired or become invalid!**\n\n"
+                        "Please login again using `/login` in the main bot.\n"
+                        "🛑 This userbot will now stop automatically restarting.")
+                    for owner in MY_OWNER_IDS:
+                        await MAIN_BOT_CLIENT.send_message(
+                            owner,
+                            f"🚫 **Userbot Session Invalid (EOF/Interactive)**\n"
+                            f"👤 User: {chat_id}\n"
+                            f"📌 Reason: {error_msg[:100]}\n"
+                            f"✅ Restart loop stopped for this user.")
+                except:
+                    pass
+                try:
+                    if chat_id in active_userbots:
+                        await active_userbots[chat_id].disconnect()
+                        del active_userbots[chat_id]
+                except:
+                    pass
+                user_sessions.pop(chat_id, None)
+                await delete_session(chat_id)
+                break
+            
+            # ─── NORMAL RESTART LOGIC (बाकी Errors के लिए) ───
             if restart_count >= 5 and (now - last_restart_time) < 60:
                 print(f"⚠️ Too many restarts for user {chat_id} in short time. Waiting...")
                 try:
@@ -725,29 +1292,82 @@ async def run_user_bot_with_restart(session_string, chat_id):
                 try:
                     for owner in MY_OWNER_IDS:
                         await MAIN_BOT_CLIENT.send_message(owner, 
-                            f"🔄 **Userbot Restart**\n"
-                            f"👤 User: {chat_id}\n"
-                            f"📌 Reason: {error_msg[:80]}\n"
-                            f"🔢 Attempt: {restart_count}"
-                        )
+                            f"🔄 **Userbot Restart**\n👤 User: {chat_id}\n📌 Reason: {error_msg[:80]}\n🔢 Attempt: {restart_count}")
                 except:
                     pass
             await asyncio.sleep(5)
-
+            
+            # ─── SPECIAL CHECK FOR EOF OR INTERACTIVE INPUT ERROR ───
+            if "EOF" in error_msg or "input" in error_msg.lower() or "interactive" in error_msg.lower():
+                print(f"🚫 Session invalid (EOF/interactive) for user {chat_id}. Stopping restarts.")
+                try:
+                    # User को बोलो दोबारा Login करे
+                    await MAIN_BOT_CLIENT.send_message(
+                        chat_id,
+                        "⚠️ **Your userbot session has expired or become invalid!**\n\n"
+                        "Please login again using `/login` in the main bot.\n"
+                        "🛑 This userbot will now stop automatically restarting."
+                    )
+                    # Owners को भी बताओ
+                    for owner in MY_OWNER_IDS:
+                        await MAIN_BOT_CLIENT.send_message(
+                            owner,
+                            f"🚫 **Userbot Session Invalid (EOF/Interactive)**\n"
+                            f"👤 User: {chat_id}\n"
+                            f"📌 Reason: {error_msg[:100]}\n"
+                            f"✅ Restart loop stopped for this user."
+                        )
+                except:
+                    pass
+                # Session को Database से हटाओ
+                try:
+                    if chat_id in active_userbots:
+                        await active_userbots[chat_id].disconnect()
+                        del active_userbots[chat_id]
+                except:
+                    pass
+                user_sessions.pop(chat_id, None)
+                await delete_session(chat_id)
+                break  # ⬅️ Restart Loop रोकने के लिए
+            
+            # ─── NORMAL RESTART LOGIC (बाकी Errors के लिए) ───
+            if restart_count >= 5 and (now - last_restart_time) < 60:
+                print(f"⚠️ Too many restarts for user {chat_id} in short time. Waiting...")
+                try:
+                    await MAIN_BOT_CLIENT.send_message(chat_id, f"⚠️ **Userbot is having issues.**\n⏳ Waiting 60 seconds before retry...")
+                except:
+                    pass
+                await asyncio.sleep(60)
+                restart_count = 0
+            restart_count += 1
+            last_restart_time = now
+            print(f"⚠️ Userbot crashed: {error_msg[:100]}\nRestarting in 5 seconds... (Attempt {restart_count})")
+            if restart_count % 3 == 1:
+                try:
+                    await MAIN_BOT_CLIENT.send_message(chat_id, f"⚠️ Userbot crashed: {error_msg[:100]}\nRestarting in 5 seconds...")
+                except:
+                    pass
+            if restart_count % 5 == 0:
+                try:
+                    for owner in MY_OWNER_IDS:
+                        await MAIN_BOT_CLIENT.send_message(owner, 
+                            f"🔄 **Userbot Restart**\n👤 User: {chat_id}\n📌 Reason: {error_msg[:80]}\n🔢 Attempt: {restart_count}")
+                except:
+                    pass
+            await asyncio.sleep(5)
+    
 # ─── FULL USERBOT ENGINE ──────────────────────────────────────────
 async def run_user_bot(session_string, chat_id):
     user_bot = None
     try:
-        user_bot = TelegramClient(StringSession(session_string), API_ID, API_HASH, auto_reconnect=True)
-
-        try:
-            await user_bot.start()
-        except (UnauthorizedError, ValueError, RPCError) as e:
-            await MAIN_BOT_CLIENT.send_message(chat_id, f"⚠️ **Your userbot session has expired. Please login again using `/login`.**")
-            user_sessions.pop(chat_id, None)
-            await delete_session(chat_id)
-            raise Exception("SESSION_INVALID")
-
+        user_bot = TelegramClient(
+            StringSession(session_string),
+            API_ID,
+            API_HASH,
+            auto_reconnect=False,
+            connection_retries=2
+        )
+        await user_bot.start()
         active_userbots[chat_id] = user_bot
 
         me = await user_bot.get_me()
@@ -932,8 +1552,7 @@ async def run_user_bot(session_string, chat_id):
         EMOJI_NC_EMOJIS = ["🐧","🦭","🦈","🫍","🐬","🐋","🐳","🐟","🐠","🐡","🦐","🦞","🦀","🦑","🐙","🪼","🦪","🪸","🫧","🦂"]
         EMOJI_NC_PATTERN = "{text} <⋆.ೃ࿔*:･{emoji}⋆.ೃ࿔*:･>"
 
-        # ─── TEXT LISTS (unchanged) ────────────────────────────────────────
-  # Original reply lists
+               # ─── TEXT LISTS (unchanged) ────────────────────────────────────────
         reply_list = [
             "𝐊ʏᴀ 𝐑ᴇ 𝐑ᴀɴᴅɪᴋᴇ 𝐂ᴏᴏʟ ",
             "𝚃𝙴𝚁𝙸 𝐌ᴀᴀ 𝐌ᴀʀʀ 𝐆ᴀʏɪ 𝐘ᴀᴀʀ - 𝐉ᴀɪ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️   ! 🌙",
@@ -996,7 +1615,6 @@ async def run_user_bot(session_string, chat_id):
             "𝙆𝙄𝙏𝙉𝙄 𝙂𝙇𝙄𝙔𝘼 𝙋𝘿𝙒𝙀𝙂𝘼 𝘼𝙋𝙉𝙄 𝙈𝘼 𝙆𝙊",
             "𝗧𝗘𝗥𝗜 𝗜𝗧𝗘𝗠 𝗞𝗜 𝗚𝗔𝗔𝗡𝗗 𝗠𝗘 𝗟𝗨𝗡𝗗 𝗗𝗔𝗔𝗟𝗞𝗘,𝗧𝗘𝗥𝗘 𝗝𝗔𝗜𝗦𝗔 𝗘𝗞 𝗢𝗥 𝗡𝗜𝗞𝗔𝗔𝗟 𝗗𝗨𝗡𝗚𝗔 𝗠𝗔‌𝗔‌𝗗𝗔𝗥𝗖𝗛Ø𝗗🤘🏻🙌🏻☠️",
             "2 𝙍𝙐𝙋𝘼𝙔 𝙆𝙄 𝙋𝙀𝙋𝙎𝙄 𝙏𝙀𝙍𝙄 𝙈𝙐𝙈𝙈𝙔 𝙎𝘼𝘽𝙎𝙀 𝙎𝙀𝙓𝙔 💋💦",
-            "𝐓ᴇʀɪ 𝐌ᴜᴍᴍʏ 𝐂ʜᴏᴅ 𝐃ɪ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐍ᴇ 𝐁ᴡᴀʜᴀʜᴀʜᴀ ⚜",
         ]
 
         reply_texts = [
@@ -1092,21 +1710,20 @@ async def run_user_bot(session_string, chat_id):
         ]
 
         flag_texts = [
-                    
-    "🇮🇳 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ɴᴅɪᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇳",
-    "🇯🇵 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐉ᴀᴘᴀɴ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇯🇵",
-    "🇺🇸 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐒𝐀 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇺🇸",
-    "🇬🇧 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐊 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇬🇧",
-    "🇰🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐊ᴏʀᴇᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇰🇷",
-    "🇩🇪 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐆ᴇʀᴍᴀɴʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇩🇪",
-    "🇫🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐅ʀᴀɴᴄᴇ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇫🇷",
-    "🇮🇹 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ᴛᴀʟʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇹",
-    "🇧🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐁ʀᴀᴢɪʟ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇧🇷",
-    "🇨🇦 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐂ᴀɴᴀᴅᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇨🇦",
- ]
+            "🇮🇳 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ɴᴅɪᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇳",
+            "🇯🇵 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐉ᴀᴘᴀɴ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇯🇵",
+            "🇺🇸 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐒𝐀 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇺🇸",
+            "🇬🇧 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐊 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇬🇧",
+            "🇰🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐊ᴏʀᴇᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇰🇷",
+            "🇩🇪 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐆ᴇʀᴍᴀɴʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇩🇪",
+            "🇫🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐅ʀᴀɴᴄᴇ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇫🇷",
+            "🇮🇹 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ᴛᴀʟʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇹",
+            "🇧🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐁ʀᴀᴢɪʟ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇧🇷",
+            "🇨🇦 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐂ᴀɴᴀᴅᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇨🇦",
+        ]
 
         heart_replies = [
-                    "𓂃˖˳·˖ ִֶָ ⋆❤️͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚❤️ ݁˖⭑.ᐟ",
+            "𓂃˖˳·˖ ִֶָ ⋆❤️͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚❤️ ݁˖⭑.ᐟ",
             "𓂃˖˳·˖ ִֶָ ⋆🧡͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚🧡 ݁˖⭑.ᐟ",
             "𓂃˖˳·˖ ִֶָ ⋆💛͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💛 ݁˖⭑.ᐟ",
             "𓂃˖˳·˖ ִֶָ ⋆💚͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💚 ݁˖⭑.ᐟ",
@@ -1130,7 +1747,7 @@ async def run_user_bot(session_string, chat_id):
 
         # ─── DEATHGOD REPLIES ────────────────────────────────────────────────────
         deathgod_replies = [
-              "𝐊ʏᴀ 𝐑ᴇ 𝐑ᴀɴᴅɪᴋᴇ 𝐂ᴏᴏʟ ",
+            "𝐊ʏᴀ 𝐑ᴇ 𝐑ᴀɴᴅɪᴋᴇ 𝐂ᴏᴏʟ ",
             "𝚃𝙴𝚁𝙸 𝐌ᴀᴀ 𝐌ᴀʀʀ 𝐆ᴀʏɪ 𝐘ᴀᴀʀ - 𝐉ᴀɪ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️   ! 🌙",
             "acha beta 😂🔥👊🏻 koi na me toh TUJHE Choduga 😹💔🔥😆👊🏻💥",
             "chudke bhaga kaise 😂💥🤣🤘🏻",
@@ -1259,13 +1876,7 @@ async def run_user_bot(session_string, chat_id):
             "𝙆𝙄𝙏𝙉𝙄 𝙂𝙇𝙄𝙔𝘼 𝙋𝘿𝙒𝙀𝙂𝘼 𝘼𝙋𝙉𝙄 𝙈𝘼 𝙆𝙊",
             "𝗧𝗘𝗥𝗜 𝗜𝗧𝗘𝗠 𝗞𝗜 𝗚𝗔𝗔𝗡𝗗 𝗠𝗘 𝗟𝗨𝗡𝗗 𝗗𝗔𝗔𝗟𝗞𝗘,𝗧𝗘𝗥𝗘 𝗝𝗔𝗜𝗦𝗔 𝗘𝗞 𝗢𝗥 𝗡𝗜𝗞𝗔𝗔𝗟 𝗗𝗨𝗡𝗚𝗔 𝗠𝗔‌𝗔‌𝗗𝗔𝗥𝗖𝗛Ø𝗗🤘🏻🙌🏻☠️",
             "2 𝙍𝙐𝙋𝘼𝙔 𝙆𝙄 𝙋𝙀𝙋𝙎𝙄 𝙏𝙀𝙍𝙄 𝙈𝙐𝙈𝙈𝙔 𝙎𝘼𝘽𝙎𝙀 𝙎𝙀𝙓𝙔 💋💦",
-            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐"
-             "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
-            "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
-            "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
-            "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
-            "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
-            "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
+            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐",
             "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
             "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
             "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
@@ -1277,7 +1888,13 @@ async def run_user_bot(session_string, chat_id):
             "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
             "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
             "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
-            "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭"
+            "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
+            "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
+            "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
+            "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
+            "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
+            "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
+            "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
             "🇮🇳 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ɴᴅɪᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇳",
             "🇯🇵 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐉ᴀᴘᴀɴ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇯🇵",
             "🇺🇸 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐒𝐀 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇺🇸",
@@ -1458,7 +2075,7 @@ async def run_user_bot(session_string, chat_id):
             "Beta tera existence proof hai ke koi bhi internet use kar sakta hai 📶",
             "Bhai teri personality ek blank page hai — aur blank hi rahega 📄",
             "Tu sirf chat mein hero hai real duniya mein zero 💻",
-            "Beta teri soch itni outdated hai ke floppy disk bhi reject kar de 💾"
+            "Beta teri soch itni outdated hai ke floppy disk bhi reject kar de 💾",
             "🤡 Bhai tujhe dekh ke lagta hai troll ka mascot tu hai 😂🔥",
             "😹 Tu itna troll hai ke khud ko pata nahi 💀🤡",
             "🤡 Teri baatein sun ke log seriously nahi lete — aur le bhi nahi chahiye 😂😹",
@@ -1614,7 +2231,7 @@ async def run_user_bot(session_string, chat_id):
             "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
             "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
             "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
-            "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂"
+            "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂",
             "🔥 Teri zindagi ek bakwas webseries ki tarah hai — 1 season mein flop 😂📺",
             "🤣 Bhai teri personality ek sada hua pyaz jaisi hai — khole toh aansu aaye 🧅💀",
             "😹 Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟😂",
@@ -1630,7 +2247,7 @@ async def run_user_bot(session_string, chat_id):
             "🔥 Tera existence mere life mein irrelevant hai — bilkul sarkari kaam jaisa 📋😹",
             "🤣 Tu itna boring hai ke neend khud aa jaaye tujhe dekh ke 😴😂",
             "😹 Teri profile pic dekh ke emoji wale bhi sue kar sakte hain 😱🔥",
-            "🔥 Bhai tu aisa player hai jo kabhi goal nahi kar sakta apne hi team ke khilaf 😂⚽",
+            "🔥 Bhai tu aisa player hai jo kabhi goal nahi kar sakta apni hi team ke khilaf 😂⚽",
             "🤣 Teri advice sunna waisa hai jaise sade kele se rasta poochna 🍌😹",
             "😹 Tu garib nahi hai — but tujhe dekh ke gareebi ko takleef hoti hai 💰😂",
             "🔥 Teri kismat itni kharab hai ke lottery ticket bhi teri traf nahi dekhti 🎫😹",
@@ -1687,104 +2304,104 @@ async def run_user_bot(session_string, chat_id):
         # ─── NON-ABUSIVE RAID TEXTS (Menu9) ────────────────────────────────────
 
         attack_texts = [
-     "🗡️ Tera baap aaya hai sunta nahi kya 👑😈",
-        "⚡ Mere saamne aake dikhao himmat hai toh 😎💪",
-        "🔥 Attack mode on — teri khair nahi aaj 😡⚔️",
-        "💀 Tujhe itna marunga ke teri maa bhi nahi pehchanegi 😂🔥",
-        "💥 Beta ye territory meri hai nikal yahan se 🏴‍☠️⚡",
-        "🗡️ Aukaat hai toh saamne aa nahi toh chup baith 😈💀",
-        "⚡ Tu keyboard warrior hai asli mard nahi 😂👊",
-        "🔥 Teri maa ne bhi bola tera baap chahiye 😹💔",
-        "💥 Chal hat yahan se chota baccha 🤣👋",
-        "⚔️ Mujhe gaali de ke dekh kya hoga teri life mein 😈⚡",
-        "💀 Bhai seedha bol de surrender karega ya maar khayega 😎🔥",
-        "🗡️ Attack karta hoon toh block nahi hoga tera 😡⚔️",
-        "⚡ Yeh game mein nahi real life mein bhi kaatenge tujhe 💪😤",
-        "🔥 Tera confidence dekh ke hansi aati hai yaar 😂💥",
-        "💥 Andha hai ya dikhta nahi kaun boss hai yahan 👑⚔️",
-        "⚔️ Teri har gaali pe 10 gaaliyan waapis aayengi 😈🔥",
-        "💀 Beta peeth nahi dikhana mujhe — coward 🏃‍♂️😂",
-        "🗡️ Lad le ek baar — guarantee hai rota hoga tu 😹⚡",
-        "⚡ Keyboard tod ke aa toh baat karte hain 💥👊",
-        "🔥 Teri bhasha se pata chalta hai ghar mein parhe nahi 😂🤣",
-        "⚔️ Main yahan hoon — tu kahan chhupta hai aaja 😎💀",
-        "💀 Teri har move ka jawab taiyaar hai mere paas 🎯🔥",
-        "🗡️ Tu sirf darta hai asli attack nahi kar sakta 😂⚡",
-        "⚡ Baahubali nahi hai tu yahan — chal nikal 👋💥",
-        "🔥 Teri aukaat utni hai jitni do takke ki 😹🗡️",
-        "💥 Attack aur reaction — dono mein haar jayega tu ⚔️😎",
-        "⚔️ Ek baar aake dekh kya hota hai tere saath 💀🔥",
-        "💀 Sher ke saamne bakra nahi ban — phir bhi ban raha 😂⚡",
-        "🗡️ Yeh teri territory nahi bhai — haath jod ke ja 🙏😈",
-        "⚡ Tu attack karega aur main finish karunga 💥⚔️",
-        "🔥 Teri himmat hai toh mujhse seedha baat kar 😤💀",
-        "💥 Keyboard pe hero ban raha hai — asli duniya mein zero 😂🗡️",
-        "⚔️ Maar kha aur phir rota mat — warning hai 😈⚡",
-        "💀 Teri speed se faster hoon main — bhaag nahi sakta 🔥💥",
-        "🗡️ Yaar teri life mein koi nahi kya isliye yahan ata hai 😂⚔️",
-        "⚡ Hero mat ban — yahan real khiladi baithe hain 👑💀",
-        "🔥 Attack kiya — ab lash uthane ki taiyaari kar 😹⚡",
-        "⚔️ Teri har galti ka hisaab hoga — ruk 😈🔥",
-        "💀 Bhai attack se pehle 1% dimag use kar 🧠💥",
-        "🗡️ Chal hat nahi toh main khud hataunga isko 😤⚡",
-        "⚡ Yeh war hai — aur tu already haar gaya 😎🔥",
-        "🔥 Teri maa bhi tera lecture sunke bore ho gayi hogi 😹💥",
-        "💥 Main attack mein vishwas nahi karta — main finish mein karta hoon ⚔️😈",
-        "⚔️ Chal randike ek baar try kar le — rona mat baad mein 😂💀",
-        "💀 Ab samjha kya hua? No? Toh phir ek aur attack 🔥⚡",
+            "🗡️ Tera baap aaya hai sunta nahi kya 👑😈",
+            "⚡ Mere saamne aake dikhao himmat hai toh 😎💪",
+            "🔥 Attack mode on — teri khair nahi aaj 😡⚔️",
+            "💀 Tujhe itna marunga ke teri maa bhi nahi pehchanegi 😂🔥",
+            "💥 Beta ye territory meri hai nikal yahan se 🏴‍☠️⚡",
+            "🗡️ Aukaat hai toh saamne aa nahi toh chup baith 😈💀",
+            "⚡ Tu keyboard warrior hai asli mard nahi 😂👊",
+            "🔥 Teri maa ne bhi bola tera baap chahiye 😹💔",
+            "💥 Chal hat yahan se chota baccha 🤣👋",
+            "⚔️ Mujhe gaali de ke dekh kya hoga teri life mein 😈⚡",
+            "💀 Bhai seedha bol de surrender karega ya maar khayega 😎🔥",
+            "🗡️ Attack karta hoon toh block nahi hoga tera 😡⚔️",
+            "⚡ Yeh game mein nahi real life mein bhi kaatenge tujhe 💪😤",
+            "🔥 Tera confidence dekh ke hansi aati hai yaar 😂💥",
+            "💥 Andha hai ya dikhta nahi kaun boss hai yahan 👑⚔️",
+            "⚔️ Teri har gaali pe 10 gaaliyan waapis aayengi 😈🔥",
+            "💀 Beta peeth nahi dikhana mujhe — coward 🏃‍♂️😂",
+            "🗡️ Lad le ek baar — guarantee hai rota hoga tu 😹⚡",
+            "⚡ Keyboard tod ke aa toh baat karte hain 💥👊",
+            "🔥 Teri bhasha se pata chalta hai ghar mein parhe nahi 😂🤣",
+            "⚔️ Main yahan hoon — tu kahan chhupta hai aaja 😎💀",
+            "💀 Teri har move ka jawab taiyaar hai mere paas 🎯🔥",
+            "🗡️ Tu sirf darta hai asli attack nahi kar sakta 😂⚡",
+            "⚡ Baahubali nahi hai tu yahan — chal nikal 👋💥",
+            "🔥 Teri aukaat utni hai jitni do takke ki 😹🗡️",
+            "💥 Attack aur reaction — dono mein haar jayega tu ⚔️😎",
+            "⚔️ Ek baar aake dekh kya hota hai tere saath 💀🔥",
+            "💀 Sher ke saamne bakra nahi ban — phir bhi ban raha 😂⚡",
+            "🗡️ Yeh teri territory nahi bhai — haath jod ke ja 🙏😈",
+            "⚡ Tu attack karega aur main finish karunga 💥⚔️",
+            "🔥 Teri himmat hai toh mujhse seedha baat kar 😤💀",
+            "💥 Keyboard pe hero ban raha hai — asli duniya mein zero 😂🗡️",
+            "⚔️ Maar kha aur phir rota mat — warning hai 😈⚡",
+            "💀 Teri speed se faster hoon main — bhaag nahi sakta 🔥💥",
+            "🗡️ Yaar teri life mein koi nahi kya isliye yahan ata hai 😂⚔️",
+            "⚡ Hero mat ban — yahan real khiladi baithe hain 👑💀",
+            "🔥 Attack kiya — ab lash uthane ki taiyaari kar 😹⚡",
+            "⚔️ Teri har galti ka hisaab hoga — ruk 😈🔥",
+            "💀 Bhai attack se pehle 1% dimag use kar 🧠💥",
+            "🗡️ Chal hat nahi toh main khud hataunga isko 😤⚡",
+            "⚡ Yeh war hai — aur tu already haar gaya 😎🔥",
+            "🔥 Teri maa bhi tera lecture sunke bore ho gayi hogi 😹💥",
+            "💥 Main attack mein vishwas nahi karta — main finish mein karta hoon ⚔️😈",
+            "⚔️ Chal randike ek baar try kar le — rona mat baad mein 😂💀",
+            "💀 Ab samjha kya hua? No? Toh phir ek aur attack 🔥⚡",
         ]
 
         war_texts = [
             "⚔️ War shuru ho gayi — aur tu pehle hi haar gaya 😂🔥",
-        "💣 Bhai main war mein nahi aata — main war khatam karne aata hoon 😈⚡",
-        "🏴‍☠️ Tera jhanda uraya — apna wala lehraya 😎💀",
-        "⚔️ Tu lad raha hai mujhse — yeh teri sabse badi galti hai 🔥😂",
-        "💣 Main war nahi khelta — main result deliver karta hoon 👑⚡",
-        "🏴‍☠️ Battlefield pe aake to dekh — tera rank kya hai 😈⚔️",
-        "⚔️ Randike war declare kiya toh surrender ka option bhi rakh 😂💣",
-        "💣 Tu soldier nahi hai — tu sirf noise hai 🔊😂",
-        "🏴‍☠️ War mein strategy chahiye — tu sirf emotion se ladhta hai 😹⚔️",
-        "⚔️ Beta yeh teri territory nahi — nikalja 👋💣",
-        "💣 Tera war cry sunke mujhe neend aati hai 😴😂",
-        "🏴‍☠️ Main akela kaafi hoon — teri poori army ke liye ⚔️😈",
-        "⚔️ War ghoshit kiya — white flag kahan hai tera 🏳️😂",
-        "💣 Bhai tu pehle khud ko toh jeet — phir mujhse lad 😎💀",
-        "🏴‍☠️ Tera war tactic: bolna aur bhaagna 😹⚔️",
-        "⚔️ Main chhoda nahi — tu chhoda baad mein roega 😂💣",
-        "💣 Battle field pe aate waqt socha — main jeet sakta hoon? Nahi 😈🏴‍☠️",
-        "⚔️ Tu ek round bhi nahi jeeta — aur war ki baat karta hai 😂💀",
-        "💣 Bhai surrender kar le — dignity bachegi thodi 🙏😹",
-        "🏴‍☠️ War mein aaye — aur pehli line mein fail ho gaye ⚔️😂",
-        "⚔️ Tera morale zero hai — teri army teri khud ki dushman hai 😂💣",
-        "💣 Main war expert hoon — tu war ka victim hai 😎🏴‍☠️",
-        "🏴‍☠️ Beta teri strategy ek broken compass jaisi hai ⚔️😂",
-        "⚔️ War mein seena taan ke aa — peeth dikha ke nahi 😹💣",
-        "💣 Bhai teri army mein sirf tu hai — aur tu kaafi nahi 😈🏴‍☠️",
-        "🏴‍☠️ Teri war cry sun ke dushman khud aa gaye — rescue karne ⚔️😂",
-        "⚔️ Beta teri territory war se pehle hi haari thi 💣😹",
-        "💣 Main war mein nahi — main tujhe personally destroy karne mein hoon 😈🏴‍☠️",
-        "🏴‍☠️ Tera war plan sunke GPS bhi confused hai ⚔️😂",
-        "⚔️ Tu war mein aaya — par weapons lana bhool gaya 💣😹",
-        "💣 Bhai yeh war nahi tujhe sirf reality check tha 😂🏴‍☠️",
-        "🏴‍☠️ Teri army tujhse zyada samajhdaar hai — unhone bandh kiya ⚔️😈",
-        "⚔️ War mein bhi excuse karta hai — aur life mein bhi 😂💣",
-        "💣 Tu jo war soch raha hai — woh meri morning routine hai 😎🏴‍☠️",
-        "🏴‍☠️ Bhai teri war itni slow hai ke climate change pehle ho jaayega ⚔️😹",
-        "⚔️ Main tujhse war karta hoon — aur tujhe pata bhi nahi chalta 💣😂",
-        "💣 War ghoshit kar ke tu pehla tha — haar ke bhi pehla hai 😹🏴‍☠️",
-        "🏴‍☠️ Teri war mein consistency hai — consistently losing ⚔️😂",
-        "⚔️ Bhai war mein bhagna galat hai — tu phir bhi karta hai 💣😈",
-        "💣 Tu war mein aaya — main pehle se tere base par tha 🏴‍☠️😂",
-        "🏴‍☠️ Teri war strategy mein sirf ek problem hai — sab kuch ⚔️😹",
-        "⚔️ Beta war ka matalab samjha nahi tujhe — sikhaunga abhi 💣😂",
-        "💣 War mein hero nahi bante — survivors bante hain — aur tu nahi banega 🏴‍☠️😈",
-        "🏴‍☠️ Teri war mein dum nahi — sirf dhool hai ⚔️😂",
-        "⚔️ Bhai war declare karna alag baat hai — jeetan alag 💣😹",
-        "💣 Tu war mein aaya sirf lose karne ke liye — congratulations 🏴‍☠️😂",
-        "🏴‍☠️ Main akele teri sab pe bhaari hoon — aur tujhe pata hai ⚔️😈",
-        "⚔️ Teri war ka sabse bura part — tu khud tha 💣😂",
-        "💣 War mein aaye — teri team ne hi tujhe chhod diya 🏴‍☠️😹",
-        "🏴‍☠️ Beta war khatam — teri taraf se surrender accepted ⚔️😎",
+            "💣 Bhai main war mein nahi aata — main war khatam karne aata hoon 😈⚡",
+            "🏴‍☠️ Tera jhanda uraya — apna wala lehraya 😎💀",
+            "⚔️ Tu lad raha hai mujhse — yeh teri sabse badi galti hai 🔥😂",
+            "💣 Main war nahi khelta — main result deliver karta hoon 👑⚡",
+            "🏴‍☠️ Battlefield pe aake to dekh — tera rank kya hai 😈⚔️",
+            "⚔️ Randike war declare kiya toh surrender ka option bhi rakh 😂💣",
+            "💣 Tu soldier nahi hai — tu sirf noise hai 🔊😂",
+            "🏴‍☠️ War mein strategy chahiye — tu sirf emotion se ladta hai 😹⚔️",
+            "⚔️ Beta yeh teri territory nahi — nikalja 👋💣",
+            "💣 Tera war cry sunke mujhe neend aati hai 😴😂",
+            "🏴‍☠️ Main akela kaafi hoon — teri poori army ke liye ⚔️😈",
+            "⚔️ War ghoshit kiya — white flag kahan hai tera 🏳️😂",
+            "💣 Bhai tu pehle khud ko toh jeet — phir mujhse lad 😎💀",
+            "🏴‍☠️ Tera war tactic: bolna aur bhaagna 😹⚔️",
+            "⚔️ Main chhoda nahi — tu chhoda baad mein roega 😂💣",
+            "💣 Battle field pe aate waqt socha — main jeet sakta hoon? Nahi 😈🏴‍☠️",
+            "⚔️ Tu ek round bhi nahi jeeta — aur war ki baat karta hai 😂💀",
+            "💣 Bhai surrender kar le — dignity bachegi thodi 🙏😹",
+            "🏴‍☠️ War mein aaye — aur pehli line mein fail ho gaye ⚔️😂",
+            "⚔️ Tera morale zero hai — teri army teri khud ki dushman hai 😂💣",
+            "💣 Main war expert hoon — tu war ka victim hai 😎🏴‍☠️",
+            "🏴‍☠️ Beta teri strategy ek broken compass jaisi hai ⚔️😂",
+            "⚔️ War mein seena taan ke aa — peeth dikha ke nahi 😹💣",
+            "💣 Bhai teri army mein sirf tu hai — aur tu kaafi nahi 😈🏴‍☠️",
+            "🏴‍☠️ Teri war cry sun ke dushman khud aa gaye — rescue karne ⚔️😂",
+            "⚔️ Beta teri territory war se pehle hi haari thi 💣😹",
+            "💣 Main war mein nahi — main tujhe personally destroy karne mein hoon 😈🏴‍☠️",
+            "🏴‍☠️ Tera war plan sunke GPS bhi confused hai ⚔️😂",
+            "⚔️ Tu war mein aaya — par weapons lana bhool gaya 💣😹",
+            "💣 Bhai yeh war nahi tujhe sirf reality check tha 😂🏴‍☠️",
+            "🏴‍☠️ Teri army tujhse zyada samajhdaar hai — unhone bandh kiya ⚔️😈",
+            "⚔️ War mein bhi excuse karta hai — aur life mein bhi 😂💣",
+            "💣 Tu jo war soch raha hai — woh meri morning routine hai 😎🏴‍☠️",
+            "🏴‍☠️ Bhai teri war itni slow hai ke climate change pehle ho jaayega ⚔️😹",
+            "⚔️ Main tujhse war karta hoon — aur tujhe pata bhi nahi chalta 💣😂",
+            "💣 War ghoshit kar ke tu pehla tha — haar ke bhi pehla hai 😹🏴‍☠️",
+            "🏴‍☠️ Teri war mein consistency hai — consistently losing ⚔️😂",
+            "⚔️ Bhai war mein bhagna galat hai — tu phir bhi karta hai 💣😈",
+            "💣 Tu war mein aaya — main pehle se tere base par tha 🏴‍☠️😂",
+            "🏴‍☠️ Teri war strategy mein sirf ek problem hai — sab kuch ⚔️😹",
+            "⚔️ Beta war ka matalab samjha nahi tujhe — sikhaunga abhi 💣😂",
+            "💣 War mein hero nahi bante — survivors bante hain — aur tu nahi banega 🏴‍☠️😈",
+            "🏴‍☠️ Teri war mein dum nahi — sirf dhool hai ⚔️😂",
+            "⚔️ Bhai war declare karna alag baat hai — jeetan alag 💣😹",
+            "💣 Tu war mein aaya sirf lose karne ke liye — congratulations 🏴‍☠️😂",
+            "🏴‍☠️ Main akele teri sab pe bhaari hoon — aur tujhe pata hai ⚔️😈",
+            "⚔️ Teri war ka sabse bura part — tu khud tha 💣😂",
+            "💣 War mein aaye — teri team ne hi tujhe chhod diya 🏴‍☠️😹",
+            "🏴‍☠️ Beta war khatam — teri taraf se surrender accepted ⚔️😎",
         ]
 
         savage_texts = [
@@ -1807,7 +2424,7 @@ async def run_user_bot(session_string, chat_id):
             "💀 Confidence without skill is just delusion! 🎭",
             "😈 Your reputation precedes you — and it's not good! 📉",
             "🔥 Let's keep it real — you're average at best! ⭐",
-            "💀 You're a cautionary tale for others! ⚠️"
+            "💀 You're a cautionary tale for others! ⚠️",
             "😈 Main savage hoon — tujhe explanation nahi deta 🔥💀",
             "💀 Teri feelings mere liye statistics hain — irrelevant 😂😈",
             "🔥 Main woh nahi hoon jo tujhe comfortable feel karaaye 😎💀",
@@ -1861,324 +2478,324 @@ async def run_user_bot(session_string, chat_id):
         ]
 
         ultra_texts = [
-           "🔥 ULTRA mode activated — time to dominate! 👑"   
-        "🌪️ ULTRA MODE ACTIVATED — teri poori existence question mein hai 😈🔥",
-        "⚡ Ultra attack — pehle gaali sunna phir rona — sequence yaad kar 😂💀",
-        "🌪️ Beta ultra level pe aake dekh — yahan teri category nahi hai 👑🔥",
-        "⚡ ULTRA BLOW — teri soch se lekar attitude tak sab destroy 💥😈",
-        "🌪️ Yeh ultra mode hai — blocking nahi help karega 😂⚡",
-        "⚡ Ultra raid engaged — ab teri poori chat history history hai 📜😹",
-        "🌪️ Beta ultra speed mein aa — par seedha home le jaata hoon 💀🔥",
-        "⚡ Ultra fire — teri har defensive move kaam nahi karegi 😈🌪️",
-        "🌪️ Yeh ultra level fight hai — tu still bronze mein hai 😂⚡",
-        "⚡ ULTRA DAMAGE — teri reputation, teri aukaat, teri everything 💥😹",
-        "🌪️ Ultra mode mein poori teri army bhi kaafi nahi 😈🔥",
-        "⚡ Beta ultra attack sunne ke baad sun raha hai kya? Normal hai 😂🌪️",
-        "🌪️ ULTRA RANT incoming — tune jo kiya uska hisaab hoga 💀⚡",
-        "⚡ Yeh ultra version hai — tujhe pata bhi nahi kya aaya 😹🔥",
-        "🌪️ Ultra mode ON — timer chal raha hai teri destruction ka 😈⚡",
-        "⚡ Beta ultra strike pe tujhe sirf ek option hai — disappear 😂💀",
-        "🌪️ ULTRA COMBO — reply + react + roast + raid all at once 🔥⚡",
-        "⚡ Yeh ultra level rage hai — aur tujhe taste hoga 😈🌪️",
-        "🌪️ Ultra activated — pehle bol sorry phir ja 😹😂",
-        "⚡ Beta ULTRA message ka matlab — tu mere liye mission ban gaya 💀🔥",
-        "🌪️ ULTRA STORM — har cheez destroy ho rahi hai teri side pe 😈⚡",
-        "⚡ Yeh ultra nahi — tujhe sirf samjhane ki koshish thi 😂🌪️",
-        "🌪️ Ultra mode finish — teri team ne tera saath chhoda 💀🔥",
-        "⚡ Beta ULTRA = mera minimum effort on you 😈😂",
-        "🌪️ ULTRA RAIN — tune invite kiya tha — enjoy karna tha na? 😹⚡",
-        "⚡ Ultra mode mein ek hi rule — no mercy 💀🔥",
-        "🌪️ Beta ULTRA sabse pehle yeh — teri galti ka hisaab 😈⚡",
-        "⚡ Yeh ultra speed se aaya — aur teri samajh mein ultra slow aayega 😹🌪️",
-        "🌪️ ULTRA LOCK — ab yahan se nahi jayega tu 💀🔥",
-        "⚡ Beta ultra strike mein teri saari strategy fail hai 😂😈",
-        "🌪️ Ultra level pe chal — toh teri duniya hi badal jaayegi 🔥⚡",
-        "⚡ ULTRA — yeh word hi teri aukat se bada hai 😹💀",
-        "🌪️ Beta ultra mein main hoon — tujhe pata nahi tha kya 😈🔥",
-        "⚡ Yeh ultra raid hai — har message teri ek problem hai 😂🌪️",
-        "🌪️ ULTRA DONE — tu done kar le pehle 💀⚡",
-        "⚡ Beta ultra mein welcome — pehle bol kya karna hai 😹🔥",
-        "🌪️ Ultra mode — ab seedha point pe aata hoon — tu fail hai 😂😈",
-        "⚡ ULTRA BLAST — teri timeline pe aaya — nahi ruk sakta 💥🌪️",
-        "🌪️ Beta ultra mein aake teri baat karo — nahi aata toh seedha ja 💀🔥",
-        "⚡ Yeh ultra war hai — aur teri taraf se koi nahi 😂😈",
-        "🌪️ ULTRA FINAL — bas yahi hoga — accept kar 💀⚡",
-        "⚡ Beta ultra strike complete — check teri status 😹🔥",
-        "🌪️ Ultra mode mein log surrender karte hain — tujhe bhi karna hoga 😈⚡",
-        "⚡ Yeh ultra punishment nahi — tutorial hai teri life ka 😂💀",
-        "🌪️ ULTRA JUDGEMENT — teri har move judged ho rahi hai 🔥⚡",
-        "⚡ Beta ultra mein ek cheez — main hoon aur tu nahi rahe 😈🌪️",
-        "🌪️ Ultra mode completed — teri side destroyed 💀😂",
-        "⚡ Yeh ultra attack ka last wave hai — teri koi repair nahi 😹🔥",
-        "🌪️ ULTRA END — teri war khatam teri taraf se flag gira 😈⚡",
-        "⚡ Beta ultra mein aana tha — rona nahi tha — par dono kiye 😂💀",
+            "🔥 ULTRA mode activated — time to dominate! 👑",
+            "🌪️ ULTRA MODE ACTIVATED — teri poori existence question mein hai 😈🔥",
+            "⚡ Ultra attack — pehle gaali sunna phir rona — sequence yaad kar 😂💀",
+            "🌪️ Beta ultra level pe aake dekh — yahan teri category nahi hai 👑🔥",
+            "⚡ ULTRA BLOW — teri soch se lekar attitude tak sab destroy 💥😈",
+            "🌪️ Yeh ultra mode hai — blocking nahi help karega 😂⚡",
+            "⚡ Ultra raid engaged — ab teri poori chat history history hai 📜😹",
+            "🌪️ Beta ultra speed mein aa — par seedha home le jaata hoon 💀🔥",
+            "⚡ Ultra fire — teri har defensive move kaam nahi karegi 😈🌪️",
+            "🌪️ Yeh ultra level fight hai — tu still bronze mein hai 😂⚡",
+            "⚡ ULTRA DAMAGE — teri reputation, teri aukaat, teri everything 💥😹",
+            "🌪️ Ultra mode mein poori teri army bhi kaafi nahi 😈🔥",
+            "⚡ Beta ultra attack sunne ke baad sun raha hai kya? Normal hai 😂🌪️",
+            "🌪️ ULTRA RANT incoming — tune jo kiya uska hisaab hoga 💀⚡",
+            "⚡ Yeh ultra version hai — tujhe pata bhi nahi kya aaya 😹🔥",
+            "🌪️ Ultra mode ON — timer chal raha hai teri destruction ka 😈⚡",
+            "⚡ Beta ultra strike pe tujhe sirf ek option hai — disappear 😂💀",
+            "🌪️ ULTRA COMBO — reply + react + roast + raid all at once 🔥⚡",
+            "⚡ Yeh ultra level rage hai — aur tujhe taste hoga 😈🌪️",
+            "🌪️ Ultra activated — pehle bol sorry phir ja 😹😂",
+            "⚡ Beta ULTRA message ka matlab — tu mere liye mission ban gaya 💀🔥",
+            "🌪️ ULTRA STORM — har cheez destroy ho rahi hai teri side pe 😈⚡",
+            "⚡ Yeh ultra nahi — tujhe sirf samjhane ki koshish thi 😂🌪️",
+            "🌪️ Ultra mode finish — teri team ne tera saath chhoda 💀🔥",
+            "⚡ Beta ULTRA = mera minimum effort on you 😈😂",
+            "🌪️ ULTRA RAIN — tune invite kiya tha — enjoy karna tha na? 😹⚡",
+            "⚡ Ultra mode mein ek hi rule — no mercy 💀🔥",
+            "🌪️ Beta ULTRA sabse pehle yeh — teri galti ka hisaab 😈⚡",
+            "⚡ Yeh ultra speed se aaya — aur teri samajh mein ultra slow aayega 😹🌪️",
+            "🌪️ ULTRA LOCK — ab yahan se nahi jayega tu 💀🔥",
+            "⚡ Beta ultra strike mein teri saari strategy fail hai 😂😈",
+            "🌪️ Ultra level pe chal — toh teri duniya hi badal jaayegi 🔥⚡",
+            "⚡ ULTRA — yeh word hi teri aukat se bada hai 😹💀",
+            "🌪️ Beta ultra mein main hoon — tujhe pata nahi tha kya 😈🔥",
+            "⚡ Yeh ultra raid hai — har message teri ek problem hai 😂🌪️",
+            "🌪️ ULTRA DONE — tu done kar le pehle 💀⚡",
+            "⚡ Beta ultra mein welcome — pehle bol kya karna hai 😹🔥",
+            "🌪️ Ultra mode — ab seedha point pe aata hoon — tu fail hai 😂😈",
+            "⚡ ULTRA BLAST — teri timeline pe aaya — nahi ruk sakta 💥🌪️",
+            "🌪️ Beta ultra mein aake teri baat karo — nahi aata toh seedha ja 💀🔥",
+            "⚡ Yeh ultra war hai — aur teri taraf se koi nahi 😂😈",
+            "🌪️ ULTRA FINAL — bas yahi hoga — accept kar 💀⚡",
+            "⚡ Beta ultra strike complete — check teri status 😹🔥",
+            "🌪️ Ultra mode mein log surrender karte hain — tujhe bhi karna hoga 😈⚡",
+            "⚡ Yeh ultra punishment nahi — tutorial hai teri life ka 😂💀",
+            "🌪️ ULTRA JUDGEMENT — teri har move judged ho rahi hai 🔥⚡",
+            "⚡ Beta ultra mein ek cheez — main hoon aur tu nahi rahe 😈🌪️",
+            "🌪️ Ultra mode completed — teri side destroyed 💀😂",
+            "⚡ Yeh ultra attack ka last wave hai — teri koi repair nahi 😹🔥",
+            "🌪️ ULTRA END — teri war khatam teri taraf se flag gira 😈⚡",
+            "⚡ Beta ultra mein aana tha — rona nahi tha — par dono kiye 😂💀",
         ]
 
         # ─── NEW MENU9 RAID TEXTS ───────────────────────────────────────────────
 
         shame_texts = [
-        "😤 Sharam kar — itna gira hua kaam karte kaise hain tum log 🔥💀",
-        "🙅 Bhai teri harkat dekh ke pura group sharam se doob gaya 😂😤",
-        "😤 Yeh sab karke tujhe pride feel hoti hai? Really? 💀🔥",
-        "🙅 Beta teri harkaten dekh ke maa baap sharmayenge 😂😤",
-        "😤 Sharam nahi hai tujhe bilkul — clearly 💀😹",
-        "🙅 Bhai itna gira hua kaam dekh ke log muh fer lete hain 😤🔥",
-        "😤 Tu itna neeche gira — zameen bhi neeche ho gayi 💀😂",
-        "🙅 Beta sharam bhi nahi aata aisa karte hue 😤😹",
-        "😤 Yeh harkat dekh ke lagta hai — tujhe value kisi ne nahi sikhaya 💀🔥",
-        "🙅 Bhai log tujhe dekh ke aankhein pher lete hain — soch kya kar raha hai 😤😂",
-        "😤 Teri galti nahi — environment ki galti — par ab waqt hai change ka 💀😹",
-        "🙅 Beta sharam isliye nahi aati kyunki sharam feel karna seekha nahi 😤🔥",
-        "😤 Yeh kaam karke tujhe khushi mili? Toh mujhe tujhse zyada chinta hai 💀😂",
-        "🙅 Bhai teri harkat pura record hai — aur yeh record kharab hai 😤😹",
-        "😤 Tu sochta hai koi dekh nahi raha — sab dekh rahe hain 💀🔥",
-        "🙅 Beta aisa behave karta hai — khud se bhi embarrassing lagta hai tu 😤😂",
-        "😤 Yeh sab dekh ke lagta hai — teri parwarish kahan gayi 💀😹",
-        "🙅 Bhai teri harkaton ka hisaab hoga — aaj nahi toh kal 😤🔥",
-        "😤 Tu sharminda nahi hai — woh most shameful cheez hai 💀😂",
-        "🙅 Beta logo ne tujhe judge kiya — kyunki tune judge hone wala kaam kiya 😤😹",
-        "😤 Yeh bura kaam karke tujhe kya mila — kuch nahi — bas naam barbad 💀🔥",
-        "🙅 Bhai sharam karo — itna toh haq hai tumhara 😤😂",
-        "😤 Tu yahan cool lagne ki koshish mein sharminda ho gaya 💀😹",
-        "🙅 Beta ghalat rasta chhod — vapas aa 😤🔥",
-        "😤 Yeh sab karke teri image bani hai — worst category mein 💀😂",
-        "🙅 Bhai teri harkat ka review — 0 stars — do not recommend 😤😹",
-        "😤 Tu itna neeche gira — recovery mushkil lagti hai 💀🔥",
-        "🙅 Beta tujhe samjhana waqt waste hai — par try kar raha hoon 😤😂",
-        "😤 Yeh sab dekh ke mujhe tujhse zyada tujhpe gussa nahi — hairaani hai 💀😹",
-        "🙅 Bhai sharam se doob — par us mein bhi tujhe help chahiye shayad 😤🔥",
-        "😤 Teri harkat ek lesson hai — dusron ke liye kya nahi karna chahiye 💀😂",
-        "🙅 Beta teri yeh sab dekh ke khud bhi tujhse door rehna chahta hoon 😤😹",
-        "😤 Yeh gaaliyaan nahi — sirf reality check hai 💀🔥",
-        "🙅 Bhai sharam tab aati hai jab insaan mein insaniyat hoti hai 😤😂",
-        "😤 Tu ek example bana diya khud ko — negative example 💀😹",
-        "🙅 Beta tujhe ek baar ruk ke soochna chahiye tha — nahi soocha 😤🔥",
-        "😤 Yeh sab karke tu yahan hai — aur sochta hai main galat hoon? 💀😂",
-        "🙅 Bhai itna toh bata — tujhe kaisa feel hota hai yeh sab karne ke baad 😤😹",
-        "😤 Tu sharminda nahi — tujhe sharminda feel karna chahiye 💀🔥",
-        "🙅 Beta yeh rasta galat hai — abhi bhi change ho sakta hai 😤😂",
-        "😤 Yeh sab khud se bura nahi tha — tu tha 💀😹",
-        "🙅 Bhai teri harkaton ka real world impact sun — sab tujhse dur hain 😤🔥",
-        "😤 Tu soch raha hai main overreact kar raha hoon — par tujhe hisaab hoga 💀😂",
-        "🙅 Beta tujhe pata hai tu kya kar raha hai — aur phir bhi kar raha hai 😤😹",
-        "😤 Yeh sharm ki baat hai — aur tujhe realize karna chahiye 💀🔥",
-        "🙅 Bhai tujhe mirror mein dekhna chahiye — ek baar 😤😂",
-        "😤 Tu itna bura nahi hai — par yeh kaam bura tha 💀😹",
-        "🙅 Beta sharam isliye nahi aati — kyunki tu sochta nahi consequences ke baare mein 😤🔥",
-        "😤 Yeh moment tera lowest point hai — aur abhi bhi jaag sakta hai 💀😂",
-        "🙅 Bhai aaj ek kaam kar — sharminda ho aur badal — bas itna chahiye 😤😎",
+            "😤 Sharam kar — itna gira hua kaam karte kaise hain tum log 🔥💀",
+            "🙅 Bhai teri harkat dekh ke pura group sharam se doob gaya 😂😤",
+            "😤 Yeh sab karke tujhe pride feel hoti hai? Really? 💀🔥",
+            "🙅 Beta teri harkaten dekh ke maa baap sharmayenge 😂😤",
+            "😤 Sharam nahi hai tujhe bilkul — clearly 💀😹",
+            "🙅 Bhai itna gira hua kaam dekh ke log muh fer lete hain 😤🔥",
+            "😤 Tu itna neeche gira — zameen bhi neeche ho gayi 💀😂",
+            "🙅 Beta sharam bhi nahi aata aisa karte hue 😤😹",
+            "😤 Yeh harkat dekh ke lagta hai — tujhe value kisi ne nahi sikhaya 💀🔥",
+            "🙅 Bhai log tujhe dekh ke aankhein pher lete hain — soch kya kar raha hai 😤😂",
+            "😤 Teri galti nahi — environment ki galti — par ab waqt hai change ka 💀😹",
+            "🙅 Beta sharam isliye nahi aati kyunki sharam feel karna seekha nahi 😤🔥",
+            "😤 Yeh kaam karke tujhe khushi mili? Toh mujhe tujhse zyada chinta hai 💀😂",
+            "🙅 Bhai teri harkat pura record hai — aur yeh record kharab hai 😤😹",
+            "😤 Tu sochta hai koi dekh nahi raha — sab dekh rahe hain 💀🔥",
+            "🙅 Beta aisa behave karta hai — khud se bhi embarrassing lagta hai tu 😤😂",
+            "😤 Yeh sab dekh ke lagta hai — teri parwarish kahan gayi 💀😹",
+            "🙅 Bhai teri harkaton ka hisaab hoga — aaj nahi toh kal 😤🔥",
+            "😤 Tu sharminda nahi hai — woh most shameful cheez hai 💀😂",
+            "🙅 Beta logo ne tujhe judge kiya — kyunki tune judge hone wala kaam kiya 😤😹",
+            "😤 Yeh bura kaam karke tujhe kya mila — kuch nahi — bas naam barbad 💀🔥",
+            "🙅 Bhai sharam karo — itna toh haq hai tumhara 😤😂",
+            "😤 Tu yahan cool lagne ki koshish mein sharminda ho gaya 💀😹",
+            "🙅 Beta ghalat rasta chhod — vapas aa 😤🔥",
+            "😤 Yeh sab karke teri image bani hai — worst category mein 💀😂",
+            "🙅 Bhai teri harkat ka review — 0 stars — do not recommend 😤😹",
+            "😤 Tu itna neeche gira — recovery mushkil lagti hai 💀🔥",
+            "🙅 Beta tujhe samjhana waqt waste hai — par try kar raha hoon 😤😂",
+            "😤 Yeh sab dekh ke mujhe tujhse zyada tujhpe gussa nahi — hairaani hai 💀😹",
+            "🙅 Bhai sharam se doob — par us mein bhi tujhe help chahiye shayad 😤🔥",
+            "😤 Teri harkat ek lesson hai — dusron ke liye kya nahi karna chahiye 💀😂",
+            "🙅 Beta teri yeh sab dekh ke khud bhi tujhse door rehna chahta hoon 😤😹",
+            "😤 Yeh gaaliyaan nahi — sirf reality check hai 💀🔥",
+            "🙅 Bhai sharam tab aati hai jab insaan mein insaniyat hoti hai 😤😂",
+            "😤 Tu ek example bana diya khud ko — negative example 💀😹",
+            "🙅 Beta tujhe ek baar ruk ke soochna chahiye tha — nahi soocha 😤🔥",
+            "😤 Yeh sab karke tu yahan hai — aur sochta hai main galat hoon? 💀😂",
+            "🙅 Bhai itna toh bata — tujhe kaisa feel hota hai yeh sab karne ke baad 😤😹",
+            "😤 Tu sharminda nahi — tujhe sharminda feel karna chahiye 💀🔥",
+            "🙅 Beta yeh rasta galat hai — abhi bhi change ho sakta hai 😤😂",
+            "😤 Yeh sab khud se bura nahi tha — tu tha 💀😹",
+            "🙅 Bhai teri harkaton ka real world impact sun — sab tujhse dur hain 😤🔥",
+            "😤 Tu soch raha hai main overreact kar raha hoon — par tujhe hisaab hoga 💀😂",
+            "🙅 Beta tujhe pata hai tu kya kar raha hai — aur phir bhi kar raha hai 😤😹",
+            "😤 Yeh sharm ki baat hai — aur tujhe realize karna chahiye 💀🔥",
+            "🙅 Bhai tujhe mirror mein dekhna chahiye — ek baar 😤😂",
+            "😤 Tu itna bura nahi hai — par yeh kaam bura tha 💀😹",
+            "🙅 Beta sharam isliye nahi aati — kyunki tu sochta nahi consequences ke baare mein 😤🔥",
+            "😤 Yeh moment tera lowest point hai — aur abhi bhi jaag sakta hai 💀😂",
+            "🙅 Bhai aaj ek kaam kar — sharminda ho aur badal — bas itna chahiye 😤😎",
         ]
 
         diss_texts = [
             "🎤 Tera naam sun ke log mute kar dete hain khud ko 🔇😂",
-        "💀 Tu diss kar raha hai — khud ko diss kar pehle 🪞😹",
-        "🎙️ Teri rap jaisi hai — no flow no bars no future 🎵😂",
-        "💥 Bhai tera verse sun ke Eminem ne retire le liya 😹🎤",
-        "🔥 Teri diss itni kamzor hai ke whisper bhi zyada loud hai 🤫😂",
-        "💀 Tu sirf bolne mein mard hai karne mein? Zero 😈🎙️",
-        "🎤 Beta teri bars mein bar hi nahi — sirf khali string 🎸😂",
-        "💥 Tera diss track sunne ke baad logon ne earbuds tod diye 🎧😹",
-        "🔥 Bhai teri lyric likh ke dekha — autocorrect ne bhi reject kiya ✍️😂",
-        "💀 Tu diss karta hai aur log diss ko diss karte hain 😂🎤",
-        "🎙️ Teri voice aisi hai ke autotune bhi nahi bach sakta 🎶😹",
-        "💥 Beta freestyle kar le — ya phir stop the embarrassment 🛑😂",
-        "🔥 Tujhe sun ke DJ ne plug nikal diya 🔌😹",
-        "💀 Bhai tera flow aisa hai jaise jaam mein traffic — ruka hua 🚗😂",
-        "🎤 Teri soch itni slow hai ke beat ke saath nahi chalti 🥁😹",
-        "💥 Tera diss mujhe sula raha hai — better than sleeping pills 😴😂",
-        "🔥 Bhai asli diss toh tab hogi jab tu actually kuch achieve kare 🏆😹",
-        "💀 Teri lyrics Google Translate se better hain — bas 🌐😂",
-        "🎙️ Beta chal hat stage se — pehle walk-on music bana 🎵😹",
-        "💥 Tera punchline itna weak hai ke paper bhi survive kar le 📄😂",
-        "🔥 Bhai teri diss sun ke crowd ne baat karna shuru kar diya 🙄😹",
-        "💀 Tu verse likhta hai ya grocery list — same energy 🛒😂",
-        "🎤 Teri bars mein calories zyada hain — totally empty 😹🔥",
-        "💥 Bhai teri rhyme sunke chhote bacche bhi sharma jaate hain 😂💀",
-        "🔥 Teri diss aisi hai — sirf uski maa samjhi 😹🎙️",
-        "💀 Tu diss karta hai mujhe — main khud apni diss sunta hoon for fun 😂💥",
-        "🎤 Tera stage naam kya hai — Bakwas ke Raja? 👑😹",
-        "💥 Bhai teri microphone bhi teri awaaz se dara hua hai 🎙️😂",
-        "🔥 Tu diss mein expert hai — aur expert hone mein loser 😹💀",
-        "💀 Teri har line mein cringe hai — Olympic level 🥇😂",
-        "🎙️ Beta khud ki diss sun le — ek baar realise hoga 😹🔥",
-        "💥 Bhai tera diss itna slow hai ke mujhe neend aa gayi 😴😂",
-        "🔥 Teri creativity level: template pe naam likhna 💀😹",
-        "💀 Tu diss karne ke liye paida hua tha — aur fail ho gaya 😂🎤",
-        "🎙️ Tera rhyme scheme: aab aab aab — boring AF 📝😹",
-        "💥 Bhai teri diss response mein Soulja Boy beat use karta hun 😂🔥",
-        "🔥 Tu keyboard pe rap karta hai — phone pe nahi kaata 📱💀",
-        "💀 Teri diss sun ke mic khud neeche gir gaya 🎙️😂",
-        "🎤 Beta teri bars itni weak hain ke paper toh chodh kaagaz bhi nahi chhapega 📰😹",
-        "💥 Bhai tera flow paani mein nahi petrol mein hai — ab blast 🔥😂",
-        "🔥 Teri diss sunta hoon toh lagta hai sabne kaan band kar rakhe hain 🔇💀",
-        "💀 Tu diss mein ghusaa — tu diss tha diss 😹😂",
-        "🎙️ Bhai tera verse industry standard se neeche hai — ground floor bhi nahi 🏚️🔥",
-        "💥 Teri awaaz mein woh baat nahi jo diss mein chahiye — talent 😂💀",
-        "🔥 Beta teri diss itni pathetic hai ke pity vote mil sakta tha 🗳️😹",
-        "💀 Bhai teri rap career ek Instagram story jaisi hai — 24 ghante mein khatam 📸😂",
-        "🎤 Tu rapper nahi rapper ki copy ki copy ka knock-off hai 😹🔥",
-        "💥 Teri diss sun ke auto-generated ho sakti thi — aur better hoti 🤖😂",
-        "🔥 Bhai freestyle maar — aur phir sun khud ko — tujhe pata chalega 🎧💀",
-        "💀 Teri diss ka reply nahi deta — tujhe dignify karna time waste hai 😂🎙️",
+            "💀 Tu diss kar raha hai — khud ko diss kar pehle 🪞😹",
+            "🎙️ Teri rap jaisi hai — no flow no bars no future 🎵😂",
+            "💥 Bhai tera verse sun ke Eminem ne retire le liya 😹🎤",
+            "🔥 Teri diss itni kamzor hai ke whisper bhi zyada loud hai 🤫😂",
+            "💀 Tu sirf bolne mein mard hai karne mein? Zero 😈🎙️",
+            "🎤 Beta teri bars mein bar hi nahi — sirf khali string 🎸😂",
+            "💥 Tera diss track sunne ke baad logon ne earbuds tod diye 🎧😹",
+            "🔥 Bhai teri lyric likh ke dekha — autocorrect ne bhi reject kiya ✍️😂",
+            "💀 Tu diss karta hai aur log diss ko diss karte hain 😂🎤",
+            "🎙️ Teri voice aisi hai ke autotune bhi nahi bach sakta 🎶😹",
+            "💥 Beta freestyle kar le — ya phir stop the embarrassment 🛑😂",
+            "🔥 Tujhe sun ke DJ ne plug nikal diya 🔌😹",
+            "💀 Bhai tera flow aisa hai jaise jaam mein traffic — ruka hua 🚗😂",
+            "🎤 Teri soch itni slow hai ke beat ke saath nahi chalti 🥁😹",
+            "💥 Tera diss mujhe sula raha hai — better than sleeping pills 😴😂",
+            "🔥 Bhai asli diss toh tab hogi jab tu actually kuch achieve kare 🏆😹",
+            "💀 Teri lyrics Google Translate se better hain — bas 🌐😂",
+            "🎙️ Beta chal hat stage se — pehle walk-on music bana 🎵😹",
+            "💥 Tera punchline itna weak hai ke paper bhi survive kar le 📄😂",
+            "🔥 Bhai teri diss sun ke crowd ne baat karna shuru kar diya 🙄😹",
+            "💀 Tu verse likhta hai ya grocery list — same energy 🛒😂",
+            "🎤 Teri bars mein calories zyada hain — totally empty 😹🔥",
+            "💥 Bhai teri rhyme sunke chhote bacche bhi sharma jaate hain 😂💀",
+            "🔥 Teri diss aisi hai — sirf uski maa samjhi 😹🎙️",
+            "💀 Tu diss karta hai mujhe — main khud apni diss sunta hoon for fun 😂💥",
+            "🎤 Tera stage naam kya hai — Bakwas ke Raja? 👑😹",
+            "💥 Bhai teri microphone bhi teri awaaz se dara hua hai 🎙️😂",
+            "🔥 Tu diss mein expert hai — aur expert hone mein loser 😹💀",
+            "💀 Teri har line mein cringe hai — Olympic level 🥇😂",
+            "🎙️ Beta khud ki diss sun le — ek baar realise hoga 😹🔥",
+            "💥 Bhai tera diss itna slow hai ke mujhe neend aa gayi 😴😂",
+            "🔥 Teri creativity level: template pe naam likhna 💀😹",
+            "💀 Tu diss karne ke liye paida hua tha — aur fail ho gaya 😂🎤",
+            "🎙️ Tera rhyme scheme: aab aab aab — boring AF 📝😹",
+            "💥 Bhai teri diss response mein Soulja Boy beat use karta hun 😂🔥",
+            "🔥 Tu keyboard pe rap karta hai — phone pe nahi kaata 📱💀",
+            "💀 Teri diss sun ke mic khud neeche gir gaya 🎙️😂",
+            "🎤 Beta teri bars itni weak hain ke paper toh chodh kaagaz bhi nahi chhapega 📰😹",
+            "💥 Bhai tera flow paani mein nahi petrol mein hai — ab blast 🔥😂",
+            "🔥 Teri diss sunta hoon toh lagta hai sabne kaan band kar rakhe hain 🔇💀",
+            "💀 Tu diss mein ghusaa — tu diss tha diss 😹😂",
+            "🎙️ Bhai tera verse industry standard se neeche hai — ground floor bhi nahi 🏚️🔥",
+            "💥 Teri awaaz mein woh baat nahi jo diss mein chahiye — talent 😂💀",
+            "🔥 Beta teri diss itni pathetic hai ke pity vote mil sakta tha 🗳️😹",
+            "💀 Bhai teri rap career ek Instagram story jaisi hai — 24 ghante mein khatam 📸😂",
+            "🎤 Tu rapper nahi rapper ki copy ki copy ka knock-off hai 😹🔥",
+            "💥 Teri diss sun ke auto-generated ho sakti thi — aur better hoti 🤖😂",
+            "🔥 Bhai freestyle maar — aur phir sun khud ko — tujhe pata chalega 🎧💀",
+            "💀 Teri diss ka reply nahi deta — tujhe dignify karna time waste hai 😂🎙️",
         ]
 
         devil_texts = [
             "😈 DEVIL MODE — yahan woh aaya hai jo tujhe deserve karta hai 🔥💀",
-        "😈 Beta main devil nahi — main tera worst nightmare hoon 🔥⚡",
-        "😈 Devil raid activate — teri poori timeline disturbed 💀😂",
-        "😈 Bhai devil pe hath lagaya — ab bhog 🔥💥",
-        "😈 DEVIL FURY — teri sab cheez ek baar mein 💀⚡",
-        "😈 Beta devil ke saamne hum sab khiladi hain — tu beginner 🔥😂",
-        "😈 DEVIL ATTACK — teri defense devil ke touch se fail 💀😈",
-        "😈 Bhai devil mode mein koi safe nahi — tu bhi nahi 🔥⚡",
-        "😈 Teri galti — devil ko challenge karna 💀😂",
-        "😈 Beta devil ki bhasha — punishment aur reward — tu punishment mein hai 🔥😈",
-        "😈 DEVIL LEVEL RAGE — teri poori life on line 💀⚡",
-        "😈 Bhai devil se lad ke koi nahi jeeta — tu bhi nahi jeetega 🔥😂",
-        "😈 Devil mode — tera sab kuch noted — sab 💀😈",
-        "😈 Beta DEVIL FIRE — teri poori duniya burn 🔥⚡",
-        "😈 DEVIL RAID COMPLETE — tujhe koi nahi bachayega 💀😂",
-        "😈 Bhai devil teri har move pe already plan bana chuka 🔥😈",
-        "😈 Devil mode — tera future bleak — teri choice thi 💀⚡",
-        "😈 Beta devil ne tujhe select kiya — koi bada reason hoga 🔥😂",
-        "😈 DEVIL STORM — teri poori squad disbanded 💀😈",
-        "😈 Bhai devil ke game mein tera turn tha — abhi mera 🔥⚡",
-        "😈 Devil raid engage — now teri responsibility 💀😂",
-        "😈 Beta devil level punishment — tujhse tune karaya tha 🔥😈",
-        "😈 DEVIL ZONE — nikal ja nahi toh devil ka guest ban 💀⚡",
-        "😈 Bhai devil hamesha sunta hai — teri bhi sun li 🔥😂",
-        "😈 Devil mode ACTIVATED — teri poori timeline hijacked 💀😈",
-        "😈 Beta devil ke saamne sirf ek option — respect ya suffer 🔥⚡",
-        "😈 DEVIL FINAL BLOW — teri defense completely gone 💀😂",
-        "😈 Bhai devil ne decide kiya — teri loss is inevitable 🔥😈",
-        "😈 Devil mein aake dekha — tu deserving nahi tha challenge ka 💀⚡",
-        "😈 Beta DEVIL RAIN — teri har cheez soaked in fire 🔥😂",
-        "😈 DEVIL vs YOU — spoiler: devil wins 💀😈",
-        "😈 Bhai devil ke saamne teri prayers bhi kaam nahi aate 🔥⚡",
-        "😈 Devil mode — teri weak spots identified — attack 💀😂",
-        "😈 Beta devil ki nazar se tu nahi chhupta 🔥😈",
-        "😈 DEVIL JUDGMENT — teri poori history reviewed — verdict: guilty 💀⚡",
-        "😈 Bhai devil ki duniya mein tu tourist tha — time up 🔥😂",
-        "😈 Devil fury — tere steps already tracked hain 💀😈",
-        "😈 Beta DEVIL COUNTER — teri har move ka counter ready tha 🔥⚡",
-        "😈 DEVIL FINISH — teri game over — my game continues 💀😂",
-        "😈 Bhai devil mode se nikalna — tujhe option nahi 🔥😈",
-        "😈 Devil attack — teri soul targeted — figuratively 💀⚡",
-        "😈 Beta devil ne kaha — teri aukat nahi — aur devil galat nahi hota 🔥😂",
-        "😈 DEVIL STORM OVER — teri side: scorched earth 💀😈",
-        "😈 Bhai devil ke rules simple hain — tu follow nahi kiya 🔥⚡",
-        "😈 Devil raid — teri position compromised — retreat 💀😂",
-        "😈 Beta DEVIL mein aake rota mat — khud aaya tha 🔥😈",
-        "😈 DEVIL WAVE — teri har defence erased 💀⚡",
-        "😈 Bhai devil ka favorite — log jo khud ko smart samjhte hain — tu 🔥😂",
-        "😈 Devil mode DONE — check teri condition 💀😈",
-        "😈 Beta devil ne aaj tujhe yaadgaar bana diya — wrong reasons se 🔥⚡",
+            "😈 Beta main devil nahi — main tera worst nightmare hoon 🔥⚡",
+            "😈 Devil raid activate — teri poori timeline disturbed 💀😂",
+            "😈 Bhai devil pe hath lagaya — ab bhog 🔥💥",
+            "😈 DEVIL FURY — teri sab cheez ek baar mein 💀⚡",
+            "😈 Beta devil ke saamne hum sab khiladi hain — tu beginner 🔥😂",
+            "😈 DEVIL ATTACK — teri defense devil ke touch se fail 💀😈",
+            "😈 Bhai devil mode mein koi safe nahi — tu bhi nahi 🔥⚡",
+            "😈 Teri galti — devil ko challenge karna 💀😂",
+            "😈 Beta devil ki bhasha — punishment aur reward — tu punishment mein hai 🔥😈",
+            "😈 DEVIL LEVEL RAGE — teri poori life on line 💀⚡",
+            "😈 Bhai devil se lad ke koi nahi jeeta — tu bhi nahi jeetega 🔥😂",
+            "😈 Devil mode — tera sab kuch noted — sab 💀😈",
+            "😈 Beta DEVIL FIRE — teri poori duniya burn 🔥⚡",
+            "😈 DEVIL RAID COMPLETE — tujhe koi nahi bachayega 💀😂",
+            "😈 Bhai devil teri har move pe already plan bana chuka 🔥😈",
+            "😈 Devil mode — tera future bleak — teri choice thi 💀⚡",
+            "😈 Beta devil ne tujhe select kiya — koi bada reason hoga 🔥😂",
+            "😈 DEVIL STORM — teri poori squad disbanded 💀😈",
+            "😈 Bhai devil ke game mein tera turn tha — abhi mera 🔥⚡",
+            "😈 Devil raid engage — now teri responsibility 💀😂",
+            "😈 Beta devil level punishment — tujhse tune karaya tha 🔥😈",
+            "😈 DEVIL ZONE — nikal ja nahi toh devil ka guest ban 💀⚡",
+            "😈 Bhai devil hamesha sunta hai — teri bhi sun li 🔥😂",
+            "😈 Devil mode ACTIVATED — teri poori timeline hijacked 💀😈",
+            "😈 Beta devil ke saamne sirf ek option — respect ya suffer 🔥⚡",
+            "😈 DEVIL FINAL BLOW — teri defense completely gone 💀😂",
+            "😈 Bhai devil ne decide kiya — teri loss is inevitable 🔥😈",
+            "😈 Devil mein aake dekha — tu deserving nahi tha challenge ka 💀⚡",
+            "😈 Beta DEVIL RAIN — teri har cheez soaked in fire 🔥😂",
+            "😈 DEVIL vs YOU — spoiler: devil wins 💀😈",
+            "😈 Bhai devil ke saamne teri prayers bhi kaam nahi aate 🔥⚡",
+            "😈 Devil mode — teri weak spots identified — attack 💀😂",
+            "😈 Beta devil ki nazar se tu nahi chhupta 🔥😈",
+            "😈 DEVIL JUDGMENT — teri poori history reviewed — verdict: guilty 💀⚡",
+            "😈 Bhai devil ki duniya mein tu tourist tha — time up 🔥😂",
+            "😈 Devil fury — tere steps already tracked hain 💀😈",
+            "😈 Beta DEVIL COUNTER — teri har move ka counter ready tha 🔥⚡",
+            "😈 DEVIL FINISH — teri game over — my game continues 💀😂",
+            "😈 Bhai devil mode se nikalna — tujhe option nahi 🔥😈",
+            "😈 Devil attack — teri soul targeted — figuratively 💀⚡",
+            "😈 Beta devil ne kaha — teri aukat nahi — aur devil galat nahi hota 🔥😂",
+            "😈 DEVIL STORM OVER — teri side: scorched earth 💀😈",
+            "😈 Bhai devil ke rules simple hain — tu follow nahi kiya 🔥⚡",
+            "😈 Devil raid — teri position compromised — retreat 💀😂",
+            "😈 Beta DEVIL mein aake rota mat — khud aaya tha 🔥😈",
+            "😈 DEVIL WAVE — teri har defence erased 💀⚡",
+            "😈 Bhai devil ka favorite — log jo khud ko smart samjhte hain — tu 🔥😂",
+            "😈 Devil mode DONE — check teri condition 💀😈",
+            "😈 Beta devil ne aaj tujhe yaadgaar bana diya — wrong reasons se 🔥⚡",
         ]
 
         karma_texts = [
-           "☯️ Karma aaya — teri sab harkat ka hisaab ho raha hai 🔥💀",
-        "☯️ Beta karma kisi ki nahi sunta — teri bhi nahi 😂⚡",
-        "☯️ KARMA STRIKE — tune jo kiya woh teri taraf wapas aaya 🔥😈",
-        "☯️ Bhai karma judge nahi karta — deliver karta hai 💀😂",
-        "☯️ Karma mode activate — teri sab galtiyan wapas aa rahi hain 🔥⚡",
-        "☯️ Beta karma tujhe bhool nahi gaya — yaad rakha tha 😂💀",
-        "☯️ KARMA DELIVERY — teri harkat ka package arrive ho gaya 🔥😈",
-        "☯️ Bhai karma se koi nahi bachta — tu bhi nahi bachega 💀⚡",
-        "☯️ Karma tujhe dhundh raha tha — dhundh liya 🔥😂",
-        "☯️ Beta karma aata hai jab expect nahi karte — sun le 😂💀",
-        "☯️ KARMA HITS DIFFERENT — teri sab cheez wapas 🔥⚡",
-        "☯️ Bhai karma teri priority nahi thi — karma mein tu priority hai 😂💀",
-        "☯️ Karma cycle complete — tune jo kiya tune hi bhoga 🔥😈",
-        "☯️ Beta karma slow hota hai par sure hota hai — yeh sure tha 💀⚡",
-        "☯️ KARMA CALL — teri line pe aa gaya 🔥😂",
-        "☯️ Bhai karma mein koi error nahi — teri galti recorded thi 😂💀",
-        "☯️ Karma teri taraf waapis — enjoy 🔥⚡",
-        "☯️ Beta karma tera address jaanta tha 😂💀",
-        "☯️ KARMA FINAL — teri poori account balance zero 🔥😈",
-        "☯️ Bhai karma se lad nahi sakte — tu chhupa nahi karma se 💀⚡",
-        "☯️ Karma strike — tune deserve kiya — mila 🔥😂",
-        "☯️ Beta karma ko excuse nahi deta — sirf result deta hai 😂💀",
-        "☯️ KARMA STORM — teri sab beizzati aaj ekatha aayi 🔥⚡",
-        "☯️ Bhai karma tujhse behtar account maintain karta hai 😂💀",
-        "☯️ Karma mein tera account — overdraft mein hai 🔥😈",
-        "☯️ Beta karma ki speed teri speed se faster hai 💀⚡",
-        "☯️ KARMA BLAST — teri sab cheezon ka hisaab 🔥😂",
-        "☯️ Bhai karma ko pata tha tune kya kiya — sab record mein hai 😂💀",
-        "☯️ Karma kisi pe bhi nahi rulta — teri bhi nahi 🔥⚡",
-        "☯️ Beta karma tera future nahi — karma tera present hai 😂💀",
-        "☯️ KARMA INVOICE — teri sab galtiyon ka bill aa gaya 🔥😈",
-        "☯️ Bhai karma mein koi discount nahi milta — full price pay 💀⚡",
-        "☯️ Karma delivered — tune jo bheja wahi mila 🔥😂",
-        "☯️ Beta karma tujhse kisi ki nahi sunta — seedha deliver karta hai 😂💀",
-        "☯️ KARMA FULL CIRCLE — teri sab harkat ghumke teri hi taraf aayi 🔥⚡",
-        "☯️ Bhai karma teri taraf — aur tu prepared nahi tha 😂💀",
-        "☯️ Karma hit kiya — tujhe pata tha aayega — aaya 🔥😈",
-        "☯️ Beta karma mein interest bhi hota hai — tera compound ho gaya 💀⚡",
-        "☯️ KARMA COMPLETE — lesson mila? 🔥😂",
-        "☯️ Bhai karma ne tujhe select kiya — deservingly 😂💀",
-        "☯️ Karma tujhe yaad dila raha hai — tune kya kiya tha 🔥⚡",
-        "☯️ Beta karma ki awaaz nahi hoti — par result loud hota hai 😂💀",
-        "☯️ KARMA RESPONSE — teri har cheez ka seedha jawab 🔥😈",
-        "☯️ Bhai karma ki list mein tu first position pe tha 💀⚡",
-        "☯️ Karma tujhe bhool nahi gaya — teri galti note thi 🔥😂",
-        "☯️ Beta karma aur tu — aaj inka meetup schedule tha 😂💀",
-        "☯️ KARMA WRAP UP — teri life lesson: yeh tha 🔥⚡",
-        "☯️ Bhai karma ne apna kaam kiya — efficient tha 😂💀",
-        "☯️ Karma strike final — teri sab cheez balanced ho gayi — zero pe 🔥😈",
-        "☯️ Beta karma yaad rakhna — abhi bhi teri account open hai ☯️😂",
+            "☯️ Karma aaya — teri sab harkat ka hisaab ho raha hai 🔥💀",
+            "☯️ Beta karma kisi ki nahi sunta — teri bhi nahi 😂⚡",
+            "☯️ KARMA STRIKE — tune jo kiya woh teri taraf wapas aaya 🔥😈",
+            "☯️ Bhai karma judge nahi karta — deliver karta hai 💀😂",
+            "☯️ Karma mode activate — teri sab galtiyan wapas aa rahi hain 🔥⚡",
+            "☯️ Beta karma tujhe bhool nahi gaya — yaad rakha tha 😂💀",
+            "☯️ KARMA DELIVERY — teri harkat ka package arrive ho gaya 🔥😈",
+            "☯️ Bhai karma se koi nahi bachta — tu bhi nahi bachega 💀⚡",
+            "☯️ Karma tujhe dhundh raha tha — dhundh liya 🔥😂",
+            "☯️ Beta karma aata hai jab expect nahi karte — sun le 😂💀",
+            "☯️ KARMA HITS DIFFERENT — teri sab cheez wapas 🔥⚡",
+            "☯️ Bhai karma teri priority nahi thi — karma mein tu priority hai 😂💀",
+            "☯️ Karma cycle complete — tune jo kiya tune hi bhoga 🔥😈",
+            "☯️ Beta karma slow hota hai par sure hota hai — yeh sure tha 💀⚡",
+            "☯️ KARMA CALL — teri line pe aa gaya 🔥😂",
+            "☯️ Bhai karma mein koi error nahi — teri galti recorded thi 😂💀",
+            "☯️ Karma teri taraf waapis — enjoy 🔥⚡",
+            "☯️ Beta karma tera address jaanta tha 😂💀",
+            "☯️ KARMA FINAL — teri poori account balance zero 🔥😈",
+            "☯️ Bhai karma se lad nahi sakte — tu chhupa nahi karma se 💀⚡",
+            "☯️ Karma strike — tune deserve kiya — mila 🔥😂",
+            "☯️ Beta karma ko excuse nahi deta — sirf result deta hai 😂💀",
+            "☯️ KARMA STORM — teri sab beizzati aaj ekatha aayi 🔥⚡",
+            "☯️ Bhai karma tujhse behtar account maintain karta hai 😂💀",
+            "☯️ Karma mein tera account — overdraft mein hai 🔥😈",
+            "☯️ Beta karma ki speed teri speed se faster hai 💀⚡",
+            "☯️ KARMA BLAST — teri sab cheezon ka hisaab 🔥😂",
+            "☯️ Bhai karma ko pata tha tune kya kiya — sab record mein hai 😂💀",
+            "☯️ Karma kisi pe bhi nahi rulta — teri bhi nahi 🔥⚡",
+            "☯️ Beta karma tera future nahi — karma tera present hai 😂💀",
+            "☯️ KARMA INVOICE — teri sab galtiyon ka bill aa gaya 🔥😈",
+            "☯️ Bhai karma mein koi discount nahi milta — full price pay 💀⚡",
+            "☯️ Karma delivered — tune jo bheja wahi mila 🔥😂",
+            "☯️ Beta karma tujhse kisi ki nahi sunta — seedha deliver karta hai 😂💀",
+            "☯️ KARMA FULL CIRCLE — teri sab harkat ghumke teri hi taraf aayi 🔥⚡",
+            "☯️ Bhai karma teri taraf — aur tu prepared nahi tha 😂💀",
+            "☯️ Karma hit kiya — tujhe pata tha aayega — aaya 🔥😈",
+            "☯️ Beta karma mein interest bhi hota hai — tera compound ho gaya 💀⚡",
+            "☯️ KARMA COMPLETE — lesson mila? 🔥😂",
+            "☯️ Bhai karma ne tujhe select kiya — deservingly 😂💀",
+            "☯️ Karma tujhe yaad dila raha hai — tune kya kiya tha 🔥⚡",
+            "☯️ Beta karma ki awaaz nahi hoti — par result loud hota hai 😂💀",
+            "☯️ KARMA RESPONSE — teri har cheez ka seedha jawab 🔥😈",
+            "☯️ Bhai karma ki list mein tu first position pe tha 💀⚡",
+            "☯️ Karma tujhe bhool nahi gaya — teri galti note thi 🔥😂",
+            "☯️ Beta karma aur tu — aaj inka meetup schedule tha 😂💀",
+            "☯️ KARMA WRAP UP — teri life lesson: yeh tha 🔥⚡",
+            "☯️ Bhai karma ne apna kaam kiya — efficient tha 😂💀",
+            "☯️ Karma strike final — teri sab cheez balanced ho gayi — zero pe 🔥😈",
+            "☯️ Beta karma yaad rakhna — abhi bhi teri account open hai ☯️😂",
         ]
 
         doom_texts = [
             "💀 DOOM activated — teri poori existence on countdown 🔥😈",
-        "💀 Beta doom aaya — tera timer start ho gaya 😂⚡",
-        "💀 DOOM STRIKE — teri poori defense wiped 🔥😈",
-        "💀 Bhai doom se koi nahi bachta — teri bhi date aane wali thi 😂💀",
-        "💀 Doom mode — teri sab cheez: scheduled for deletion 🔥⚡",
-        "💀 Beta doom tera waqt dekh ke aaya — perfect timing 😂😈",
-        "💀 DOOM RAID — teri poori squad: doomed 🔥💀",
-        "💀 Bhai doom pe haath lagaya — yeh result expect karna chahiye tha 😂⚡",
-        "💀 Doom finale — teri poori story: ended 🔥😈",
-        "💀 Beta doom ki awaaz sunna nahi chahte log — teri aa gayi 😂💀",
-        "💀 DOOM COMPLETE — teri sab cheez: finished 🔥⚡",
-        "💀 Bhai doom tujhse pehle plan kar ke aaya tha 😂😈",
-        "💀 Doom level CRITICAL — teri situation: hopeless 🔥💀",
-        "💀 Beta doom ne tujhe select kiya — teri achievement nahi 😂⚡",
-        "💀 DOOM COUNTDOWN — teri sab cheez: 3... 2... 1... done 🔥😈",
-        "💀 Bhai doom mein rasta ek hi hota hai — neeche 😂💀",
-        "💀 Doom activated — teri poori future: uncertain 🔥⚡",
-        "💀 Beta doom ki language — teri samajh nahi aati — result aata hai 😂😈",
-        "💀 DOOM FINAL — teri poori team: gone 🔥💀",
-        "💀 Bhai doom aur tu — aaj ka meetup tera worst tha 😂⚡",
-        "💀 Doom mode — tera har step: tracked 🔥😈",
-        "💀 Beta doom ne teri position: permanent zero confirm ki 😂💀",
-        "💀 DOOM RAIN — teri har cheez: destroyed 🔥⚡",
-        "💀 Bhai doom mein mercy nahi hoti — teri request: denied 😂😈",
-        "💀 Doom strike — teri sab galtiyan: collected 🔥💀",
-        "💀 Beta doom clock — teri ticking: started 😂⚡",
-        "💀 DOOM WAVE — teri poori defense: overwhelmed 🔥😈",
-        "💀 Bhai doom ki speed mein teri situation resolve ho gayi — badly 😂💀",
-        "💀 Doom verdict — teri case: closed — against you 🔥⚡",
-        "💀 Beta doom se pehle sun: teri galti — doom aaya 😂😈",
-        "💀 DOOM ARRIVAL — teri poori day ruined 🔥💀",
-        "💀 Bhai doom ne tujhe apna project bana liya 😂⚡",
-        "💀 Doom mode final — teri sab cheez: ash 🔥😈",
-        "💀 Beta doom ki ek khasiyat — woh aata zaroor hai 😂💀",
-        "💀 DOOM EXECUTION — teri poori plan: failed 🔥⚡",
-        "💀 Bhai doom tera number leke aaya tha — mila 😂😈",
-        "💀 Doom level MAX — teri recovery: impossible 🔥💀",
-        "💀 Beta doom ki taraf se ek gift — teri haari 😂⚡",
-        "💀 DOOM COMPLETE CYCLE — teri poori existence reset 🔥😈",
-        "💀 Bhai doom tujhse better hai — wait nahi karta 😂💀",
-        "💀 Doom mode — teri sab cheez: compromised 🔥⚡",
-        "💀 Beta DOOM aur tu — tujhe jeetna tha par doom ka hi naam hai 😂😈",
-        "💀 DOOM FINAL WAVE — teri sab: erased 🔥💀",
-        "💀 Bhai doom ne tujhe memorable bana diya — galat reasons se 😂⚡",
-        "💀 Doom activated final time — teri countdown: zero 🔥😈",
-        "💀 Beta DOOM se seekhna tha — tujhe nahi tha pata ab hai 😂💀",
-        "💀 DOOM OVER — teri side: collapsed — mine: standing 🔥⚡",
-        "💀 Bhai doom ne tera chapter likh diya — R.I.P. chapter 😂😈",
-        "💀 Doom final message — tujhe yaad rahega — sahi reasons se nahi 🔥💀",
-        "💀 Beta DOOM complete — check teri condition — yahi tha 😂⚡",
+            "💀 Beta doom aaya — tera timer start ho gaya 😂⚡",
+            "💀 DOOM STRIKE — teri poori defense wiped 🔥😈",
+            "💀 Bhai doom se koi nahi bachta — teri bhi date aane wali thi 😂💀",
+            "💀 Doom mode — teri sab cheez: scheduled for deletion 🔥⚡",
+            "💀 Beta doom tera waqt dekh ke aaya — perfect timing 😂😈",
+            "💀 DOOM RAID — teri poori squad: doomed 🔥💀",
+            "💀 Bhai doom pe haath lagaya — yeh result expect karna chahiye tha 😂⚡",
+            "💀 Doom finale — teri poori story: ended 🔥😈",
+            "💀 Beta doom ki awaaz sunna nahi chahte log — teri aa gayi 😂💀",
+            "💀 DOOM COMPLETE — teri sab cheez: finished 🔥⚡",
+            "💀 Bhai doom tujhse pehle plan kar ke aaya tha 😂😈",
+            "💀 Doom level CRITICAL — teri situation: hopeless 🔥💀",
+            "💀 Beta doom ne tujhe select kiya — teri achievement nahi 😂⚡",
+            "💀 DOOM COUNTDOWN — teri sab cheez: 3... 2... 1... done 🔥😈",
+            "💀 Bhai doom mein rasta ek hi hota hai — neeche 😂💀",
+            "💀 Doom activated — teri poori future: uncertain 🔥⚡",
+            "💀 Beta doom ki language — teri samajh nahi aati — result aata hai 😂😈",
+            "💀 DOOM FINAL — teri poori team: gone 🔥💀",
+            "💀 Bhai doom aur tu — aaj ka meetup tera worst tha 😂⚡",
+            "💀 Doom mode — tera har step: tracked 🔥😈",
+            "💀 Beta doom ne teri position: permanent zero confirm ki 😂💀",
+            "💀 DOOM RAIN — teri har cheez: destroyed 🔥⚡",
+            "💀 Bhai doom mein mercy nahi hoti — teri request: denied 😂😈",
+            "💀 Doom strike — teri sab galtiyan: collected 🔥💀",
+            "💀 Beta doom clock — teri ticking: started 😂⚡",
+            "💀 DOOM WAVE — teri poori defense: overwhelmed 🔥😈",
+            "💀 Bhai doom ki speed mein teri situation resolve ho gayi — badly 😂💀",
+            "💀 Doom verdict — teri case: closed — against you 🔥⚡",
+            "💀 Beta doom se pehle sun: teri galti — doom aaya 😂😈",
+            "💀 DOOM ARRIVAL — teri poori day ruined 🔥💀",
+            "💀 Bhai doom ne tujhe apna project bana liya 😂⚡",
+            "💀 Doom mode final — teri sab cheez: ash 🔥😈",
+            "💀 Beta doom ki ek khasiyat — woh aata zaroor hai 😂💀",
+            "💀 DOOM EXECUTION — teri poori plan: failed 🔥⚡",
+            "💀 Bhai doom tera number leke aaya tha — mila 😂😈",
+            "💀 Doom level MAX — teri recovery: impossible 🔥💀",
+            "💀 Beta doom ki taraf se ek gift — teri haari 😂⚡",
+            "💀 DOOM COMPLETE CYCLE — teri poori existence reset 🔥😈",
+            "💀 Bhai doom tujhse better hai — wait nahi karta 😂💀",
+            "💀 Doom mode — teri sab cheez: compromised 🔥⚡",
+            "💀 Beta DOOM aur tu — tujhe jeetna tha par doom ka hi naam hai 😂😈",
+            "💀 DOOM FINAL WAVE — teri sab: erased 🔥💀",
+            "💀 Bhai doom ne tujhe memorable bana diya — galat reasons se 😂⚡",
+            "💀 Doom activated final time — teri countdown: zero 🔥😈",
+            "💀 Beta DOOM se seekhna tha — tujhe nahi tha pata ab hai 😂💀",
+            "💀 DOOM OVER — teri side: collapsed — mine: standing 🔥⚡",
+            "💀 Bhai doom ne tera chapter likh diya — R.I.P. chapter 😂😈",
+            "💀 Doom final message — tujhe yaad rahega — sahi reasons se nahi 🔥💀",
+            "💀 Beta DOOM complete — check teri condition — yahi tha 😂⚡",
         ]
 
         # ─── GAME TEXTS (Menu10) ──────────────────────────────────────────────
@@ -2334,8 +2951,7 @@ async def run_user_bot(session_string, chat_id):
             {"q": "Main hoon jo kabhi nahi marta, kabhi nahi hota. Main kya hoon?", "a": "Atma (Soul)"},
             {"q": "The person who makes it doesn't need it. The person who buys it doesn't use it. The person who uses it doesn't know they're using it. What is it?", "a": "coffin"},
         ]
-            
-                    
+
         # ─── FUN TEXTS (Joke, Fact, Compliment, Quotes) ──────────────────────
 
         joke_list = [
@@ -2367,7 +2983,7 @@ async def run_user_bot(session_string, chat_id):
             "👁️ Insaan ki aankh 10 million rangon ko differentiate kar sakti hai!",
             "🐝 Ek machhar ek second mein 600 baar apne pankh hilata hai!",
             "🦒 Giraffe ki tongue 20 inches lambi hoti hai!",
-            "🐧 Penguins ek dusre ko pehchanne ke liye unique calls use karte hain!"
+            "🐧 Penguins ek dusre ko pehchanne ke liye unique calls use karte hain!",
             "🚀 Space mein awaaz travel nahi karti, kyunki wahan hawa nahi hoti.",
             "👅 Har insaan ki tongue print fingerprints ki tarah unique hoti hai.",
             "🦒 Giraffe apni 21-inch lambi tongue se kaan saaf kar sakta hai.",
@@ -2447,7 +3063,7 @@ async def run_user_bot(session_string, chat_id):
             "💭 'The only way to do great work is to love what you do.' — Steve Jobs",
             "💭 'In the middle of difficulty lies opportunity.' — Einstein",
             "💭 'Believe you can and you're halfway there.' — Theodore Roosevelt",
-            "💭 'The best time to plant a tree was 20 years ago. The second best time is now.' — Chinese Proverb"
+            "💭 'The best time to plant a tree was 20 years ago. The second best time is now.' — Chinese Proverb",
             "💭 People's lives don't end when they die, it ends when they lose faith. — Itachi Uchiha",
             "💭 Wake up to reality. Nothing ever goes as planned in this world. — Madara Uchiha",
             "💭 Those who break the rules are trash, but those who abandon their friends are worse than trash. — Kakashi Hatake",
@@ -2731,7 +3347,8 @@ async def run_user_bot(session_string, chat_id):
                 "║  📌 `.menu8` → 🎭 FUN RAIDS (Shayari/Rizz/Pickup/Roast)   ║\n"
                 "║  📌 `.menu9` → ⚔️ NON-ABUSIVE RAIDS (Attack/War/Savage/Ultra/Shame/Diss/Devil/Karma/Doom) ║\n"
                 "║  📌 `.menu10`→ 🎮 GAMES & FUN (Truth/Dare/Situation/RPS/TTT/Flip/Dice/Joke/Fact/Compliment/Quotes) ║\n"
-                "║  📌 `.menu11`→ 💎 PREMIUM COMMANDS                          ║\n"
+                "║  📌 `.menu11a`→ 💎 PREMIUM COMMANDS (Part 1)               ║\n"
+                "║  📌 `.menu11b`→ 💎 PREMIUM COMMANDS (Part 2)               ║\n"
                 "║                                                              ║\n"
                 "║  💡 Use `.cmds` for complete command list.                  ║\n"
                 "║                                                              ║\n"
@@ -3108,20 +3725,32 @@ async def run_user_bot(session_string, chat_id):
                 "║  │  `.compliment`→ Random compliment                       ║\n"
                 "║  │  `.quote`    → Inspirational quote                      ║\n"
                 "║  └───────────────────────────────┘                          ║\n"
+                "║  ┌───〔 ✍️ TYPING EFFECT 〕───┐                           ║\n"
+                "║  │  `.typing bold <text>`  → Bold typing                  ║\n"
+                "║  │  `.typing italic <text>`→ Italic typing                ║\n"
+                "║  │  `.typing double <text>`→ Double struck typing         ║\n"
+                "║  │  `.typing script <text>`→ Script typing                ║\n"
+                "║  │  `.typing mono <text>`  → Monospace typing             ║\n"
+                "║  │  `.typing circle <text>`→ Circled typing               ║\n"
+                "║  │  `.typing square <text>`→ Squared typing               ║\n"
+                "║  │  `.typing default <text>`→ Normal typing               ║\n"
+                "║  │  `.typing <text>`       → Bold typing (default)        ║\n"
+                "║  └───────────────────────────────┘                          ║\n"
                 "║  📌 `.menu` → Main menu                                     ║\n"
                 "╚══════════════════════════════════════════════════════════════╝"
             )
             await safe_edit(event, menu)
 
-        # ─── NEW MENU11 (Premium Commands) ──────────────────────────────────
-        @register_cmd("menu11")
-        async def cmd_menu11(event, _):
+        # ─── MENU11a & MENU11b (split premium commands) ──────────────────────
+
+        @register_cmd("menu11a")
+        async def cmd_menu11a(event, _):
             if not await is_premium_user(event.sender_id):
                 await safe_edit(event, "❌ This menu is for premium users only.\nBuy premium with `/buy` in main bot.")
                 return
             menu = (
                 "╔══════════════════════════════════════════════════════════════╗\n"
-                "║            💎 𝗣𝗥𝗘𝗠𝗜𝗨𝗠 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦                    ║\n"
+                "║            💎 𝗣𝗥𝗘𝗠𝗜𝗨𝗠 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦 (𝗣𝗮𝗿𝘁 𝗔)         ║\n"
                 "╠══════════════════════════════════════════════════════════════╣\n"
                 "║  ┌───〔 💬 TEXT FORMATTING 〕───┐                          ║\n"
                 "║  │  `.upper <text>`   → Uppercase                          ║\n"
@@ -3152,7 +3781,44 @@ async def run_user_bot(session_string, chat_id):
                 "║  │  `.lettercount <text>` → Letter count (without spaces) ║\n"
                 "║  │  `.charinfo <text>` → Info about first character       ║\n"
                 "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🧮 MATH 〕───┐                                     ║\n"
+                "║  ┌───〔 ✨ STYLISH TEXT 〕───┐                             ║\n"
+                "║  │  `.titlecase <text>` → Title Case                      ║\n"
+                "║  │  `.snake <text>`     → snake_case                      ║\n"
+                "║  │  `.shout <text>`     → SHOUT!                          ║\n"
+                "║  │  `.mock <text>`      → mOcKiNg TeXt                   ║\n"
+                "║  │  `.spaceit <text>`   → S p a c e d                    ║\n"
+                "║  │  `.removespaces <text>` → Removespaces                 ║\n"
+                "║  │  `.clap <text>`      → 👏 Clap 👏 Between 👏 Words    ║\n"
+                "║  │  `.mirror <text>`    → Mirror text                     ║\n"
+                "║  │  `.flip_text <text>` → Flip upside down                ║\n"
+                "║  └───────────────────────────────┘                          ║\n"
+                "║  📌 `.menu11b` → Part B                                    ║\n"
+                "║  📌 `.menu` → Main menu                                     ║\n"
+                "╚══════════════════════════════════════════════════════════════╝"
+            )
+            await safe_edit(event, menu)
+
+        @register_cmd("menu11b")
+        async def cmd_menu11b(event, _):
+            if not await is_premium_user(event.sender_id):
+                await safe_edit(event, "❌ This menu is for premium users only.\nBuy premium with `/buy` in main bot.")
+                return
+            menu = (
+                "╔══════════════════════════════════════════════════════════════╗\n"
+                "║            💎 𝗣𝗥𝗘𝗠𝗜𝗨𝗠 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦 (𝗣𝗮𝗿𝘁 𝗕)         ║\n"
+                "╠══════════════════════════════════════════════════════════════╣\n"
+                "║  ┌───〔 ✍️ TYPING EFFECT (Premium) 〕───┐                  ║\n"
+                "║  │  `.typing bold <text>`  → Bold typing effect            ║\n"
+                "║  │  `.typing italic <text>`→ Italic typing effect          ║\n"
+                "║  │  `.typing double <text>`→ Double struck typing          ║\n"
+                "║  │  `.typing script <text>`→ Script typing effect          ║\n"
+                "║  │  `.typing mono <text>`  → Monospace typing              ║\n"
+                "║  │  `.typing circle <text>`→ Circled typing                ║\n"
+                "║  │  `.typing square <text>`→ Squared typing                ║\n"
+                "║  │  `.typing default <text>`→ Normal typing                ║\n"
+                "║  │  `.typing <text>`       → Bold typing (default)         ║\n"
+                "║  └───────────────────────────────┘                          ║\n"
+                "║  ┌───〔 🧮 MATH & FUNCTIONS 〕───┐                        ║\n"
                 "║  │  `.bmi <weight_kg> <height_m>` → BMI                   ║\n"
                 "║  │  `.age <YYYY-MM-DD>` → Age from birth date              ║\n"
                 "║  │  `.prime <n>`      → Check if prime                     ║\n"
@@ -3164,22 +3830,6 @@ async def run_user_bot(session_string, chat_id):
                 "║  │  `.percentage <n> <total>` → Percentage                 ║\n"
                 "║  │  `.number <n>`     → Number properties                  ║\n"
                 "║  │  `.countdown <seconds>` → Countdown timer               ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 ✨ STYLISH TEXT 〕───┐                             ║\n"
-                "║  │  `.titlecase <text>` → Title Case                      ║\n"
-                "║  │  `.snake <text>`     → snake_case                      ║\n"
-                "║  │  `.shout <text>`     → SHOUT!                          ║\n"
-                "║  │  `.mock <text>`      → mOcKiNg TeXt                   ║\n"
-                "║  │  `.alternating <text>` → AlTeRnAtInG                   ║\n"
-                "║  │  `.spaceit <text>`   → S p a c e d                    ║\n"
-                "║  │  `.removespaces <text>` → Removespaces                 ║\n"
-                "║  │  `.clap <text>`      → 👏 Clap 👏 Between 👏 Words    ║\n"
-                "║  │  `.mirror <text>`    → Mirror text                     ║\n"
-                "║  │  `.flip_text <text>` → Flip upside down                ║\n"
-                "║  │  `.tinytext <text>`  → ᵗⁱⁿʸ ᵗᵉˣᵗ                  ║\n"
-                "║  │  `.bubble <text>`    → ⓑⓤⓑⓑⓛⓔ                    ║\n"
-                "║  │  `.square_text <text>` → 🅂🅀🅄🄰🅁🄴                 ║\n"
-                "║  │  `.boxtext <text>`    → [Boxed Text]                    ║\n"
                 "║  └───────────────────────────────┘                          ║\n"
                 "║  ┌───〔 🔒 ENCRYPTION & MORE 〕───┐                       ║\n"
                 "║  │  `.encrypt <text>`  → Caesar cipher (shift 3)           ║\n"
@@ -3202,10 +3852,11 @@ async def run_user_bot(session_string, chat_id):
                 "║  │  `.protectlist`      → List protected commands          ║\n"
                 "║  └───────────────────────────────┘                          ║\n"
                 "║  ┌───〔 💬 OTHER PREMIUM 〕───┐                            ║\n"
-                "║  │  `.typing <text>`  → Typing effect with stylish font   ║\n"
                 "║  │  `.afk <reason>`   → Set AFK (mention triggers reply)  ║\n"
                 "║  │  `.afk off`        → Remove AFK                         ║\n"
+                "║  │  `.premiumstatus`  → Check your premium status          ║\n"
                 "║  └───────────────────────────────┘                          ║\n"
+                "║  📌 `.menu11a` → Part A                                    ║\n"
                 "║  📌 `.menu` → Main menu                                     ║\n"
                 "╚══════════════════════════════════════════════════════════════╝"
             )
@@ -3217,7 +3868,6 @@ async def run_user_bot(session_string, chat_id):
             if not arg:
                 return
             cmd = arg.strip().lower()
-            # Validate command exists
             if cmd not in commands:
                 await safe_edit(event, f"❌ Command `.{cmd}` not found.")
                 return
@@ -3241,20 +3891,147 @@ async def run_user_bot(session_string, chat_id):
             msg = "🛡️ **Protected Commands:**\n" + "\n".join(f"• `.{c}`" for c in sorted(prot))
             await safe_edit(event, msg)
 
-        # ─── TYPING EFFECT ────────────────────────────────────────────────────
+        @register_cmd("premiumstatus", premium=True)
+        async def cmd_premiumstatus(event, _):
+            data = await check_premium_status(event.sender_id)
+            if not data:
+                await safe_edit(event, "❌ You are not a premium user.")
+                return
+            expiry = data['expiry_date'].strftime("%Y-%m-%d %H:%M:%S")
+            plan = data['plan'].upper()
+            await safe_edit(event, f"💎 **Premium Status**\n━━━━━━━━━━━━━━━\n📅 Plan: {plan}\n⏳ Expires: {expiry}\n🛡️ Protected from all raids/spam/deathgod.")
+
+               # ─── TYPING EFFECT WITH MULTIPLE STYLES ─────────────────────────────
         @register_cmd("typing", premium=True)
         async def cmd_typing(event, arg):
             if not arg:
                 return
-            # Simulate typing animation: send typing action, then send stylized text
-            await user_bot.send_message(event.chat_id, "⌨️ *typing...*")
-            await asyncio.sleep(2)
-            # Convert to italic (or any fancy style)
-            styled = f"__{arg}__"  # italic
-            await safe_send(event.chat_id, f"✍️ {styled}")
+            
+            # Parse arguments: .typing <style> <text>
+            parts = arg.split(maxsplit=1)
+            style = "bold"
+            text = arg
+            
+            if len(parts) == 2 and parts[0].lower() in ['bold', 'italic', 'double', 'script', 'mono', 'circle', 'square', 'default']:
+                style = parts[0].lower()
+                text = parts[1]
+            
+            # ─── STYLISH FONT MAPS ──────────────────────────────────────────
+            bold_map = {
+                'a': '𝗮', 'b': '𝗯', 'c': '𝗰', 'd': '𝗱', 'e': '𝗲', 'f': '𝗳', 'g': '𝗴', 'h': '𝗵',
+                'i': '𝗶', 'j': '𝗷', 'k': '𝗸', 'l': '𝗹', 'm': '𝗺', 'n': '𝗻', 'o': '𝗼', 'p': '𝗽',
+                'q': '𝗾', 'r': '𝗿', 's': '𝘀', 't': '𝘁', 'u': '𝘂', 'v': '𝘃', 'w': '𝘄', 'x': '𝘅',
+                'y': '𝘆', 'z': '𝘇',
+                'A': '𝗔', 'B': '𝗕', 'C': '𝗖', 'D': '𝗗', 'E': '𝗘', 'F': '𝗙', 'G': '𝗚', 'H': '𝗛',
+                'I': '𝗜', 'J': '𝗝', 'K': '𝗞', 'L': '𝗟', 'M': '𝗠', 'N': '𝗡', 'O': '𝗢', 'P': '𝗣',
+                'Q': '𝗤', 'R': '𝗥', 'S': '𝗦', 'T': '𝗧', 'U': '𝗨', 'V': '𝗩', 'W': '𝗪', 'X': '𝗫',
+                'Y': '𝗬', 'Z': '𝗭',
+                '0': '𝟬', '1': '𝟭', '2': '𝟮', '3': '𝟯', '4': '𝟰',
+                '5': '𝟱', '6': '𝟲', '7': '𝟳', '8': '𝟴', '9': '𝟵'
+            }
+            italic_map = {
+                'a': '𝘢', 'b': '𝘣', 'c': '𝘤', 'd': '𝘥', 'e': '𝘦', 'f': '𝘧', 'g': '𝘨', 'h': '𝘩',
+                'i': '𝘪', 'j': '𝘫', 'k': '𝘬', 'l': '𝘭', 'm': '𝘮', 'n': '𝘯', 'o': '𝘰', 'p': '𝘱',
+                'q': '𝘲', 'r': '𝘳', 's': '𝘴', 't': '𝘵', 'u': '𝘶', 'v': '𝘷', 'w': '𝘸', 'x': '𝘹',
+                'y': '𝘺', 'z': '𝘻',
+                'A': '𝘈', 'B': '𝘉', 'C': '𝘊', 'D': '𝘋', 'E': '𝘌', 'F': '𝘍', 'G': '𝘎', 'H': '𝘏',
+                'I': '𝘐', 'J': '𝘑', 'K': '𝘒', 'L': '𝘓', 'M': '𝘔', 'N': '𝘕', 'O': '𝘖', 'P': '𝘗',
+                'Q': '𝘘', 'R': '𝘙', 'S': '𝘚', 'T': '𝘛', 'U': '𝘜', 'V': '𝘝', 'W': '𝘞', 'X': '𝘟',
+                'Y': '𝘠', 'Z': '𝘡'
+            }
+            double_map = {
+                'a': '𝕒', 'b': '𝕓', 'c': '𝕔', 'd': '𝕕', 'e': '𝕖', 'f': '𝕗', 'g': '𝕘', 'h': '𝕙',
+                'i': '𝕚', 'j': '𝕛', 'k': '𝕜', 'l': '𝕝', 'm': '𝕞', 'n': '𝕟', 'o': '𝕠', 'p': '𝕡',
+                'q': '𝕢', 'r': '𝕣', 's': '𝕤', 't': '𝕥', 'u': '𝕦', 'v': '𝕧', 'w': '𝕨', 'x': '𝕩',
+                'y': '𝕪', 'z': '𝕫',
+                'A': '𝔸', 'B': '𝔹', 'C': 'ℂ', 'D': '𝔻', 'E': '𝔼', 'F': '𝔽', 'G': '𝔾', 'H': 'ℍ',
+                'I': '𝕀', 'J': '𝕁', 'K': '𝕂', 'L': '𝕃', 'M': '𝕄', 'N': 'ℕ', 'O': '𝕆', 'P': 'ℙ',
+                'Q': 'ℚ', 'R': 'ℝ', 'S': '𝕊', 'T': '𝕋', 'U': '𝕌', 'V': '𝕍', 'W': '𝕎', 'X': '𝕏',
+                'Y': '𝕐', 'Z': 'ℤ',
+                '0': '𝟘', '1': '𝟙', '2': '𝟚', '3': '𝟛', '4': '𝟜',
+                '5': '𝟝', '6': '𝟞', '7': '𝟟', '8': '𝟠', '9': '𝟡'
+            }
+            script_map = {
+                'a': '𝓪', 'b': '𝓫', 'c': '𝓬', 'd': '𝓭', 'e': '𝓮', 'f': '𝓯', 'g': '𝓰', 'h': '𝓱',
+                'i': '𝓲', 'j': '𝓳', 'k': '𝓴', 'l': '𝓵', 'm': '𝓶', 'n': '𝓷', 'o': '𝓸', 'p': '𝓹',
+                'q': '𝓺', 'r': '𝓻', 's': '𝓼', 't': '𝓽', 'u': '𝓾', 'v': '𝓿', 'w': '𝔀', 'x': '𝔁',
+                'y': '𝔂', 'z': '𝔃',
+                'A': '𝓐', 'B': '𝓑', 'C': '𝓒', 'D': '𝓓', 'E': '𝓔', 'F': '𝓕', 'G': '𝓖', 'H': '𝓗',
+                'I': '𝓘', 'J': '𝓙', 'K': '𝓚', 'L': '𝓛', 'M': '𝓜', 'N': '𝓝', 'O': '𝓞', 'P': '𝓟',
+                'Q': '𝓠', 'R': '𝓡', 'S': '𝓢', 'T': '𝓣', 'U': '𝓤', 'V': '𝓥', 'W': '𝓦', 'X': '𝓧',
+                'Y': '𝓨', 'Z': '𝓩'
+            }
+            mono_map = {
+                'a': '𝚊', 'b': '𝚋', 'c': '𝚌', 'd': '𝚍', 'e': '𝚎', 'f': '𝚏', 'g': '𝚐', 'h': '𝚑',
+                'i': '𝚒', 'j': '𝚓', 'k': '𝚔', 'l': '𝚕', 'm': '𝚖', 'n': '𝚗', 'o': '𝚘', 'p': '𝚙',
+                'q': '𝚚', 'r': '𝚛', 's': '𝚜', 't': '𝚝', 'u': '𝚞', 'v': '𝚟', 'w': '𝚠', 'x': '𝚡',
+                'y': '𝚢', 'z': '𝚣',
+                'A': '𝙰', 'B': '𝙱', 'C': '𝙲', 'D': '𝙳', 'E': '𝙴', 'F': '𝙵', 'G': '𝙶', 'H': '𝙷',
+                'I': '𝙸', 'J': '𝙹', 'K': '𝙺', 'L': '𝙻', 'M': '𝙼', 'N': '𝙽', 'O': '𝙾', 'P': '𝙿',
+                'Q': '𝚀', 'R': '𝚁', 'S': '𝚂', 'T': '𝚃', 'U': '𝚄', 'V': '𝚅', 'W': '𝚆', 'X': '𝚇',
+                'Y': '𝚈', 'Z': '𝚉'
+            }
+            circle_map = {
+                'a': 'ⓐ', 'b': 'ⓑ', 'c': 'ⓒ', 'd': 'ⓓ', 'e': 'ⓔ', 'f': 'ⓕ', 'g': 'ⓖ', 'h': 'ⓗ',
+                'i': 'ⓘ', 'j': 'ⓙ', 'k': 'ⓚ', 'l': 'ⓛ', 'm': 'ⓜ', 'n': 'ⓝ', 'o': 'ⓞ', 'p': 'ⓟ',
+                'q': 'ⓠ', 'r': 'ⓡ', 's': 'ⓢ', 't': 'ⓣ', 'u': 'ⓤ', 'v': 'ⓥ', 'w': 'ⓦ', 'x': 'ⓧ',
+                'y': 'ⓨ', 'z': 'ⓩ',
+                'A': 'Ⓐ', 'B': 'Ⓑ', 'C': 'Ⓒ', 'D': 'Ⓓ', 'E': 'Ⓔ', 'F': 'Ⓕ', 'G': 'Ⓖ', 'H': 'Ⓗ',
+                'I': 'Ⓘ', 'J': 'Ⓙ', 'K': 'Ⓚ', 'L': 'Ⓛ', 'M': 'Ⓜ', 'N': 'Ⓝ', 'O': 'Ⓞ', 'P': 'Ⓟ',
+                'Q': 'Ⓠ', 'R': 'Ⓡ', 'S': 'Ⓢ', 'T': 'Ⓣ', 'U': 'Ⓤ', 'V': 'Ⓥ', 'W': 'Ⓦ', 'X': 'Ⓧ',
+                'Y': 'Ⓨ', 'Z': 'Ⓩ',
+                '0': '⓪', '1': '①', '2': '②', '3': '③', '4': '④',
+                '5': '⑤', '6': '⑥', '7': '⑦', '8': '⑧', '9': '⑨'
+            }
+            square_map = {
+                'a': '🅰', 'b': '🅱', 'c': '🅲', 'd': '🅳', 'e': '🅴', 'f': '🅵', 'g': '🅶', 'h': '🅷',
+                'i': '🅸', 'j': '🅹', 'k': '🅺', 'l': '🅻', 'm': '🅼', 'n': '🅽', 'o': '🅾', 'p': '🅿',
+                'q': '🆀', 'r': '🆁', 's': '🆂', 't': '🆃', 'u': '🆄', 'v': '🆅', 'w': '🆆', 'x': '🆇',
+                'y': '🆈', 'z': '🆉',
+                '0': '🅾', '1': '🆒', '2': '🆓', '3': '🆔', '4': '🆕',
+                '5': '🆖', '6': '🆗', '7': '🆘', '8': '🆙', '9': '🆚'
+            }
+            
+            font_maps = {
+                'bold': bold_map,
+                'italic': italic_map,
+                'double': double_map,
+                'script': script_map,
+                'mono': mono_map,
+                'circle': circle_map,
+                'square': square_map,
+                'default': {}
+            }
+            
+            char_map = font_maps.get(style, bold_map)
+            stylish_text = ''.join(char_map.get(c, c) for c in text) if style != 'default' else text
+            
+            # Delete original command
+            try:
+                await event.delete()
+            except:
+                pass
+            
+            # Send initial message with typing indicator only
+            msg = await user_bot.send_message(event.chat_id, "✍️ ")
+            
+            # Type each character slowly
+            for i in range(1, len(stylish_text) + 1):
+                current_text = f"✍️ {stylish_text[:i]}"
+                try:
+                    await msg.edit(current_text)
+                    await asyncio.sleep(random.uniform(0.15, 0.6))
+                except Exception:
+                    pass
+            
+            # Final message (no extra line)
+            try:
+                await msg.edit(f"✍️ {stylish_text}")
+            except:
+                pass
 
         # ─── AFK ──────────────────────────────────────────────────────────────
-        user_bot.afk_data = {}  # user_id -> {"reason": str, "time": float}
+        user_bot.afk_data = {}
         @register_cmd("afk", premium=True)
         async def cmd_afk(event, arg):
             uid = event.sender_id
@@ -3269,14 +4046,12 @@ async def run_user_bot(session_string, chat_id):
             user_bot.afk_data[uid] = {"reason": reason, "time": time.time()}
             await safe_edit(event, f"✅ AFK set: {reason}")
 
-        # ─── AFK auto-reply handler ──────────────────────────────────────────
         @user_bot.on(events.NewMessage)
         async def afk_handler(event):
             if event.out:
                 return
             sender = event.sender_id
             if sender in user_bot.afk_data:
-                # If someone mentions the bot/user, reply with AFK message
                 text = event.raw_text or ""
                 if "@" + me.username in text or "tg://user?id=" + str(me.id) in text or me.id in [x.id for x in event.mentions if hasattr(x, 'id')]:
                     data = user_bot.afk_data[sender]
@@ -3292,7 +4067,6 @@ async def run_user_bot(session_string, chat_id):
                 await safe_edit(event, f"**{name.upper()}**\n━━━━━━━━━━━━━━━\n{result}")
             return cmd
 
-        # Define transforms
         transforms = {
             "upper": str.upper,
             "lower": str.lower,
@@ -3307,33 +4081,14 @@ async def run_user_bot(session_string, chat_id):
             "snake": lambda s: '_'.join(s.lower().split()),
             "shout": lambda s: s.upper() + "!",
             "mock": lambda s: ''.join(c.upper() if i%2 else c.lower() for i,c in enumerate(s)),
-            "alternating": lambda s: ''.join(c.upper() if i%2 else c.lower() for i,c in enumerate(s)),  # same as mock
             "spaceit": lambda s: ' '.join(s),
             "removespaces": lambda s: ''.join(s.split()),
             "clap": lambda s: ' 👏 '.join(s.split()),
             "mirror": lambda s: s + s[::-1],
             "flip_text": lambda s: s[::-1].translate(str.maketrans("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", "ɐqɔpǝɟɓɥıɾʞlɯuodbɹsʇnʌʍxʎz∀BƆDƎℲ⅁HIſʞLMNOԀQɹS┴∩ΛMX⅄Z")),
-            "tinytext": lambda s: s.translate(str.maketrans("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", "ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖᑫʳˢᵗᵘᵛʷˣʸᶻᴬᴮᶜᴰᴱᶠᴳᴴᴵᴶᴷᴸᴹᴺᴼᴾᑫᴿˢᵀᵁⱽᵂˣʸᶻ")),
-            "bubble": lambda s: s.translate(str.maketrans("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", "ⓐⓑⓒⓓⓔⓕⓖⓗⓘⓙⓚⓛⓜⓝⓞⓟⓠⓡⓢⓣⓤⓥⓦⓧⓨⓩⒶⒷⒸⒹⒺⒻⒼⒽⒾⒿⓀⓁⓂⓃⓄⓅⓆⓇⓈⓉⓊⓋⓌⓍⓎⓏ")),
-            "square_text": lambda s: s.translate(str.maketrans("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", "🅰🅱🅲🅳🅴🅵🅶🅷🅸🅹🅺🅻🅼🅽🅾🅿🆀🆁🆂🆃🆄🆅🆆🆇🆈🆉🅰🅱🅲🅳🅴🅵🅶🅷🅸🅹🅺🅻🅼🅽🅾🅿🆀🆁🆂🆃🆄🆅🆆🆇🆈🆉")),
-            "boxtext": lambda s: f"[{s}]",
-            "strike": lambda s: f"~~{s}~~",
-            "spoiler": lambda s: f"||{s}||",
         }
-        # Also add .big and .small using Unicode (big: uppercase, small: lowercase)
         for name, func in transforms.items():
-            if name not in ["len","wcount","reverse"]: # len/wcount returns string
-                format_text_func(name, func)
-        # Additional functions
-        @register_cmd("len", premium=True)
-        async def cmd_len(event, arg):
-            await safe_edit(event, f"**LEN**\n━━━━━━━━━━━━━━━\n{len(arg)}")
-        @register_cmd("wcount", premium=True)
-        async def cmd_wcount(event, arg):
-            await safe_edit(event, f"**WCOUNT**\n━━━━━━━━━━━━━━━\n{len(arg.split())}")
-        @register_cmd("reverse", premium=True)
-        async def cmd_reverse(event, arg):
-            await safe_edit(event, f"**REVERSE**\n━━━━━━━━━━━━━━━\n{arg[::-1]}")
+            format_text_func(name, func)
 
         @register_cmd("big", premium=True)
         async def cmd_big(event, arg):
@@ -3345,12 +4100,10 @@ async def run_user_bot(session_string, chat_id):
 
         @register_cmd("shadow", premium=True)
         async def cmd_shadow(event, arg):
-            # Simulate shadow with bold italic
             await safe_edit(event, f"**SHADOW**\n━━━━━━━━━━━━━━━\n***{arg}***")
 
         @register_cmd("zalgo", premium=True)
         async def cmd_zalgo(event, arg):
-            # Simple zalgo: add diacritics
             diacritics = r"̴̵̶̷̸̡̢̧̨̛̖̗̘̙̜̝̞̟̠̣̤̥̦̩̪̫̬̭̮̯̰̱̲̳̹̺̻̼͇͈͉͍͎̀́̂̃̄̅̆̇̈̉̊̋̌̍̎̏̐̑̒̓̔̽̾̿̀́͂̓̈́͆͊͋͌̕̚ͅ͏͓͔͕͖͙͚͐͑͒͗͛ͣͤͥͦͧͨͩͪͫͬͭͮͯ͘͜͟͢͝͞͠͡"
             zalgo = ''.join(c + ''.join(random.choice(diacritics) for _ in range(random.randint(1, 3))) for c in arg)
             await safe_edit(event, f"**ZALGO**\n━━━━━━━━━━━━━━━\n{zalgo}")
@@ -3378,14 +4131,7 @@ async def run_user_bot(session_string, chat_id):
 
         @register_cmd("nato", premium=True)
         async def cmd_nato(event, arg):
-            nato = {
-                'a': 'Alpha', 'b': 'Bravo', 'c': 'Charlie', 'd': 'Delta', 'e': 'Echo',
-                'f': 'Foxtrot', 'g': 'Golf', 'h': 'Hotel', 'i': 'India', 'j': 'Juliett',
-                'k': 'Kilo', 'l': 'Lima', 'm': 'Mike', 'n': 'November', 'o': 'Oscar',
-                'p': 'Papa', 'q': 'Quebec', 'r': 'Romeo', 's': 'Sierra', 't': 'Tango',
-                'u': 'Uniform', 'v': 'Victor', 'w': 'Whiskey', 'x': 'Xray', 'y': 'Yankee',
-                'z': 'Zulu'
-            }
+            nato = {'a':'Alpha','b':'Bravo','c':'Charlie','d':'Delta','e':'Echo','f':'Foxtrot','g':'Golf','h':'Hotel','i':'India','j':'Juliett','k':'Kilo','l':'Lima','m':'Mike','n':'November','o':'Oscar','p':'Papa','q':'Quebec','r':'Romeo','s':'Sierra','t':'Tango','u':'Uniform','v':'Victor','w':'Whiskey','x':'Xray','y':'Yankee','z':'Zulu'}
             result = ' '.join(nato.get(c.lower(), c) for c in arg)
             await safe_edit(event, f"**NATO**\n━━━━━━━━━━━━━━━\n{result}")
 
@@ -3556,7 +4302,6 @@ async def run_user_bot(session_string, chat_id):
         # ─── ENCRYPTION ──────────────────────────────────────────────────────
         @register_cmd("encrypt", premium=True)
         async def cmd_encrypt(event, arg):
-            # Simple Caesar cipher (shift 3)
             encrypted = ''.join(chr(ord(c)+3) if c.isprintable() else c for c in arg)
             await safe_edit(event, f"**ENCRYPT**\n━━━━━━━━━━━━━━━\n{encrypted}")
 
@@ -3577,10 +4322,8 @@ async def run_user_bot(session_string, chat_id):
 
         @register_cmd("typetest", premium=True)
         async def cmd_typetest(event, arg):
-            # Simulate typing test: just show a fancy message
             await safe_edit(event, f"**TYPING TEST**\n━━━━━━━━━━━━━━━\nTyping speed: {random.randint(30,60)} WPM\nAccuracy: {random.randint(90,100)}%")
 
-        # ─── FUN GAMES ──────────────────────────────────────────────────────
         @register_cmd("coin", premium=True)
         async def cmd_coin(event, _):
             await safe_edit(event, f"**COIN FLIP**\n━━━━━━━━━━━━━━━\n{random.choice(['Heads', 'Tails'])}")
@@ -3601,7 +4344,6 @@ async def run_user_bot(session_string, chat_id):
 
         @register_cmd("timer", premium=True)
         async def cmd_timer(event, arg):
-            # same as countdown
             try:
                 sec = int(arg)
                 if sec <= 0:
@@ -3612,7 +4354,6 @@ async def run_user_bot(session_string, chat_id):
             except:
                 await safe_edit(event, "❌ Invalid seconds.")
 
-        # ─── REPEAT ─────────────────────────────────────────────────────────────
         @register_cmd("repeat", premium=True)
         async def cmd_repeat(event, arg):
             parts = arg.split(maxsplit=1)
@@ -3625,7 +4366,7 @@ async def run_user_bot(session_string, chat_id):
             result = (text + "\n") * count
             await safe_edit(event, f"**REPEAT**\n━━━━━━━━━━━━━━━\n{result.strip()}")
 
-        # ─── FIX TIC TAC TOE ──────────────────────────────────────────────────
+        # ─── TIC TAC TOE ──────────────────────────────────────────────────────
         ttt_games = {}
 
         @register_cmd("ttt")
@@ -3635,7 +4376,6 @@ async def run_user_bot(session_string, chat_id):
                 return await safe_edit(event, "⚠️ A game is already in progress! Use `.ttt_move` to play.")
             board = [" "] * 9
             ttt_games[chat] = {"board": board, "turn": "X", "player_x": None, "player_o": None}
-            # The starter is X
             ttt_games[chat]["player_x"] = event.sender_id
             board_display = "```\n" + "\n".join([" | ".join(board[i:i+3]) for i in range(0, 9, 3)]) + "\n```"
             await safe_edit(event, f"🎮 **TIC TAC TOE**\n{board_display}\n\nPlayer X (you) starts. Use `.ttt_move 1-9`")
@@ -3647,13 +4387,12 @@ async def run_user_bot(session_string, chat_id):
                 return await safe_edit(event, "❌ No game active. Start with `.ttt`")
             game = ttt_games[chat]
             sender = event.sender_id
-            # Determine player
             if game["turn"] == "X":
                 if game["player_x"] is None:
                     game["player_x"] = sender
                 if sender != game["player_x"]:
                     return await safe_edit(event, "❌ It's not your turn (X).")
-            else:  # O
+            else:
                 if game["player_o"] is None:
                     game["player_o"] = sender
                 if sender != game["player_o"]:
@@ -3665,7 +4404,6 @@ async def run_user_bot(session_string, chat_id):
                 return await safe_edit(event, "❌ Position already taken!")
             game["board"][pos] = game["turn"]
             board = game["board"]
-            # Check win
             win = False
             for i in range(3):
                 if board[i*3] == board[i*3+1] == board[i*3+2] != " ":
@@ -3689,13 +4427,40 @@ async def run_user_bot(session_string, chat_id):
             board_display = "```\n" + "\n".join([" | ".join(board[i:i+3]) for i in range(0, 9, 3)]) + "\n```"
             await safe_edit(event, f"🎮 **TIC TAC TOE**\n{board_display}\n\n{game['turn']}'s turn")
 
-        # ─── FIX RPS ───────────────────────────────────────────────────────────
-        # Already fixed: .rps works.
+        # ─── RPS ───────────────────────────────────────────────────────────────
+        @register_cmd("rps")
+        async def cmd_rps(event, arg):
+            choices = {"r": "🪨 Rock", "p": "📄 Paper", "s": "✂️ Scissors"}
+            wins = {"r": "s", "p": "r", "s": "p"}
+            if not arg or arg.lower() not in choices:
+                return await safe_edit(event, "❌ Use: `.rps r` (rock) / `.rps p` (paper) / `.rps s` (scissors)")
+            user = arg.lower()
+            bot = random.choice(list(choices.keys()))
+            if user == bot:
+                result = "🤝 Draw!"
+            elif wins[user] == bot:
+                result = "🏆 You Win!"
+            else:
+                result = "🤖 Bot Wins!"
+            await safe_edit(event, f"✂️🪨📄 **RPS**\n━━━━━━━━━━━━━━━\n👤 You: {choices[user]}\n🤖 Bot: {choices[bot]}\n\n{result}")
 
-       # ─── ORIGINAL COMMANDS ──────────────────────────────────────────────────────
+        # ─── RIDDLE & QUIZ ──────────────────────────────────────────────────────
+        @register_cmd("riddle")
+        async def cmd_riddle(event, _):
+            riddle = random.choice(riddle_texts)
+            await safe_edit(event, f"🧩 **RIDDLE**\n━━━━━━━━━━━━━━━\n{riddle['q']}\n\n⏳ You have 60 seconds to think!\n💡 Answer will be revealed after timer...")
+            await asyncio.sleep(60)
+            await safe_edit(event, f"🧩 **RIDDLE ANSWER**\n━━━━━━━━━━━━━━━\n{riddle['q']}\n\n✅ **Answer:** `{riddle['a']}`")
 
-# ─── REPLY RAIDS ──────────────────────────────────────────────────────────
-        # ─── ORIGINAL COMMANDS ──────────────────────────────────────────────────────
+        @register_cmd("quiz")
+        async def cmd_quiz(event, _):
+            quiz = random.choice(quiz_texts)
+            await safe_edit(event, f"📚 **QUIZ**\n━━━━━━━━━━━━━━━\n{quiz['q']}\n\n⏳ You have 60 seconds to answer!\n💡 Answer will be revealed after timer...")
+            await asyncio.sleep(60)
+            await safe_edit(event, f"📚 **QUIZ ANSWER**\n━━━━━━━━━━━━━━━\n{quiz['q']}\n\n✅ **Answer:** `{quiz['a']}`")
+
+        # ─── ORIGINAL REPLY & RAID COMMANDS ──────────────────────────────────
+        # ─── ORIGINAL COMMANDS ──────────────────────────────────────────────────
 
         # ─── REPLY RAIDS ──────────────────────────────────────────────────────────
 
@@ -3953,6 +4718,15 @@ async def run_user_bot(session_string, chat_id):
                 text = parts[1] if len(parts) > 1 else ""
                 if not text: return
             chat = event.chat_id
+            target_user = None
+            if event.is_reply:
+                reply = await event.get_reply_message()
+                if reply:
+                    target_user = reply.sender_id
+                    # 🛡️ PROTECTION CHECK
+                    if target_user and await is_protected(target_user, "spray"):
+                        await safe_edit(event, "🚫 This user is protected from Spray.")
+                        return
             if chat in user_bot.spray_tasks and not user_bot.spray_tasks[chat].done():
                 return
             await safe_edit(event, f"⚡ Spray starting{' (' + str(count) + ' msgs)' if count else ' (infinite)'}...")
@@ -3961,6 +4735,10 @@ async def run_user_bot(session_string, chat_id):
                 try:
                     while chat in user_bot.spray_tasks:
                         if count is not None and sent >= count:
+                            break
+                        # re-check protection every 20 messages
+                        if target_user and sent % 20 == 0 and await is_protected(target_user, "spray"):
+                            await safe_send(chat, "🛑 Target is now protected. Stopping Spray.")
                             break
                         await safe_send(chat, text)
                         sent += 1
@@ -4110,10 +4888,16 @@ async def run_user_bot(session_string, chat_id):
                 if count > 1000: count = 1000
             chat = event.chat_id
             target_msg_id = None
+            target_user = None
             if event.is_reply:
                 reply = await event.get_reply_message()
                 if reply:
                     target_msg_id = reply.id
+                    target_user = reply.sender_id
+                    # 🛡️ PROTECTION CHECK
+                    if target_user and await is_protected(target_user, "multispray"):
+                        await safe_edit(event, "🚫 This user is protected from MultiSpray.")
+                        return
             if chat in user_bot.spray_tasks and not user_bot.spray_tasks[chat].done():
                 return await safe_edit(event, "⚠️ Already spraying")
             await safe_edit(event, f"🔄 MultiSpray starting{' with reply' if target_msg_id else ''}..."
@@ -4124,6 +4908,10 @@ async def run_user_bot(session_string, chat_id):
                 try:
                     while chat in user_bot.spray_tasks:
                         if count is not None and sent >= count:
+                            break
+                        # re-check protection every 20 messages
+                        if target_user and sent % 20 == 0 and await is_protected(target_user, "multispray"):
+                            await safe_send(chat, "🛑 Target is now protected. Stopping MultiSpray.")
                             break
                         txt = user_bot.spam_texts[i % len(user_bot.spam_texts)]
                         i += 1
@@ -4155,6 +4943,17 @@ async def run_user_bot(session_string, chat_id):
                 return await safe_edit(event, "❌ Count must be 1-500")
             text = parts[1]
             chat = event.chat_id
+            target_msg_id = None
+            target_user = None
+            if event.is_reply:
+                reply = await event.get_reply_message()
+                if reply:
+                    target_msg_id = reply.id
+                    target_user = reply.sender_id
+                    # 🛡️ PROTECTION CHECK
+                    if target_user and await is_protected(target_user, "countspray"):
+                        await safe_edit(event, "🚫 This user is protected from CountSpray.")
+                        return
             if chat in user_bot.spray_tasks and not user_bot.spray_tasks[chat].done():
                 return await safe_edit(event, "⚠️ Already spraying")
             await safe_edit(event, f"🎯 CountSpray starting ({count} messages)...")
@@ -4162,7 +4961,11 @@ async def run_user_bot(session_string, chat_id):
                 sent = 0
                 try:
                     while sent < count and chat in user_bot.spray_tasks:
-                        await safe_send(chat, text)
+                        # re-check protection every 20 messages
+                        if target_user and sent % 20 == 0 and await is_protected(target_user, "countspray"):
+                            await safe_send(chat, "🛑 Target is now protected. Stopping CountSpray.")
+                            break
+                        await safe_send(chat, text, reply_to=target_msg_id if target_msg_id else None)
                         sent += 1
                         if sent % 30 == 0:
                             await asyncio.sleep(3)
@@ -4199,15 +5002,19 @@ async def run_user_bot(session_string, chat_id):
         async def cmd_mute(event, arg):
             targets = await get_targets(event, arg)
             if not targets: return
-            added, already = [], []
+            added, already, protected = [], [], []
             for uid in targets:
+                if await is_protected(uid, "mute"):
+                    protected.append(str(uid))
+                    continue
                 if uid in user_bot.muted_users:
                     already.append(str(uid))
                 else:
                     user_bot.muted_users.add(uid); added.append(str(uid))
             msg = ""
             if added: msg += f"🔇 Muted: {', '.join(added)}\n"
-            if already: msg += f"⚠️ Already muted: {', '.join(already)}"
+            if already: msg += f"⚠️ Already muted: {', '.join(already)}\n"
+            if protected: msg += f"🛡️ Protected (skip): {', '.join(protected)}"
             if not msg: msg = "❌ No changes"
             await safe_edit(event, msg)
 
@@ -4231,15 +5038,19 @@ async def run_user_bot(session_string, chat_id):
         async def cmd_gmute(event, arg):
             targets = await get_targets(event, arg)
             if not targets: return
-            added, already = [], []
+            added, already, protected = [], [], []
             for uid in targets:
+                if await is_protected(uid, "gmute"):
+                    protected.append(str(uid))
+                    continue
                 if uid in user_bot.global_muted:
                     already.append(str(uid))
                 else:
                     user_bot.global_muted.add(uid); added.append(str(uid))
             msg = ""
             if added: msg += f"🔕 Gmuted: {', '.join(added)}\n"
-            if already: msg += f"⚠️ Already gmuted: {', '.join(already)}"
+            if already: msg += f"⚠️ Already gmuted: {', '.join(already)}\n"
+            if protected: msg += f"🛡️ Protected (skip): {', '.join(protected)}"
             if not msg: msg = "❌ No changes"
             await safe_edit(event, msg)
 
@@ -4351,11 +5162,14 @@ async def run_user_bot(session_string, chat_id):
                     return
             except:
                 return
-            kicked, failed, skipped = [], [], []
+            kicked, failed, skipped, protected = [], [], [], []
             me2 = await user_bot.get_me()
             for uid in targets:
                 if uid == me2.id:
                     skipped.append(str(uid)); continue
+                if await is_protected(uid, "throw"):
+                    protected.append(str(uid))
+                    continue
                 try:
                     await user_bot.kick_participant(event.chat_id, uid)
                     kicked.append(str(uid))
@@ -4364,6 +5178,7 @@ async def run_user_bot(session_string, chat_id):
             msg = ""
             if kicked: msg += f"👞 Kicked: {', '.join(kicked)}\n"
             if failed: msg += f"⚠️ Failed: {', '.join(failed)}\n"
+            if protected: msg += f"🛡️ Protected (skip): {', '.join(protected)}\n"
             if skipped: msg += f"👑 Self skip: {', '.join(skipped)}"
             if not msg: msg = "❌ No action"
             await safe_edit(event, msg)
@@ -4977,7 +5792,528 @@ async def run_user_bot(session_string, chat_id):
                     stop_loader.set(); loader_task.cancel()
                     await safe_edit(event, f"❌ DMusic error: {e}")
             asyncio.create_task(download_music())
+                   # ─── FUN METERS (Menu7) ──────────────────────────────────────────────
 
+        # Helper function for funny lines (10 lines per meter, alternating Hindi/English/Hinglish)
+        def get_funny_line(meter_type, percent):
+            lines = {
+                'stud': [
+                    "तू तो ग्रुप का अल्फा है! 🐺 (Alpha of the group!)",
+                    "Absolute chad energy! You're the alpha! 💪",
+                    "बहुत स्टड है तू – सबको NPC bana de! 😎",
+                    "तेरी स्टडनेस ने छत पार कर दी! 📈",
+                    "You're basically a walking sigma, bro! 🌟",
+                    "Tera stud level off the charts hai! 💯",
+                    "तू ही हीरो है इस कहानी का! 🦸",
+                    "You make other guys look like sidekicks! 😤",
+                    "Pure chad vibes – koi match nahi kar sakta! 💥",
+                    "तेरे आगे सब फीके हैं! 👑"
+                ],
+                'looks': [
+                    "तू तो मॉडल बन सकता/सकती है! 📸",
+                    "Even the sun is jealous of your glow! ☀️",
+                    "Tera chehra dekh ke mirror bhi sharma jaye! 🪞",
+                    "लग रहा है स्नैक – खाने का मन करता है! 🍕",
+                    "You've got that Greek god/goddess face! 🏛️",
+                    "Itna gorgeous ki Instagram crash ho jaye! 📱",
+                    "तेरी खूबसूरती का कोई मुकाबला नहीं! ✨",
+                    "Looking like a million bucks! 💰",
+                    "Tere glow se suraj bhi jal gaya! ☀️",
+                    "तू तो चेहरा है, बाकी सब पृष्ठभूमि! 🖼️"
+                ],
+                'gay': [
+                    "इंद्रधनुष तेरे लिए लहरा रहा! 🌈",
+                    "You're the life of the Pride parade! 🎉",
+                    "Itna gay ki unicorn ko bhi insecurity ho jaye! 🦄",
+                    "तू गेयों की रानी है! 👑",
+                    "Fabulous level: legendary! 💅",
+                    "Teri gayness ne rainbow ko bhi piche chhod diya! 🌈",
+                    "तू तो गे प्राइड का मुख्य आकर्षण है! 🏳️‍🌈",
+                    "You're so gay you make glitter jealous! ✨",
+                    "Itna gay ki straight log bhi confused ho jayein! 🤔",
+                    "तू ही इंद्रधनुष का दूसरा नाम है! 🌈"
+                ],
+                'lesbian': [
+                    "तू wlw दुनिया की रानी है! 👑",
+                    "You make sapphic hearts flutter! 💕",
+                    "Itni lesbian ki rainbow bhi sharm jaye! 🌈",
+                    "तू प्राइड का कारण है! 🏳️‍🌈",
+                    "You're the ultimate goddess of love! 💖",
+                    "Teri lesbian vibe ne sabko impress kar diya! 😍",
+                    "तू तो लेस्बियन क्वीन है! 👑",
+                    "You're so lesbian you make the moon blush! 🌙",
+                    "Itni sapphic ki Dilwale Dulhania bhi fade ho jaye! 🎬",
+                    "तू ही सबकी सपनों की रानी है! 💭"
+                ],
+                'straight': [
+                    "तू तो रूलर की तरह सीधा/सीधी है! 📏",
+                    "You're the definition of vanilla! 🍦",
+                    "Itna straight ki line bhi curve ho jaye! 😂",
+                    "तू हेट्रोनॉर्मेटिविटी का पोस्टर चाइल्ड है! 📸",
+                    "You're as straight as your hair after a blowout! 💇",
+                    "Tera straightness sabko surprise kar deta hai! 😮",
+                    "तू तो सीधा रास्ता है, मोड़ नहीं! 🛤️",
+                    "You're the most straight person ever! 🏳️",
+                    "Itna straight ki compass bhi confuse ho jaye! 🧭",
+                    "तू ही सीधेपन की मिसाल है! 🏆"
+                ],
+                'bi': [
+                    "तू दोनों दुनिया का सबसे अच्छा है! 🌈",
+                    "You're like a bicycle – you go both ways! 🚲",
+                    "Teri bi-ness ne sabko confuse kar diya! 😵",
+                    "तू बाई-कॉनिक की परिभाषा है! 💖💜💙",
+                    "You're so bi you make the colors jealous! 🎨",
+                    "Itna bi ki rainbow bhi piche reh gaya! 🌈",
+                    "तू बाई सोसाइटी की रानी है! 👑",
+                    "You're the best of both worlds, literally! 🌍",
+                    "Tera bi span sabko cover kar leta hai! 🤗",
+                    "तू ही दोनों तरफ की चाबी है! 🔑"
+                ],
+                'trans': [
+                    "तू एक खूबसूरत तितली है! 🦋",
+                    "You're the reason gender is a construct! 🏳️‍⚧️",
+                    "Itni trans ki flag ko bhi garv ho! 🏳️‍⚧️",
+                    "तू खुद होने का अवतार है! 💫",
+                    "You're a true trailblazer! 🚀",
+                    "Teri trans journey ne sabko inspire kar diya! ✨",
+                    "तू तो बदलाव की मिसाल है! 🌟",
+                    "You're so trans you make the stars align! 🌌",
+                    "Itna trans ki duniya badal do! 🌍",
+                    "तू ही सच्ची पहचान है! 💖"
+                ],
+                'simp': [
+                    "तू दीवार पर भी सिंप करेगा/करेगी! 🧱",
+                    "You'd send money to your own shadow! 💸",
+                    "Itna simp ki crush ka bathwater bhi kharid lo! 🛁",
+                    "तू सिंपों का राजा/रानी है! 👑",
+                    "You're the reason 'simp' is in the dictionary! 📖",
+                    "Teri simping ne sabko hila kar rakha! 😂",
+                    "तू तो सिम्पनेस का पर्याय है! 🏆",
+                    "You'd simp for a rock if it smiled! 🪨",
+                    "Itna simp ki girlfriend bhi bolde 'chill'! 😅",
+                    "तू ही सिम्पों का गुरु है! 🙏"
+                ],
+                'chad': [
+                    "तू अल्टीमेट चाड है! 🗿",
+                    "You make other men insecure! 😤",
+                    "Teri chadness ne sabko pichhe chhod diya! 🏃",
+                    "तू इस दुनिया का प्रोटागोनिस्ट है! 🌍",
+                    "You flex with just your pinky! 💪",
+                    "Itna chad ki sigma bhi respect kare! 🐺",
+                    "तू ही चाडों का चाड है! 👑",
+                    "You're the main character, everyone else is an extra! 🎬",
+                    "Teri vibe se duniya hil jati hai! 🌪️",
+                    "तू तो अल्फा का भी अल्फा है! 🐺"
+                ],
+                'friendly': [
+                    "तू सबकी ज़िंदगी की धूप है! ☀️",
+                    "You make friends everywhere you go! 🤝",
+                    "Itna friendly ki dushman bhi dost ban jaye! 😊",
+                    "तू गोल्डन रिट्रीवर का इंसानी रूप है! 🐕",
+                    "You're the reason people believe in kindness! 💖",
+                    "Teri friendliness ne sabko impress kar diya! 🥰",
+                    "तू तो मिलनसार का अवतार है! 🌟",
+                    "You're so friendly even the sun is jealous! ☀️",
+                    "Itna friendly ki log tujhse hi motivate ho! 💪",
+                    "तू ही सबकी पसंद है! 💕"
+                ],
+                'rizz': [
+                    "तेरी रिज़ ने सबका दिल चुरा लिया! 😏",
+                    "You have the rizz of a thousand pickup lines! 📞",
+                    "Tera rizz itna smooth ki makkhan bhi sharm jaye! 🧈",
+                    "तू रिज़ मास्टर है – कोई नहीं रुक सकता! 🧲",
+                    "You're the rizz of the century! 🌟",
+                    "Itni rizz ki log tujhse hi pyaar kar bethe! 😍",
+                    "तेरी रिज़ ने सारे नियम तोड़ दिए! 📜",
+                    "Your rizz makes everyone weak in the knees! 🦵",
+                    "Tera rizz level next level hai! 🚀",
+                    "तू ही रिज़ का बादशाह/मलिका है! 👑"
+                ],
+                'iq': [
+                    "तू सर्टिफाइड जीनियस है! 🧠",
+                    "Your IQ is higher than room temperature! 🌡️",
+                    "Itna smart ki Einstein bhi feel kare average! 🤓",
+                    "तू इस ऑपरेशन का दिमाग है! 💡",
+                    "You're the definition of intellect! 📚",
+                    "Teri IQ ne sabko chakkar mein daal diya! 😵",
+                    "तू तो बुद्धिमानों का बुद्धिमान है! 🏆",
+                    "You're so smart you make computers jealous! 💻",
+                    "Itna genius ki Google bhi tujhse puchhe! 🔍",
+                    "तू ही ज्ञान का सागर है! 🌊"
+                ],
+                'stupid': [
+                    "तू इतना बेवकूफ है कि मेंढक को ब्लेंडर में डाल दे! 🐸",
+                    "You're the reason instructions exist! 📋",
+                    "Itna dumb ki machhli ko tairna sikhaye! 🐟",
+                    "तू 'होल्ड माय बियर' का अवतार है! 🍺",
+                    "You make a rock look smart! 🪨",
+                    "Teri stupidity ne sabko hansa diya! 😂",
+                    "तू तो बेवकूफी का प्रतीक है! 🏆",
+                    "You'd try to charge your phone in the microwave! 📱",
+                    "Itna stupid ki khud ko hi confuse kar le! 🤔",
+                    "तू ही मूर्खों के राजा है! 👑"
+                ],
+                'sigma': [
+                    "तू अकेला भेड़िया है – सच्चा सिग्मा! 🐺",
+                    "You don't follow rules, you make them! 👑",
+                    "Teri sigma vibe ne sabko silent kar diya! 🤐",
+                    "तू पैक का सिग्मा है! 🐾",
+                    "You're the definition of independent! 🌟",
+                    "Itna sigma ki validation ki zaroorat nahi! 💪",
+                    "तू ही सिग्माओं का सिग्मा है! 🐺",
+                    "You're the lone wolf that leads the pack! 🐾",
+                    "Teri sigma energy ne sabko impress kar diya! 🔥",
+                    "तू ही अपनी दुनिया का राजा है! 🌍"
+                ],
+                'pookie': [
+                    "तू सबसे क्यूट पूकी है! 🧸",
+                    "You're so pookie you make teddy bears jealous! 🐻",
+                    "Itna pookie ki marshmallow bhi sharm jaye! ☁️",
+                    "तू ग्रुप का पूकी है! 💕",
+                    "You're the ultimate pookie bear! 🧸",
+                    "Teri pookie-ness ne sabko pighla diya! 🫠",
+                    "तू तो पूकी का पर्याय है! 🏆",
+                    "You're so pookie you make hearts melt! 💖",
+                    "Itna pookie ki log tujhe gale laga le! 🤗",
+                    "तू ही प्यार का पुतला है! 💞"
+                ],
+                'baddie': [
+                    "तू टोटल बैडी है – स्ले! 💅",
+                    "You're so baddie you make everyone else look basic! 🔥",
+                    "Teri baddie energy ne sabko hila diya! 💃",
+                    "तू फियरलेस की परिभाषा है! 🦁",
+                    "You're the baddie that runs the world! 🌍",
+                    "Itni baddie ki shaitan bhi sharm jaye! 😈",
+                    "तू तो बैडियों की रानी है! 👑",
+                    "You're so baddie you make the devil blush! 😈",
+                    "Tera baddie level next level hai! 🚀",
+                    "तू ही सबकी सपनों की बैडी है! 💖"
+                ]
+            }
+            if meter_type in lines:
+                return random.choice(lines[meter_type])
+            return "तू कमाल है! 🌟 (You're amazing!)"
+
+        @register_cmd("studmeter")
+        async def cmd_studmeter(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('stud', percent)
+                    await event.reply(f"📊 **Stud Meter**\n{name} is **{percent}%** Stud!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("looks")
+        async def cmd_looks(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('looks', percent)
+                    await event.reply(f"📊 **Looks Meter**\n{name} is **{percent}%** Good-looking!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("gay")
+        async def cmd_gay(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('gay', percent)
+                    await event.reply(f"📊 **Gay Meter**\n{name} is **{percent}%** Gay!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("lesbian")
+        async def cmd_lesbian(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('lesbian', percent)
+                    await event.reply(f"📊 **Lesbian Meter**\n{name} is **{percent}%** Lesbian!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("straight")
+        async def cmd_straight(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('straight', percent)
+                    await event.reply(f"📊 **Straight Meter**\n{name} is **{percent}%** Straight!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("bi")
+        async def cmd_bi(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('bi', percent)
+                    await event.reply(f"📊 **Bi Meter**\n{name} is **{percent}%** Bi!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("trans")
+        async def cmd_trans(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('trans', percent)
+                    await event.reply(f"📊 **Trans Meter**\n{name} is **{percent}%** Trans!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("simp")
+        async def cmd_simp(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('simp', percent)
+                    await event.reply(f"📊 **Simp Meter**\n{name} is **{percent}%** Simp!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("chad")
+        async def cmd_chad(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('chad', percent)
+                    await event.reply(f"📊 **Chad Meter**\n{name} is **{percent}%** Chad!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("friendly")
+        async def cmd_friendly(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('friendly', percent)
+                    await event.reply(f"📊 **Friendly Meter**\n{name} is **{percent}%** Friendly!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("rizz")
+        async def cmd_rizz(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    score = random.randint(1, 100)
+                    line = get_funny_line('rizz', score)
+                    await event.reply(f"📊 **Rizz Meter**\n{name} has **{score}** Rizz!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("iq")
+        async def cmd_iq(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    score = random.randint(1, 200)
+                    line = get_funny_line('iq', score)
+                    await event.reply(f"📊 **IQ Score**\n{name} has an IQ of **{score}**\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("stupidmeter")
+        async def cmd_stupidmeter(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('stupid', percent)
+                    await event.reply(f"📊 **Stupid Meter**\n{name} is **{percent}%** Stupid!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("sigma")
+        async def cmd_sigma(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('sigma', percent)
+                    await event.reply(f"📊 **Sigma Meter**\n{name} is **{percent}%** Sigma!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("pookie")
+        async def cmd_pookie(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('pookie', percent)
+                    await event.reply(f"📊 **Pookie Meter**\n{name} is **{percent}%** Pookie!\n\n{line}")
+                except:
+                    pass
+
+        @register_cmd("baddie")
+        async def cmd_baddie(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                targets = {event.sender_id}
+            for uid in targets:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    percent = random.randint(0, 100)
+                    line = get_funny_line('baddie', percent)
+                    await event.reply(f"📊 **Baddie Meter**\n{name} is **{percent}%** Baddie!\n\n{line}")
+                except:
+                    pass
+
+        # ─── BEST FRIEND, MARRIAGE, DIVORCE ──────────────────────────────
+
+        @register_cmd("bestfrnd")
+        async def cmd_bestfrnd(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                return await safe_edit(event, "❌ Please reply to someone or tag a user.")
+            uid = next(iter(targets))
+            try:
+                u = await user_bot.get_entity(uid)
+                name = u.first_name or str(uid)
+                msgs = [
+                    f"💖 **{name}**, will you be my best friend forever? 🌟\n\nYou are the sunshine of my life ☀️",
+                    f"💖 **{name}**, let's be BFFs! 🥺\n\nYou make my heart skip a beat 💓",
+                    f"💖 **{name}**, I choose you as my bestie! 💕\n\nMy life is incomplete without you 💔",
+                    f"💖 **{name}**, tu meri best friend banegi? 🤗\n\nTere bina toh dil hai veeran 💔",
+                    f"💖 **{name}**, chal bestie ban ja! 🫂\n\nTu hai toh har gam bhoola 🌈",
+                    f"💖 **{name}**, main tera best friend banna chahta/chahti hoon! 😍\n\nTeri hansi mein jaani hai 💕"
+                ]
+                msg = random.choice(msgs)
+                buttons = [
+                    [types.KeyboardButtonCallback("💞 Yes / हाँ", f"bestfrnd_yes_{uid}")],
+                    [types.KeyboardButtonCallback("💔 No / नहीं", f"bestfrnd_no_{uid}")]
+                ]
+                await safe_edit(event, msg, buttons=buttons)
+            except:
+                await safe_edit(event, "❌ Failed to find user.")
+
+        @register_cmd("marriage")
+        async def cmd_marriage(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                return await safe_edit(event, "❌ Please reply to someone or tag a user.")
+            uid = next(iter(targets))
+            try:
+                u = await user_bot.get_entity(uid)
+                name = u.first_name or str(uid)
+                msgs = [
+                    f"💍 **{name}**, will you marry me? ❤️💍\n\nI can’t imagine my life without you",
+                    f"💍 **{name}**, be mine forever! 🥰\n\nYou are my everything",
+                    f"💍 **{name}**, let's tie the knot! 🎊\n\nSay yes and make me the happiest person",
+                    f"💍 **{name}**, mujhse shaadi karogi? 🥹\n\nTere bina mera koi nahi 💔",
+                    f"💍 **{name}**, main tera/tujhse pyaar karta/karti hoon! 💕\n\nSach mein, forever ❤️",
+                    f"💍 **{name}**, chal do dil ek ho jaayein! 💞\n\nTu hai toh duniya hai meri 🌍"
+                ]
+                msg = random.choice(msgs)
+                buttons = [
+                    [types.KeyboardButtonCallback("💍 Yes / हाँ", f"marriage_yes_{uid}")],
+                    [types.KeyboardButtonCallback("💔 No / नहीं", f"marriage_no_{uid}")]
+                ]
+                await safe_edit(event, msg, buttons=buttons)
+            except:
+                await safe_edit(event, "❌ Failed to find user.")
+
+        @register_cmd("divorce")
+        async def cmd_divorce(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                return await safe_edit(event, "❌ Please reply to someone or tag a user.")
+            uid = next(iter(targets))
+            try:
+                u = await user_bot.get_entity(uid)
+                name = u.first_name or str(uid)
+                msgs = [
+                    f"💔 **{name}**, I think we should get divorced... 😢\n\nIt’s not you, it’s me",
+                    f"💔 **{name}**, we need to part ways... 😭\n\nWe grew apart",
+                    f"💔 **{name}**, I'm sorry but I need space... 💔\n\nI need some space",
+                    f"💔 **{name}**, mujhe talaaq chahiye... 😭\n\nAb saath nahi reh sakte 💔",
+                    f"💔 **{name}**, rista todna padega... 😢\n\nKuch rishte kabhi nahi chahiye the 🤷",
+                    f"💔 **{name}**, ab nahi ho sakta... 💔\n\nTu theek hai, par main nahi 🥀"
+                ]
+                msg = random.choice(msgs)
+                buttons = [
+                    [types.KeyboardButtonCallback("✅ Yes / हाँ", f"divorce_yes_{uid}")],
+                    [types.KeyboardButtonCallback("❌ No / नहीं", f"divorce_no_{uid}")]
+                ]
+                await safe_edit(event, msg, buttons=buttons)
+            except:
+                await safe_edit(event, "❌ Failed to find user.")
+        
         # ─── FUN RAIDS (Menu8) ──────────────────────────────────────────────────
 
         @register_cmd("shayariraid", needs_reply=True)
@@ -5717,6 +7053,8 @@ async def run_user_bot(session_string, chat_id):
         async def cmd_quote(event, _):
             await safe_edit(event, f"💭 **QUOTE**\n━━━━━━━━━━━━━━━\n{random.choice(quote_list)}")
 
+        # ─── RPS ───────────────────────────────────────────────────────────────
+
         @register_cmd("rps")
         async def cmd_rps(event, arg):
             choices = {"r": "🪨 Rock", "p": "📄 Paper", "s": "✂️ Scissors"}
@@ -5744,7 +7082,6 @@ async def run_user_bot(session_string, chat_id):
                 return await safe_edit(event, "⚠️ A game is already in progress! Use `.ttt_move` to play.")
             board = [" "] * 9
             ttt_games[chat] = {"board": board, "turn": "X", "player_x": None, "player_o": None}
-            # The starter is X
             ttt_games[chat]["player_x"] = event.sender_id
             board_display = "```\n" + "\n".join([" | ".join(board[i:i+3]) for i in range(0, 9, 3)]) + "\n```"
             await safe_edit(event, f"🎮 **TIC TAC TOE**\n{board_display}\n\nPlayer X (you) starts. Use `.ttt_move 1-9`")
@@ -5756,13 +7093,12 @@ async def run_user_bot(session_string, chat_id):
                 return await safe_edit(event, "❌ No game active. Start with `.ttt`")
             game = ttt_games[chat]
             sender = event.sender_id
-            # Determine player
             if game["turn"] == "X":
                 if game["player_x"] is None:
                     game["player_x"] = sender
                 if sender != game["player_x"]:
                     return await safe_edit(event, "❌ It's not your turn (X).")
-            else:  # O
+            else:
                 if game["player_o"] is None:
                     game["player_o"] = sender
                 if sender != game["player_o"]:
@@ -5774,7 +7110,6 @@ async def run_user_bot(session_string, chat_id):
                 return await safe_edit(event, "❌ Position already taken!")
             game["board"][pos] = game["turn"]
             board = game["board"]
-            # Check win
             win = False
             for i in range(3):
                 if board[i*3] == board[i*3+1] == board[i*3+2] != " ":
@@ -6061,7 +7396,6 @@ async def run_user_bot(session_string, chat_id):
                 await safe_edit(event, "❌ Invalid action. Use `set` or `stop`.")
 
         # ─── DEATHGOD ────────────────────────────────────────────────────────────
-
         @register_cmd("deathgod")
         async def cmd_deathgod(event, arg):
             chat = event.chat_id
@@ -6070,19 +7404,34 @@ async def run_user_bot(session_string, chat_id):
                 count = int(arg.strip())
                 if count < 1: count = 1
                 if count > 1000: count = 1000
+
             reply_to = None
+            target_user = None
+
             if event.is_reply:
                 reply = await event.get_reply_message()
                 if reply:
                     reply_to = reply.id
+                    target_user = reply.sender_id
+                    # 🛡️ PREMIUM PROTECTION CHECK
+                    if target_user and await is_protected(target_user, "deathgod"):
+                        await safe_edit(event, "🚫 This user is protected from Deathgod.")
+                        return
+
             if chat in user_bot.spray_tasks and not user_bot.spray_tasks[chat].done():
                 return
+
             await safe_edit(event, f"☠️ Deathgod started{' with reply' if reply_to else ''}{' (' + str(count) + ' msgs)' if count else ' (infinite)'}...")
+
             async def loop():
                 sent = 0
                 try:
                     while chat in user_bot.spray_tasks:
                         if count is not None and sent >= count:
+                            break
+                        # Re-check protection every 10 messages
+                        if target_user and sent % 10 == 0 and await is_protected(target_user, "deathgod"):
+                            await safe_send(chat, "🛑 Target is now protected. Stopping Deathgod.")
                             break
                         txt = random.choice(deathgod_replies)
                         sent += 1
@@ -6096,22 +7445,25 @@ async def run_user_bot(session_string, chat_id):
                     user_bot.spray_tasks.pop(chat, None)
                     if sent > 0:
                         await safe_send(chat, f"☠️ Deathgod done: {sent} messages sent.")
+
             user_bot.spray_tasks[chat] = asyncio.create_task(loop())
             await safe_edit(event, f"☠️ Deathgod started{' with reply' if reply_to else ''}{' (' + str(count) + ' msgs)' if count else ' (infinite)'}")
 
         @register_cmd("sdeathgod")
         async def cmd_sdeathgod(event, _):
             chat = event.chat_id
-            if chat not in user_bot.spray_tasks:
-                return
-            try:
-                user_bot.spray_tasks[chat].cancel()
-            except:
-                pass
-            user_bot.spray_tasks.pop(chat, None)
-            await safe_edit(event, "🛑 Deathgod stopped.")
+            if chat in user_bot.spray_tasks:
+                try:
+                    user_bot.spray_tasks[chat].cancel()
+                except:
+                    pass
+                user_bot.spray_tasks.pop(chat, None)
+                await safe_edit(event, "🛑 Deathgod stopped.")
+            else:
+                await safe_edit(event, "⚠️ No active Deathgod spray in this chat.")
 
-        # ─── DISPATCHER (modified to check premium) ──────────────────────────
+
+        # ─── DISPATCHER ──────────────────────────────────────────────────────
         @user_bot.on(events.NewMessage)
         async def dispatcher(event):
             text = event.raw_text
@@ -6167,7 +7519,7 @@ async def run_user_bot(session_string, chat_id):
             except Exception:
                 pass
 
-        # ─── AUTO HANDLER (modified to check protection) ────────────────────
+        # ─── AUTO HANDLER ──────────────────────────────────────────────────
         @user_bot.on(events.NewMessage)
         async def auto_handler(event):
             if event.out:
@@ -6214,7 +7566,6 @@ async def run_user_bot(session_string, chat_id):
                 return
 
             # Check protection for each raid type
-            # We'll add a helper function to check if sender is protected for a given command
             async def is_protected_cmd(target, cmd):
                 return await is_protected(target, cmd)
 
@@ -6555,7 +7906,7 @@ async def run_user_bot(session_string, chat_id):
                 user_bot.reply_cooldowns[sender] = now
                 return
 
-        # ─── CACHE & ANTI-DELETE (unchanged) ──────────────────────────────────
+        # ─── CACHE & ANTI-DELETE ──────────────────────────────────────────────
         @user_bot.on(events.NewMessage(outgoing=True))
         async def cache_own(event):
             if not user_bot.antidel_enabled:
@@ -6622,34 +7973,48 @@ async def run_user_bot(session_string, chat_id):
         await MAIN_BOT_CLIENT.send_message(chat_id, f"🔥 **Your Userbot is now Active!**\n👤 {me.first_name}\n💡 Use `.menu` to get started.")
         await user_bot.run_until_disconnected()
 
-    except asyncio.CancelledError:
-        print("Userbot task cancelled.")
-    except Exception as e:
-        if "SESSION_INVALID" not in str(e):
-            print(f"Userbot crashed: {e}")
+    except (UnauthorizedError, ValueError, RPCError) as e:
+        error_msg = str(e)
+        if "SESSION_INVALID" in error_msg or "invalid" in error_msg.lower():
             try:
-                await MAIN_BOT_CLIENT.send_message(chat_id, f"⚠️ **Userbot crashed:** {str(e)[:100]}\nIt will restart automatically in 5 seconds...")
+                await MAIN_BOT_CLIENT.send_message(chat_id, "⚠️ **Your userbot session is invalid. Please login again with /login.**")
             except:
                 pass
         raise
-    finally:
-        active_userbots.pop(chat_id, None)
-        if user_bot is not None:
-            try:
-                await user_bot.disconnect()
-            except:
-                pass
+
+    except asyncio.CancelledError:
+        print(f"Userbot task cancelled for {chat_id}")
+        raise
+
+    except Exception as e:
+        print(f"Userbot crashed: {e}")
         try:
-            if user_bot is not None:
-                await MAIN_BOT_CLIENT.send_message(chat_id, "🛑 Userbot stopped.")
+            await MAIN_BOT_CLIENT.send_message(chat_id, f"⚠️ **Userbot crashed:** {str(e)[:100]}\nRestarting...")
         except:
             pass
+        raise
+
+    finally:
+        active_userbots.pop(chat_id, None)
+        if user_bot:
+            try:
+                # Cancel all tasks related to this userbot
+                tasks_to_cancel = []
+                for task in asyncio.all_tasks():
+                    if task.get_name() in [f"userbot_{chat_id}", f"userbot_restart_{chat_id}"]:
+                        tasks_to_cancel.append(task)
+                for task in tasks_to_cancel:
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await asyncio.shield(task)
+                        except:
+                            pass
+                await user_bot.disconnect()
+            except Exception:
+                pass
 
 # ─── WEB SERVER ──────────────────────────────────────────────────────
-from flask import Flask
-import threading
-from waitress import serve
-
 app = Flask(__name__)
 
 @app.route('/')
@@ -6665,29 +8030,34 @@ def run_web():
 async def main():
     print("🚀 Main bot starting with Web Server (Waitress)...")
     
-    # Initialize database and cipher
     await init_db()
     await init_cipher()
 
-    # Restore sessions
-    sessions = await load_sessions()
+    sessions = await load_sessions()  
     for uid, sess_str in sessions.items():
         try:
-            asyncio.create_task(run_user_bot_with_restart(sess_str, uid))
+            task = asyncio.create_task(run_user_bot_with_restart(sess_str, uid))
+            task.set_name(f"userbot_restart_{uid}")
+            running_tasks.add(task)
+            task.add_done_callback(running_tasks.discard)
             print(f"✅ Restored session for user {uid}")
         except Exception as e:
             print(f"❌ Failed to restore {uid}: {e}")
             await delete_session(uid)
 
-    # Start the web server in a background thread
     threading.Thread(target=run_web, daemon=True).start()
 
-    # Start the main bot client
     await MAIN_BOT_CLIENT.start(bot_token=BOT_TOKEN)
     print("✅ Bot is running. Press Ctrl+C to stop.")
 
-    # Keep the bot running forever
-    await MAIN_BOT_CLIENT.run_until_disconnected()
+    try:
+        await MAIN_BOT_CLIENT.run_until_disconnected()
+    finally:
+        # Clean shutdown
+        for task in list(running_tasks):
+            if not task.done():
+                task.cancel()
+        await MAIN_BOT_CLIENT.disconnect()
 
 if __name__ == "__main__":
     asyncio.run(main())
