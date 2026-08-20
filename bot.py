@@ -181,7 +181,7 @@ async def init_db():
                 frozen BOOLEAN DEFAULT FALSE
             )
         """)
-        # ─── ENCRYPTION FUNCTIONS ──────────────────────────────────────────
+       # ─── ENCRYPTION FUNCTIONS ──────────────────────────────────────────
 
 async def get_encryption_key():
     async with db_pool.acquire() as conn:
@@ -227,6 +227,7 @@ def decrypt_session(data: str):
     return cipher.decrypt(data.encode()).decode()
 
 
+
 # ─── SESSION FUNCTIONS ──────────────────────────────────────────────
 
 async def save_session(user_id: int, session_str: str):
@@ -235,7 +236,8 @@ async def save_session(user_id: int, session_str: str):
     async with db_pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO user_sessions (user_id, session_encrypted)
+            INSERT INTO user_sessions
+            (user_id, session_encrypted)
             VALUES ($1, $2)
             ON CONFLICT (user_id)
             DO UPDATE SET
@@ -257,7 +259,10 @@ async def load_sessions() -> dict:
 
     for row in rows:
         try:
-            sessions[row["user_id"]] = decrypt_session(row["session_encrypted"])
+            sessions[row["user_id"]] = decrypt_session(
+                row["session_encrypted"]
+            )
+
         except Exception:
             await delete_session(row["user_id"])
 
@@ -267,8 +272,105 @@ async def load_sessions() -> dict:
 async def delete_session(user_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute(
-            "DELETE FROM user_sessions WHERE user_id = $1",
+            "DELETE FROM user_sessions WHERE user_id=$1",
             user_id
+        )
+
+
+
+# ─── FREEZE FUNCTIONS ──────────────────────────────────────────────
+
+async def set_freeze(user_id: int, frozen: bool):
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO user_freeze
+            (user_id, frozen)
+            VALUES ($1, $2)
+
+            ON CONFLICT (user_id)
+            DO UPDATE SET frozen=$2
+            """,
+            user_id,
+            frozen
+        )
+
+
+async def get_freeze(user_id: int) -> bool:
+
+    async with db_pool.acquire() as conn:
+
+        row = await conn.fetchrow(
+            "SELECT frozen FROM user_freeze WHERE user_id=$1",
+            user_id
+        )
+
+        if row:
+            return row["frozen"]
+
+        return False
+
+
+
+# ─── WALLET FUNCTIONS ──────────────────────────────────────────────
+
+async def get_balance(user_id: int) -> float:
+
+    async with db_pool.acquire() as conn:
+
+        row = await conn.fetchrow(
+            "SELECT balance FROM user_wallet WHERE user_id=$1",
+            user_id
+        )
+
+        return float(row["balance"]) if row else 0.0
+
+
+
+async def add_balance(user_id: int, amount: float):
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+            """
+            INSERT INTO user_wallet
+            (user_id, balance)
+            VALUES ($1,$2)
+
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+
+            balance=user_wallet.balance+$2,
+            updated_at=CURRENT_TIMESTAMP
+            """,
+            user_id,
+            amount
+        )
+
+
+
+async def deduct_balance(user_id: int, amount: float):
+
+    balance = await get_balance(user_id)
+
+    if balance < amount:
+        raise ValueError("Insufficient balance")
+
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+            """
+            UPDATE user_wallet
+
+            SET balance=balance-$2,
+            updated_at=CURRENT_TIMESTAMP
+
+            WHERE user_id=$1
+            """,
+            user_id,
+            amount
         )
 
 # ─── PREMIUM ──────────────────────────────────────────────────────
