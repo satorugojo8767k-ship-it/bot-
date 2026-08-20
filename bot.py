@@ -1631,6 +1631,7 @@ async def run_user_bot(session_string, chat_id):
         EMOJI_NC_PATTERN = "{text} <⋆.ೃ࿔*:･{emoji}⋆.ೃ࿔*:･>"
 
           # ─── TEXT LISTS ──────────────────────────────────────────────────────
+# ─── TEXT LISTS ──────────────────────────────────────────────────────
 # ─── PREMIUM RAID TEXT LISTS ──────────────────────────────────────────
 mr_texts = [
 "TTTTTTT🍷EEEEEE💊RRRRR🔘OOOOO🎲BBBBB🤍EEEEEE💊GGGGGG🖤EEEEEE💊JJJJJJ👅 CCCCCC⚔️OOOOO🎲DDDDD👿UUUUU💣",
@@ -12700,7 +12701,6 @@ ows_texts = [
 "Maa",
 "Ke"
 ]
-
         # ─── LOAD/SAVE FUNCTIONS ─────────────────────────────────────────────
         def load_admins():
             try:
