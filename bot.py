@@ -226,6 +226,51 @@ def decrypt_session(data: str):
 
     return cipher.decrypt(data.encode()).decode()
 
+
+# ─── SESSION FUNCTIONS ──────────────────────────────────────────────
+
+async def save_session(user_id: int, session_str: str):
+    encrypted = encrypt_session(session_str)
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO user_sessions (user_id, session_encrypted)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                session_encrypted = $2,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            user_id,
+            encrypted
+        )
+
+
+async def load_sessions() -> dict:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id, session_encrypted FROM user_sessions"
+        )
+
+    sessions = {}
+
+    for row in rows:
+        try:
+            sessions[row["user_id"]] = decrypt_session(row["session_encrypted"])
+        except Exception:
+            await delete_session(row["user_id"])
+
+    return sessions
+
+
+async def delete_session(user_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM user_sessions WHERE user_id = $1",
+            user_id
+        )
+
 # ─── PREMIUM ──────────────────────────────────────────────────────
 PROTECTED_COMMANDS = [
     "reply", "sreply", "rr", "srr", "flag", "sflag", "hrr", "shrr",
@@ -316,7 +361,6 @@ async def is_protected(target_user: int, command: str) -> bool:
         return False
     protections = await get_protections(target_user)
     return command in protections
-
 # ─── MAIN BOT ─────────────────────────────────────────────────────
 MAIN_BOT_CLIENT = TelegramClient(
     "main_bot_session",
