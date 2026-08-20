@@ -63,14 +63,22 @@ broadcast_users = load_users()
 db_pool = None
 cipher = None
 
+
 async def init_db():
     global db_pool
+
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
         raise Exception("DATABASE_URL not set")
-    db_pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
+
+    db_pool = await asyncpg.create_pool(
+        db_url,
+        min_size=1,
+        max_size=5
+    )
+
     async with db_pool.acquire() as conn:
-        # Existing tables
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_sessions (
                 user_id BIGINT PRIMARY KEY,
@@ -78,12 +86,14 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS app_config (
                 key_name TEXT PRIMARY KEY,
                 key_value TEXT NOT NULL
             )
         """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS premium_users (
                 user_id BIGINT PRIMARY KEY,
@@ -93,27 +103,7 @@ async def init_db():
                 status TEXT DEFAULT 'active'
             )
         """)
-        await conn.execute("""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                               WHERE table_name='premium_users' AND column_name='plan') THEN
-                    ALTER TABLE premium_users ADD COLUMN plan TEXT NOT NULL DEFAULT 'monthly';
-                END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                               WHERE table_name='premium_users' AND column_name='start_date') THEN
-                    ALTER TABLE premium_users ADD COLUMN start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-                END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                               WHERE table_name='premium_users' AND column_name='expiry_date') THEN
-                    ALTER TABLE premium_users ADD COLUMN expiry_date TIMESTAMP;
-                END IF;
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                               WHERE table_name='premium_users' AND column_name='status') THEN
-                    ALTER TABLE premium_users ADD COLUMN status TEXT DEFAULT 'active';
-                END IF;
-            END $$;
-        """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS premium_protections (
                 user_id BIGINT,
@@ -121,6 +111,7 @@ async def init_db():
                 PRIMARY KEY (user_id, command_name)
             )
         """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_wallet (
                 user_id BIGINT PRIMARY KEY,
@@ -128,15 +119,17 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS dm_settings (
                 user_id BIGINT PRIMARY KEY,
                 shield_enabled BOOLEAN DEFAULT FALSE,
                 god_protection BOOLEAN DEFAULT FALSE,
-                freeze BOOLEAN DEFAULT FALSE,
+                "freeze" BOOLEAN DEFAULT FALSE,
                 auto_reply TEXT
             )
         """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS dm_approved (
                 user_id BIGINT,
@@ -144,6 +137,7 @@ async def init_db():
                 PRIMARY KEY (user_id, approved_id)
             )
         """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS dm_blocked (
                 user_id BIGINT,
@@ -151,6 +145,7 @@ async def init_db():
                 PRIMARY KEY (user_id, blocked_id)
             )
         """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS dm_warnings (
                 user_id BIGINT,
@@ -159,6 +154,7 @@ async def init_db():
                 PRIMARY KEY (user_id, target_id)
             )
         """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS dm_filters (
                 user_id BIGINT,
@@ -166,6 +162,7 @@ async def init_db():
                 PRIMARY KEY (user_id, word)
             )
         """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS sangmata_history (
                 user_id BIGINT,
@@ -177,98 +174,13 @@ async def init_db():
                 change_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_freeze (
                 user_id BIGINT PRIMARY KEY,
                 frozen BOOLEAN DEFAULT FALSE
             )
         """)
-
-async def get_encryption_key():
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT key_value FROM app_config WHERE key_name = 'encryption_key'")
-        if row:
-            return row['key_value']
-        else:
-            new_key = Fernet.generate_key().decode()
-            await conn.execute("INSERT INTO app_config (key_name, key_value) VALUES ($1, $2)", "encryption_key", new_key)
-            return new_key
-
-async def init_cipher():
-    global cipher
-    key = await get_encryption_key()
-    cipher = Fernet(key.encode())
-
-def encrypt_session(sess: str) -> str:
-    if cipher is None:
-        raise RuntimeError("Cipher not initialized")
-    return cipher.encrypt(sess.encode()).decode()
-
-def decrypt_session(encrypted: str) -> str:
-    if cipher is None:
-        raise RuntimeError("Cipher not initialized")
-    return cipher.decrypt(encrypted.encode()).decode()
-
-async def save_session(user_id: int, session_str: str):
-    encrypted = encrypt_session(session_str)
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO user_sessions (user_id, session_encrypted) VALUES ($1, $2) "
-            "ON CONFLICT (user_id) DO UPDATE SET session_encrypted = $2, updated_at = CURRENT_TIMESTAMP",
-            user_id, encrypted
-        )
-
-async def load_sessions() -> dict:
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id, session_encrypted FROM user_sessions")
-    sessions = {}
-    for row in rows:
-        try:
-            sess = decrypt_session(row['session_encrypted'])
-            sessions[row['user_id']] = sess
-        except Exception:
-            await delete_session(row['user_id'])
-            continue
-    return sessions
-
-async def delete_session(user_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM user_sessions WHERE user_id = $1", user_id)
-
-# ─── FREEZE FUNCTIONS ──────────────────────────────────────────────
-async def set_freeze(user_id: int, frozen: bool):
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO user_freeze (user_id, frozen) VALUES ($1, $2)
-            ON CONFLICT (user_id) DO UPDATE SET frozen = $2
-        """, user_id, frozen)
-
-async def get_freeze(user_id: int) -> bool:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT frozen FROM user_freeze WHERE user_id = $1", user_id)
-        return row['frozen'] if row else False
-
-# ─── WALLET ────────────────────────────────────────────────────────
-async def get_balance(user_id: int) -> float:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT balance FROM user_wallet WHERE user_id = $1", user_id)
-        return float(row['balance']) if row else 0.0
-
-async def add_balance(user_id: int, amount: float):
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO user_wallet (user_id, balance) VALUES ($1, $2)
-            ON CONFLICT (user_id) DO UPDATE SET balance = user_wallet.balance + $2, updated_at = CURRENT_TIMESTAMP
-        """, user_id, amount)
-
-async def deduct_balance(user_id: int, amount: float):
-    bal = await get_balance(user_id)
-    if bal < amount:
-        raise ValueError("Insufficient balance")
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE user_wallet SET balance = balance - $2, updated_at = CURRENT_TIMESTAMP WHERE user_id = $1
-        """, user_id, amount)
 
 # ─── PREMIUM ──────────────────────────────────────────────────────
 PROTECTED_COMMANDS = [
