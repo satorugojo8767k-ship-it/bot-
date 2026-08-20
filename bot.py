@@ -16,7 +16,7 @@ import qrcode
 from gtts import gTTS
 import yt_dlp
 from telethon import TelegramClient, events, functions, types
-from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError, MessageNotModifiedError, UnauthorizedError
+from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError, MessageNotModifiedError, UnauthorizedError, AuthKeyDuplicatedError
 from telethon.sessions import StringSession
 from cryptography.fernet import Fernet
 import asyncpg
@@ -36,7 +36,7 @@ UPI_ID = os.environ.get("UPI_ID", "paryush01@nyes")
 QR_IMAGE_PATH = os.environ.get("QR_IMAGE_PATH", "upi_qr.jpg")
 PREMIUM_FEATURES_LINK = os.environ.get("PREMIUM_FEATURES_LINK", "https://t.me/userbotsupport_ZA/20")
 
-# ─── CHANNEL VERIFICATION ───
+# ─── CHANNEL VERIFICATION (UPDATED WITH 4 PRIVATE CHANNELS) ───
 REQUIRED_CHANNELS = [
     {"id": -1004404975416, "invite": "https://t.me/+j9ndQJG6wdc3ZDE1", "name": "Channel 1"},
     {"id": -1004334756214, "invite": "https://t.me/+5DvNxDnfAApjYWNk", "name": "Channel 2"},
@@ -70,6 +70,7 @@ async def init_db():
         raise Exception("DATABASE_URL not set")
     db_pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
     async with db_pool.acquire() as conn:
+        # Existing tables
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_sessions (
                 user_id BIGINT PRIMARY KEY,
@@ -127,6 +128,61 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS dm_settings (
+                user_id BIGINT PRIMARY KEY,
+                shield_enabled BOOLEAN DEFAULT FALSE,
+                god_protection BOOLEAN DEFAULT FALSE,
+                freeze BOOLEAN DEFAULT FALSE,
+                auto_reply TEXT
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS dm_approved (
+                user_id BIGINT,
+                approved_id BIGINT,
+                PRIMARY KEY (user_id, approved_id)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS dm_blocked (
+                user_id BIGINT,
+                blocked_id BIGINT,
+                PRIMARY KEY (user_id, blocked_id)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS dm_warnings (
+                user_id BIGINT,
+                target_id BIGINT,
+                count INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, target_id)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS dm_filters (
+                user_id BIGINT,
+                word TEXT,
+                PRIMARY KEY (user_id, word)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS sangmata_history (
+                user_id BIGINT,
+                target_id BIGINT,
+                old_name TEXT,
+                old_username TEXT,
+                new_name TEXT,
+                new_username TEXT,
+                change_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_freeze (
+                user_id BIGINT PRIMARY KEY,
+                frozen BOOLEAN DEFAULT FALSE
+            )
+        """)
 
 async def get_encryption_key():
     async with db_pool.acquire() as conn:
@@ -179,6 +235,19 @@ async def delete_session(user_id: int):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM user_sessions WHERE user_id = $1", user_id)
 
+# ─── FREEZE FUNCTIONS ──────────────────────────────────────────────
+async def set_freeze(user_id: int, frozen: bool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO user_freeze (user_id, frozen) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET frozen = $2
+        """, user_id, frozen)
+
+async def get_freeze(user_id: int) -> bool:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT frozen FROM user_freeze WHERE user_id = $1", user_id)
+        return row['frozen'] if row else False
+
 # ─── WALLET ────────────────────────────────────────────────────────
 async def get_balance(user_id: int) -> float:
     async with db_pool.acquire() as conn:
@@ -215,7 +284,13 @@ PROTECTED_COMMANDS = [
     "devilraid", "sdevilraid", "karmaraid", "skarmaraid",
     "doomraid", "sdoomraid",
     "spray", "dspray", "tspray", "rspray", "multispray", "countspray",
-    "deathgod", "sdeathgod"
+    "deathgod", "sdeathgod",
+    # Premium raids/spam
+    "mr", "smr", "mr2", "smr2", "br", "sbr", "br2", "sbr2", "br3", "sbr3",
+    "sqr", "ssqr", "sq2", "ssq2", "cr", "scr", "bar", "sbar", "gr", "sgr",
+    "ms", "sms", "ms2", "sms2", "bs", "sbs", "bs2", "sbs2", "bs3", "sbs3",
+    "sqs", "ssqs", "sqs2", "ssqs2", "cs", "scs", "bas", "sbas", "gs", "sgs",
+    "pwr", "spwr", "ows", "sows"
 ]
 
 async def add_premium_user(user_id: int, plan: str, days: int):
@@ -298,8 +373,6 @@ MAIN_BOT_CLIENT = TelegramClient(
 active_userbots = {}
 user_sessions = {}
 user_states = {}
-
-# Store all running tasks for proper cleanup
 running_tasks = set()
 
 print("🚀 Main Bot started...")
@@ -327,16 +400,11 @@ async def shutdown_handler(sig, frame):
             await asyncio.sleep(0.5)
         except:
             pass
-    
-    # Cancel all running tasks properly
-    tasks_to_cancel = []
     for uid, client in active_userbots.items():
         try:
             await client.disconnect()
         except:
             pass
-    
-    # Cancel all userbot tasks
     for task in list(running_tasks):
         if not task.done():
             task.cancel()
@@ -344,7 +412,6 @@ async def shutdown_handler(sig, frame):
                 await asyncio.shield(task)
             except:
                 pass
-    
     await MAIN_BOT_CLIENT.disconnect()
     sys.exit(0)
 
@@ -400,7 +467,6 @@ def plan_price_str(plan):
     return f"₹{plan_price(plan)}"
 
 # ─── MAIN HANDLERS ─────────────────────────────────────────────────
-
 @MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/start"))
 async def start_handler(event):
     user_id = event.sender_id
@@ -413,19 +479,77 @@ async def start_handler(event):
         [types.KeyboardButtonUrl("🔗 Premium Features", url=PREMIUM_FEATURES_LINK)],
     ]
     bal = await get_balance(user_id)
-    await safe_reply(
-        event,
-        f"╔═══════════════════════════════════════════╗\n"
-        f"║  ✦ 👑 ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️ 𝐀𝐔𝐓𝐎-𝐃𝐄𝐏𝐋𝐎𝐘 👑 ✦  ║\n"
-        f"╚═══════════════════════════════════════════╝\n\n"
+    intro = (
+        "╔═══════════════════════════════════════════╗\n"
+        "║  ✦ 👑 ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️ 𝐀𝐔𝐓𝐎-𝐃𝐄𝐏𝐋𝐎𝐘 👑 ✦  ║\n"
+        "╚═══════════════════════════════════════════╝\n\n"
         f"Welcome to the **Ultimate Userbot Manager**.\n"
         f"• To start your personal userbot, type `/login`\n"
         f"• To stop it, use `/logout`\n"
         f"• Use the buttons below to buy premium or deposit.\n\n"
         f"💰 **Your Wallet Balance:** ₹{bal:.2f}\n\n"
-        "Enjoy the premium experience! 🚀",
-        buttons=buttons
+        "Enjoy the premium experience! 🚀"
     )
+    await safe_reply(event, intro, buttons=buttons)
+    # Force join message
+    not_joined = []
+    for ch in REQUIRED_CHANNELS:
+        if not await is_user_in_channel(user_id, ch):
+            not_joined.append(ch)
+    if not_joined:
+        force_join_msg = (
+            "⚠️═══⟦ ꜰᴏʀᴄᴇ ᴊᴏɪɴ ʀᴇqᴜɪʀᴇᴅ ⟧═══⚠️\n\n"
+            "✧➤ ᴘʟᴇᴀꜱᴇ ᴊᴏɪɴ ᴀʟʟ 4 ᴄʜᴀɴɴᴇʟꜱ ᴛᴏ\n"
+            "   ᴜꜱᴇ ᴛʜɪꜱ ʙᴏᴛ ᴀɴᴅ ᴅᴇᴘʟᴏʏ\n"
+            "❀═════════════════════════════❀"
+        )
+        await safe_respond(event, force_join_msg, buttons=get_join_buttons())
+
+@MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/freeze"))
+async def freeze_cmd(event):
+    if event.sender_id not in MY_OWNER_IDS:
+        return
+    args = event.text.strip().split()
+    if len(args) != 2 or not args[1].isdigit():
+        await safe_reply(event, "❌ Usage: /freeze <user_id>")
+        return
+    uid = int(args[1])
+    await set_freeze(uid, True)
+    if uid in active_userbots:
+        try:
+            await active_userbots[uid].send_message(uid, "❄️ Your userbot has been frozen by the owner.")
+        except:
+            pass
+    await safe_reply(event, f"✅ User {uid} frozen.")
+
+@MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/unfreeze"))
+async def unfreeze_cmd(event):
+    if event.sender_id not in MY_OWNER_IDS:
+        return
+    args = event.text.strip().split()
+    if len(args) != 2 or not args[1].isdigit():
+        await safe_reply(event, "❌ Usage: /unfreeze <user_id>")
+        return
+    uid = int(args[1])
+    await set_freeze(uid, False)
+    if uid in active_userbots:
+        try:
+            await active_userbots[uid].send_message(uid, "🔥 Your userbot has been unfrozen by the owner.")
+        except:
+            pass
+    await safe_reply(event, f"✅ User {uid} unfrozen.")
+
+@MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/freezelist"))
+async def freezelist_cmd(event):
+    if event.sender_id not in MY_OWNER_IDS:
+        return
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM user_freeze WHERE frozen = TRUE")
+    if not rows:
+        await safe_reply(event, "📭 No frozen users.")
+        return
+    msg = "❄️ **Frozen Users:**\n" + "\n".join(f"• `{r['user_id']}`" for r in rows)
+    await safe_reply(event, msg)
 
 @MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/login"))
 async def login_handler(event):
@@ -440,10 +564,10 @@ async def login_handler(event):
             not_joined.append(ch)
 
     if not_joined:
-        msg = "❌ **You must join all channels first:**\n\n"
+        msg = "⚠️═══⟦ ꜰᴏʀᴄᴇ ᴊᴏɪɴ ʀᴇqᴜɪʀᴇᴅ ⟧═══⚠️\n\n"
         for ch in not_joined:
-            msg += f"• {ch['name']} ({ch['invite']})\n"
-        msg += "\nAfter joining, click the **'✅ I have joined all'** button below."
+            msg += f"✧➤ {ch['name']} ({ch['invite']})\n"
+        msg += "\n❀═════════════════════════════❀"
         buttons = get_join_buttons()
         await safe_reply(event, msg, buttons=buttons)
         return
@@ -455,7 +579,6 @@ async def login_handler(event):
         "Example: `+919876543210`"
     )
 
-# ─── PHONE NUMBER HANDLER ─────────────────────────────────────────
 @MAIN_BOT_CLIENT.on(events.NewMessage)
 async def handle_login_phone(event):
     if not event.is_private:
@@ -470,13 +593,11 @@ async def handle_login_phone(event):
     phone = event.raw_text.strip()
     phone = re.sub(r'[\s\-\(\)]', '', phone)
     
-    # Fix: Better phone validation
     if not re.match(r'^\+?\d{10,15}$', phone):
         await safe_reply(event, "❌ Invalid phone number format. Please send with country code, e.g., `+919876543210`")
         return
 
     try:
-        # Use a fresh StringSession
         temp_client = TelegramClient(StringSession(), API_ID, API_HASH)
         await temp_client.connect()
         await temp_client.send_code_request(phone)
@@ -506,7 +627,6 @@ async def handle_login_phone(event):
         except:
             pass
 
-# ─── CODE HANDLER ──────────────────────────────────────────────────
 @MAIN_BOT_CLIENT.on(events.NewMessage)
 async def handle_login_code(event):
     if not event.is_private:
@@ -532,22 +652,18 @@ async def handle_login_code(event):
         return
 
     try:
-        # Try signing in with code
         await temp_client.sign_in(phone, code=code)
         session_str = temp_client.session.save()
         await save_session(user_id, session_str)
         
-        # Create task and track it
         task = asyncio.create_task(run_user_bot_with_restart(session_str, user_id))
         task.set_name(f"userbot_restart_{user_id}")
         running_tasks.add(task)
         task.add_done_callback(running_tasks.discard)
         
-        # Send login notification to owners
         user_entity = await MAIN_BOT_CLIENT.get_entity(user_id)
         user_name = user_entity.first_name or "Unknown"
         username = f"@{user_entity.username}" if user_entity.username else "No username"
-        # FIX: Show first 3 digits, hide middle, show last 3 digits
         if len(phone) > 6:
             phone_display = phone[:3] + "*" * (len(phone) - 6) + phone[-3:]
         else:
@@ -587,7 +703,6 @@ async def handle_login_code(event):
             except:
                 pass
 
-# ─── 2FA PASSWORD HANDLER ─────────────────────────────────────────
 @MAIN_BOT_CLIENT.on(events.NewMessage)
 async def handle_login_password(event):
     if not event.is_private:
@@ -611,18 +726,15 @@ async def handle_login_password(event):
         session_str = temp_client.session.save()
         await save_session(user_id, session_str)
         
-        # Create task and track it
         task = asyncio.create_task(run_user_bot_with_restart(session_str, user_id))
         task.set_name(f"userbot_restart_{user_id}")
         running_tasks.add(task)
         task.add_done_callback(running_tasks.discard)
         
-        # Send login notification to owners
         user_entity = await MAIN_BOT_CLIENT.get_entity(user_id)
         user_name = user_entity.first_name or "Unknown"
         username = f"@{user_entity.username}" if user_entity.username else "No username"
         phone = state.get("phone", "Unknown")
-        # FIX: Show first 3 digits, hide middle, show last 3 digits
         if len(phone) > 6:
             phone_display = phone[:3] + "*" * (len(phone) - 6) + phone[-3:]
         else:
@@ -659,7 +771,6 @@ async def handle_login_password(event):
             except:
                 pass
 
-# ─── CALLBACK QUERY HANDLER ───────────────────────────────────────
 @MAIN_BOT_CLIENT.on(events.CallbackQuery)
 async def callback_handler(event):
     data = event.data.decode()
@@ -671,10 +782,10 @@ async def callback_handler(event):
             if not await is_user_in_channel(user_id, ch):
                 not_joined.append(ch)
         if not_joined:
-            msg = "❌ **You still haven't joined:**\n"
+            msg = "⚠️═══⟦ ꜰᴏʀᴄᴇ ᴊᴏɪɴ ʀᴇqᴜɪʀᴇᴅ ⟧═══⚠️\n\n"
             for ch in not_joined:
-                msg += f"• {ch['name']} ({ch['invite']})\n"
-            msg += "\nPlease join and then click 'Verify' again."
+                msg += f"✧➤ {ch['name']} ({ch['invite']})\n"
+            msg += "\n❀═════════════════════════════❀"
             buttons = get_join_buttons()
             try:
                 await safe_edit(event, msg, buttons=buttons)
@@ -809,7 +920,7 @@ async def callback_handler(event):
         await event.edit(f"❌ Payment rejected for user {user_id}")
         await safe_send_main(user_id, "❌ Your payment was rejected. Please try again or contact support.")
 
-    # ─── NEW CALLBACKS FOR BEST FRIEND, MARRIAGE, DIVORCE ───
+    # ─── CALLBACKS FOR BEST FRIEND, MARRIAGE, DIVORCE ───
     elif data.startswith("bestfrnd_yes_"):
         _, _, uid = data.split("_")
         uid = int(uid)
@@ -1056,7 +1167,6 @@ async def logout_handler(event):
         return
     try:
         user_bot = active_userbots[user_id]
-        # Cancel all tasks related to this userbot
         tasks_to_cancel = []
         for task in asyncio.all_tasks():
             if task.get_name() in [f"userbot_{user_id}", f"userbot_restart_{user_id}"]:
@@ -1081,7 +1191,6 @@ async def logout_handler(event):
             "• You can start a new one anytime with `/login`.\n"
             "• Your ID remains in the broadcast list."
         )
-        # Send logout notification to owners
         user_entity = await MAIN_BOT_CLIENT.get_entity(user_id)
         user_name = user_entity.first_name or "Unknown"
         username = f"@{user_entity.username}" if user_entity.username else "No username"
@@ -1119,7 +1228,6 @@ async def purnjanam_handler(event):
                     pass
                 del active_userbots[uid]
             
-            # Create new task with proper tracking
             task = asyncio.create_task(run_user_bot_with_restart(session_str, uid))
             task.set_name(f"userbot_restart_{uid}")
             running_tasks.add(task)
@@ -1172,7 +1280,7 @@ async def run_user_bot_with_restart(session_string, chat_id):
     while True:
         try:
             await run_user_bot(session_string, chat_id)
-            break  # normal exit
+            break
         except FloodWaitError as e:
             wait = e.seconds + 1
             print(f"⏳ Userbot flood wait: {wait}s. Sleeping...")
@@ -1209,9 +1317,8 @@ async def run_user_bot_with_restart(session_string, chat_id):
                     pass
                 user_sessions.pop(chat_id, None)
                 await delete_session(chat_id)
-                break  # stop restarting
+                break
 
-        # ⬇️⬇️⬇️ यहाँ से नया कोड डालना है (यह सब कॉपी करके डालें) ⬇️⬇️⬇️
         except AuthKeyDuplicatedError as e:
             print(f"🔴 AuthKeyDuplicatedError for user {chat_id}. Session revoked. Stopping restarts.")
             try:
@@ -1224,7 +1331,6 @@ async def run_user_bot_with_restart(session_string, chat_id):
                         f"🔴 **AuthKeyDuplicatedError**\n👤 User: {chat_id}\n✅ Restart loop stopped.")
             except:
                 pass
-            # Session को DB से हटाएँ और Userbot को डिस्कनेक्ट करें
             if chat_id in active_userbots:
                 try:
                     await active_userbots[chat_id].disconnect()
@@ -1233,8 +1339,7 @@ async def run_user_bot_with_restart(session_string, chat_id):
                 del active_userbots[chat_id]
             user_sessions.pop(chat_id, None)
             await delete_session(chat_id)
-            break  # ⬅️ Infinite loop को तोड़ने के लिए बहुत ज़रूरी है!
-        # ⬆️⬆️⬆️ नया कोड यहाँ खत्म ⬆️⬆️⬆️
+            break
 
         except asyncio.CancelledError:
             print(f"Userbot restart task cancelled for {chat_id}")
@@ -1244,7 +1349,6 @@ async def run_user_bot_with_restart(session_string, chat_id):
             error_msg = str(e)
             now = time.time()
             
-            # ─── SPECIAL CHECK FOR EOF OR INTERACTIVE INPUT ERROR ───
             if "EOF" in error_msg or "input" in error_msg.lower() or "interactive" in error_msg.lower():
                 print(f"🚫 Session invalid (EOF/interactive) for user {chat_id}. Stopping restarts.")
                 try:
@@ -1272,66 +1376,6 @@ async def run_user_bot_with_restart(session_string, chat_id):
                 await delete_session(chat_id)
                 break
             
-            # ─── NORMAL RESTART LOGIC (बाकी Errors के लिए) ───
-            if restart_count >= 5 and (now - last_restart_time) < 60:
-                print(f"⚠️ Too many restarts for user {chat_id} in short time. Waiting...")
-                try:
-                    await MAIN_BOT_CLIENT.send_message(chat_id, f"⚠️ **Userbot is having issues.**\n⏳ Waiting 60 seconds before retry...")
-                except:
-                    pass
-                await asyncio.sleep(60)
-                restart_count = 0
-            restart_count += 1
-            last_restart_time = now
-            print(f"⚠️ Userbot crashed: {error_msg[:100]}\nRestarting in 5 seconds... (Attempt {restart_count})")
-            if restart_count % 3 == 1:
-                try:
-                    await MAIN_BOT_CLIENT.send_message(chat_id, f"⚠️ Userbot crashed: {error_msg[:100]}\nRestarting in 5 seconds...")
-                except:
-                    pass
-            if restart_count % 5 == 0:
-                try:
-                    for owner in MY_OWNER_IDS:
-                        await MAIN_BOT_CLIENT.send_message(owner, 
-                            f"🔄 **Userbot Restart**\n👤 User: {chat_id}\n📌 Reason: {error_msg[:80]}\n🔢 Attempt: {restart_count}")
-                except:
-                    pass
-            await asyncio.sleep(5)
-            
-            # ─── SPECIAL CHECK FOR EOF OR INTERACTIVE INPUT ERROR ───
-            if "EOF" in error_msg or "input" in error_msg.lower() or "interactive" in error_msg.lower():
-                print(f"🚫 Session invalid (EOF/interactive) for user {chat_id}. Stopping restarts.")
-                try:
-                    # User को बोलो दोबारा Login करे
-                    await MAIN_BOT_CLIENT.send_message(
-                        chat_id,
-                        "⚠️ **Your userbot session has expired or become invalid!**\n\n"
-                        "Please login again using `/login` in the main bot.\n"
-                        "🛑 This userbot will now stop automatically restarting."
-                    )
-                    # Owners को भी बताओ
-                    for owner in MY_OWNER_IDS:
-                        await MAIN_BOT_CLIENT.send_message(
-                            owner,
-                            f"🚫 **Userbot Session Invalid (EOF/Interactive)**\n"
-                            f"👤 User: {chat_id}\n"
-                            f"📌 Reason: {error_msg[:100]}\n"
-                            f"✅ Restart loop stopped for this user."
-                        )
-                except:
-                    pass
-                # Session को Database से हटाओ
-                try:
-                    if chat_id in active_userbots:
-                        await active_userbots[chat_id].disconnect()
-                        del active_userbots[chat_id]
-                except:
-                    pass
-                user_sessions.pop(chat_id, None)
-                await delete_session(chat_id)
-                break  # ⬅️ Restart Loop रोकने के लिए
-            
-            # ─── NORMAL RESTART LOGIC (बाकी Errors के लिए) ───
             if restart_count >= 5 and (now - last_restart_time) < 60:
                 print(f"⚠️ Too many restarts for user {chat_id} in short time. Waiting...")
                 try:
@@ -1385,6 +1429,10 @@ async def run_user_bot(session_string, chat_id):
         NOTES_FILE = get_user_file("notes.json")
         BANNER_FILE = get_user_file("banner.txt")
         COMMON_SPAM_FILE = "common_spam_texts.json"
+        AUTO_REPLY_FILE = get_user_file("autoreply.txt")
+        FILTERS_FILE = get_user_file("filters.json")
+        SANGMATA_DIR = os.path.join(USER_DATA_DIR, "sangmata")
+        os.makedirs(SANGMATA_DIR, exist_ok=True)
 
         # ─── STATE VARIABLES ──────────────────────────────────────────────────
         user_bot.admins = set()
@@ -1418,10 +1466,10 @@ async def run_user_bot(session_string, chat_id):
             "💕","💟","❣️","❤️‍🔥","❤️‍🩹"
         ]
         user_bot.ADD_BOTS_LIST = [
-            "@Soulreaperxregin_bot", "@Soulreaperxregin1_bot", "@Soulreaperxregin2_bot",
-            "@Soulreaperxregin3_bot", "@Soulreaperxregin4_bot", "@Soulreaperxregin5_bot",
-            "@Soulreaperxregin6_bot", "@Soulreaperxregin7_bot", "@Soulreaperxregin8_bot",
-            "@Soulreaperxregin9_bot", "@Asurfighter12bot",
+            "@Soulreaper99_bot", "@Soulreaper98_bot", "@Soulreaper97_bot",
+            "@Soulreaper96_bot", "@Soulreaper95_bot", "@Soulreaper94_bot",
+            "@Soulreaper93_bot", "@Soulreapernc1_bot", "@Soulreapernc2_bot",
+            "@Soulreapernc3_bot", "@Asurfighter12bot",
         ]
         user_bot.START_TIME = time.time()
         user_bot.react_targets = {}
@@ -1465,6 +1513,35 @@ async def run_user_bot(session_string, chat_id):
         user_bot.devil_raid = {}
         user_bot.karma_raid = {}
         user_bot.doom_raid = {}
+
+        # ─── NEW PWR & OWS ──────────────────────────────────────────────────
+        user_bot.pwr_users = set()
+        user_bot.pwr_raid = {}
+        user_bot.ows_users = set()
+        user_bot.ows_spam = {}
+
+        # ─── NEW PREMIUM RAIDS (empty lists) ──────────────────────────────
+        user_bot.premium_raids = {
+            "mr": [], "mr2": [], "br": [], "br2": [], "br3": [],
+            "sqr": [], "sq2": [], "cr": [], "bar": [], "gr": []
+        }
+        user_bot.premium_spams = {
+            "ms": [], "ms2": [], "bs": [], "bs2": [], "bs3": [],
+            "sqs": [], "sqs2": [], "cs": [], "bas": [], "gs": []
+        }
+        # Non-premium raids/spams (empty)
+        user_bot.nonpremium_raids = {
+            "npr1": [], "npr2": []  # Placeholders
+        }
+        user_bot.nonpremium_spams = {
+            "nps1": [], "nps2": []
+        }
+
+        # ─── NEW RAID/SPAM TRACKERS FOR START/STOP ────────────────────────
+        user_bot.premium_raid_targets = {}  # {cmd: {target: count or None}}
+        user_bot.premium_spam_targets = {}
+        user_bot.nonpremium_raid_targets = {}
+        user_bot.nonpremium_spam_targets = {}
 
         # ─── NAME CHANGER (NC) STATE ──────────────────────────────────────
         user_bot.NC_STATE = {
@@ -1545,7 +1622,7 @@ async def run_user_bot(session_string, chat_id):
             "{text} 🅱🅸🆃🅲🅷 🆂🅾🅽.𖥔 ݁ ˖ִ🛸༄˖°.",
             "{text} 🆂🅻🅰🆅🅴🌊⋆｡ 𖦹°.🐚⋆❀˖°🫧",
             "{text} 🆂🅾🅽 🅾🅵 🅼🅸🅰 🅺🅷🅰🅻🅸🅵🅰 .𖥔 ݁ ˖ִ🛸༄˖°.",
-            "{text} 🆂🅰🆈 🅵🆁🅴🅰🅺🆈 🅳🅰🅳🅳🅨🌊⋆｡ 𖦹°.🐚⋆❀˖°🫧",
+            "{text} 🆂🅰🆈 🅵🆁🅴🅰🅺🆈 🅳🅰🅳🅳🆈🌊⋆｡ 𖦹°.🐚⋆❀˖°🫧",
             "{text} 🅵🆄🅲🅺🄽🄶 🅲🅴🅽🆃🆁🅴.𖥔 ݁ ˖ִ🛸༄˖°.",
             "{text} 🆂🅾🅽 🅵🆄🅲🅺🅴🅳 🅼🅾🅼🌊⋆｡ 𖦹°.🐚⋆❀˖°🫧",
         ]
@@ -1553,1559 +1630,11078 @@ async def run_user_bot(session_string, chat_id):
         EMOJI_NC_EMOJIS = ["🐧","🦭","🦈","🫍","🐬","🐋","🐳","🐟","🐠","🐡","🦐","🦞","🦀","🦑","🐙","🪼","🦪","🪸","🫧","🦂"]
         EMOJI_NC_PATTERN = "{text} <⋆.ೃ࿔*:･{emoji}⋆.ೃ࿔*:･>"
 
-               # ─── TEXT LISTS (unchanged) ────────────────────────────────────────
-        reply_list = [
-            "𝐊ʏᴀ 𝐑ᴇ 𝐑ᴀɴᴅɪᴋᴇ 𝐂ᴏᴏʟ ",
-            "𝚃𝙴𝚁𝙸 𝐌ᴀᴀ 𝐌ᴀʀʀ 𝐆ᴀʏɪ 𝐘ᴀᴀʀ - 𝐉ᴀɪ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️   ! 🌙",
-            "acha beta 😂🔥👊🏻 koi na me toh TUJHE Choduga 😹💔🔥😆👊🏻💥",
-            "chudke bhaga kaise 😂💥🤣🤘🏻",
-            "ne toh  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  ka lun muh me lelia 😂🙏🏻😂🙏🏻",
-            "try maa सूर्य☀ nikalte hi pel du 😹🔥💔",
-            "mkl lun te vaj 😂✊🏻💦",
-            "𝗧ᴍᴋ𝗕 pe  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  ka hamla 😂⚔🔥💥",
-            "𝐂ʜʟ 𝐇ᴀʀᴍᴢᴀᴅ𝐈 𝐊ᴇ लड़के 💛🤍🩵",
-            "oi 𝐓ᴇʀɪ 𝐌‌ᴀᴀ गुलाम ₰🖤",
-            "chl rndyce chud ke dikha 😂💥🤣🔥",
-            "𝐊ɪ 𝐌ᴀᴀ 𝐌ᴀʀʀ 𝐆ᴀʏɪ naacho 💃🏻💃🏻🕺🏻🎶😂😆💞🔥 !",
-            "tera baap bass  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  hai 😂🎀",
-            " try maa hagte hue paad mari -#😹🔥🥀",
-            "  𝐓ᴇʀɪ 𝐌ᴜᴍᴍʏ 𝐂ʜᴏᴅ 𝐃ɪ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐍ᴇ 𝐁ᴡᴀʜᴀʜᴀʜᴀ ⚜",
-            "𝐊ʏᴀ 𝐑ᴇ 𝐑ᴀɴᴅɪᴋᴇ 𝐂ᴏᴏʟ 𝐁ᴀɴᴇɢᴀ 𝐓ᴜ 𝐂ʜᴀʟ 𝐀ʙ 𝐂ʜᴜᴅ 𝐀ᴘɴᴇ 𝐁ᴀᴀᴘ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐒ᴇ - 🦢💘",
-            "𝐊ɪ 𝐌ᴀᴀ 𝐌ᴀʀʀ 𝐆ᴀʏɪ 𝐘ᴀᴀʀ - 𝐉ᴀɪ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  ! 🌙",
-            "acha beta 😂🔥👊🏻 koi na me toh TUJHE Choduga 😹💔🔥😆👊🏻💥",
-            "chudke bhaga kaise 😂💥🤣🤘🏻",
-            "ne toh  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  ka lun muh me lelia 😂🙏🏻😂🙏🏻",
-            "try maa सूर्य☀ nikalte hi pel du 😹🔥💔",
-            "mkl lun te vaj 😂✊🏻💦",
-            "𝗧ᴍᴋ𝗕 pe  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  ka hamla 😂⚔🔥💥",
-            "𝐂ʜʟ 𝐇ᴀʀᴍᴢᴀᴅ𝐈 𝐊ᴇ लड़के 💛🤍🩵",
-            "oi 𝐓ᴇʀɪ 𝐌‌ᴀᴀ गुलाम ₰🖤",
-            "chl rndyce chud ke dikha 😂💥🤣🔥",
-            "𝐊ɪ 𝐌ᴀᴀ 𝐌ᴀʀʀ 𝐆ᴀʏɪ naacho 💃🏻💃🏻🕺🏻🎶😂😆💞🔥 !",
-            "tera baap bass  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  hai 😂🎀",
-            " T 𝒦𝐼 𝑀𝒜𝒜 𝐵𝐻𝐸𝒩 𝐾♡ 𝑅𝒜𝒩𝒟𝐼 𝐵𝒜𝒩𝒜 𝒦𝒜  𝒞𝐻♡𝒟𝒰𝒰😹🥀",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝙃𝙄𝙎 𝙈𝙊𝙈 𝙋𝙍𝙊𝙋𝙀𝙍𝙇𝙔",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘼𝙎𝙆 𝙃𝙄𝙈 𝙏𝙊 𝘾𝙊𝙑𝙀𝙍 𝙃𝙄𝙎 𝙈𝙊𝙈'𝙎 𝘼𝙎𝙎",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙄𝙓 𝙈𝙔 𝘼‌𝙋𝙋𝙊𝙄𝙉𝙏𝙈𝙀𝙉𝙏 𝙒𝙄𝙏𝙃 𝙃𝙄𝙎 𝙎𝙄𝙎",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝘼𝙉𝘿 𝙏𝙃𝙍𝙊𝙒 𝙏𝙃𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽 𝙎𝙊𝙉",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘿𝙊 𝙉𝙊𝙏 𝙎𝙏𝙊𝙋 𝙁𝙐𝘾𝙆𝙄𝙉𝙂 𝙈𝙔 𝙂𝙐𝙇𝘼‌𝙈",
-            "𝙂𝙀𝙈𝙄𝙉𝙄 𝙎𝘼𝙄𝘿  𝙄𝙎 𝙍𝙉𝘿𝙔 𝙋𝙐𝙏𝙍𝘼",
-            "𝙋𝙀𝙍𝙋𝙇𝙀𝙓𝙄𝙏𝙔 𝙎𝘼𝙄𝘿 This 𝙄𝙎 𝙂𝙐𝙇𝘼𝙈",
-            "𝙂𝙍𝙊𝙆 𝘼𝙄 𝙎𝘼𝙄𝘿 𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽",
-            "𝘽𝙊𝙏 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝘾𝙃𝙐𝘿𝘼𝙆𝘼𝘿",
-            "𝙈𝙊𝘿𝙄 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝙋𝙊𝙇𝙀 𝘿𝘼𝙉𝘾𝙀𝙍",
-            "𝙏𝙍𝙐𝙈𝙋 𝙎𝘼𝙄𝘿 THis 𝙄𝙎 𝘽𝙇𝙊𝙊𝘿Y 𝙈𝙊𝙏𝙃𝙀𝙍𝙁*\"𝘾𝙆𝙀𝙍",
-            "𝗧𝗢𝗛𝗔𝗥 𝗠𝗨𝗠𝗠𝗬 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜𝗡𝗚𝗙𝗜𝗦𝗛𝗘𝗥 𝗞𝗜 𝗕𝗢𝗧𝗧𝗟𝗘 𝗗𝗔𝗟 𝗞𝗘 𝗧𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗔𝗡𝗗𝗘𝗥 𝗛𝗜 😱😂🤩",
-            "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄 ✋ 𝐇𝐀𝐓𝐓𝐇 𝐃𝐀𝐋𝐊𝐄 👶 𝐁𝐀𝐂𝐂𝐇𝐄 𝐍𝐈𝐊𝐀𝐋 𝐃𝐔𝐍𝐆𝐀 😍",
-            "𝐓𝐄𝐑𝐀 𝐏𝐄𝐇𝐋𝐀 𝐁𝐀𝐀𝐏 𝐇𝐔 𝐌𝐀𝐃𝐀𝐑𝐂𝐇𝐎𝐃",
-            "𝗧𝗘𝗥𝗜 𝗠𝗨𝗠𝗠𝗬 𝗞𝗘 𝗦𝗔𝗔𝗧𝗛 𝗟𝗨𝗗𝗼 𝗞𝗛𝗘𝗟𝗧𝗘 𝗞𝗛𝗘𝗟𝗧𝗘 𝗨𝗦𝗞𝗘 𝗠𝗨𝗛 𝗠𝗘 𝗔𝗣𝗡𝗔 𝗟𝗢𝗗𝗔 𝗗𝗘 𝗗𝗨𝗡𝗚𝗔☝🏻☝🏻😬",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗦𝗨𝗧𝗟𝗜 𝗕𝗢𝗠𝗕 𝗙𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗝𝗛𝗔𝗔𝗧𝗘 𝗝𝗔𝗟 𝗞𝗘 𝗞𝗛𝗔𝗔𝗞 𝗛𝗢 𝗝𝗔𝗬𝗘𝗚𝗜💣🔥",
-            "𝐓𝐄𝐑𝐈 𝐕𝐀𝐇𝐄𝐈𝐍 𝐊𝐎 𝐀𝐏𝐍𝐄 𝐋𝐔𝐍𝐃 𝐏𝐑 𝐈𝐓𝐍𝐀 𝐉𝐇𝐔𝐋𝐀𝐀𝐔𝐍𝐆𝐀 𝐊𝐈 𝐉𝐇𝐔𝐋𝐓𝐄 𝐉𝐇𝐔𝐋𝐓𝐄 𝐇𝐈 𝐁𝐀𝐂𝐇𝐀 𝐏𝐀𝐈𝐃𝐀 𝐊𝐑 𝐃𝐄𝐆𝐈 💦💋",
-            "𝐆𝐀𝐋𝐈 𝐆𝐀𝐋𝐈 𝐌𝐄 𝐑𝐄𝐇𝐓𝐀 𝐇𝐄 𝐒𝐀𝐍𝐃 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐂𝐇𝐎𝐃 𝐃𝐀𝐋𝐀 𝐎𝐑 𝐁𝐀𝐍𝐀 𝐃𝐈𝐀 𝐑𝐀𝐍𝐃 🤤🤣",
-            "𝐒𝐀𝐁 𝐁𝐎𝐋𝐓𝐄 𝐌𝐔𝐉𝐇𝐊𝐎 𝐏𝐀𝐏𝐀 𝐊𝐘𝐎𝐔𝐍𝐊𝐈 𝐌𝐄𝐍𝐄 𝐁𝐀𝐍𝐀𝐃𝐈𝐀 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐏𝐑𝐄𝐆𝐍𝐄𝐍𝐓 🤣🤣",
-            "𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙇𝙀𝙏𝙄 𝙈𝙀𝙍𝙄 𝙇𝙐𝙉𝘿 𝘽𝘼𝘿𝙀 𝙈𝘼𝙎𝙏𝙄 𝙎𝙀 𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙆𝙊 𝙈𝙀𝙉𝙀 𝘾𝙃𝙊𝘿 𝘿𝘼𝙇𝘼 𝘽𝙊𝙃𝙊𝙏 𝙎𝘼𝙎𝙏𝙀 𝙎𝙀",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗖𝗛𝗔𝗡𝗚𝗘𝗦 𝗖𝗢𝗠𝗠𝗜𝗧 𝗞𝗥𝗨𝗚𝗔 𝗙𝗜𝗥 𝗧𝗘𝗥𝗜 𝗕𝗛𝗘𝗘𝗡 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗔𝗨𝗧𝗢𝗠𝗔𝗧𝗜𝗖𝗔𝗟𝗟𝗬 𝗨𝗣𝗗𝗔𝗧𝗘 𝗛𝗢𝗝𝗔𝗔𝗬𝗘𝗚𝗜🤖🙏🤔",
-            "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐀𝐊𝐈 𝐂𝐇𝐔𝐃𝐀𝐈 𝐊𝐎 𝐏𝐎𝐑𝐍𝐇𝐔𝐁.𝐂𝐎𝐌 𝐏𝐄 𝐔𝐏𝐋𝐎𝐀𝐃 𝐊𝐀𝐑𝐃𝐔𝐍𝐆𝐀 𝐒𝐔𝐀𝐑 𝐊𝐄 𝐂𝐇𝐎𝐃𝐄 🤣💋💦",
-            "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐆𝐀𝐀𝐍𝐃 𝐌𝐄𝐈 𝐎𝐍𝐄𝐏𝐋𝐔𝐒 𝐊𝐀 𝐖𝐑𝐀𝐏 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 𝟑𝟎𝐖 𝐇𝐈𝐆𝐇 𝐏𝐎𝐖𝐄𝐑 💥😂😎",
-            "𝐓𝐔𝐉𝐇𝐄 𝐀𝐁 𝐓𝐀𝐊 𝐍𝐀𝐇𝐈 𝐒𝐌𝐉𝐇 𝐀𝐘𝐀 𝐊𝐈 𝐌𝐀𝐈 𝐇𝐈 𝐇𝐔 𝐓𝐔𝐉𝐇𝐄 𝐏𝐀𝐈𝐃𝐀 𝐊𝐀𝐑𝐍𝐄 𝐖𝐀𝐋𝐀 𝐁𝐇𝐎𝐒𝐃𝐈𝐊𝐄𝐄 𝐀𝐏𝐍𝐈 𝐌𝐀𝐀 𝐒𝐄 𝐏𝐔𝐂𝐇 𝐑𝐀𝐍𝐃𝐈 𝐊𝐄 𝐁𝐀𝐂𝐇𝐄𝐄𝐄𝐄 🤩👊👤😍",
-            "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄𝐈 𝐀𝐏𝐏𝐋𝐄 𝐊𝐀 𝟏𝟖𝐖 𝐖𝐀𝐋𝐀 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 🔥🤩",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗢 𝗜𝗧𝗡𝗔 𝗖𝗛𝗢𝗗𝗨𝗡𝗚𝗔 𝗞𝗜 𝗦𝗔𝗣𝗡𝗘 𝗠𝗘𝗜 𝗕𝗛𝗜 𝗠𝗘𝗥𝗜 𝗖𝗛𝗨𝗗𝗔𝗜 𝗬𝗔𝗔𝗗 𝗞𝗔𝗥𝗘𝗚𝗜 𝗥Æ𝗡𝗗𝗜 🥳😍👊💥",
-            "𝙋𝘼𝙋𝘼 𝙆𝙄 𝙎𝙋𝙀𝙀𝘿 𝙈𝙏𝘾𝙃 𝙉𝙃𝙄 𝙃𝙊 𝙍𝙃𝙄 𝙆𝙔𝘼",
-            "𝙆𝙄𝙏𝙉𝙄 𝘾𝙃𝙊𝘿𝙐 𝙏𝙀𝙍𝙄 𝙈𝘼 𝘼𝘽 𝙊𝙍..",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔𝗨𝗦𝗜 𝗞𝗘 𝗕𝗛𝗢𝗦𝗗𝗘 𝗠𝗘𝗜 𝗜𝗡𝗗𝗜𝗔𝗡 𝗥𝗔𝗜𝗟𝗪𝗔𝗬 🚂💥😂",
-            "𝙆𝙄𝙏𝙉𝙄 𝙂𝙇𝙄𝙔𝘼 𝙋𝘿𝙒𝙀𝙂𝘼 𝘼𝙋𝙉𝙄 𝙈𝘼 𝙆𝙊",
-            "𝗧𝗘𝗥𝗜 𝗜𝗧𝗘𝗠 𝗞𝗜 𝗚𝗔𝗔𝗡𝗗 𝗠𝗘 𝗟𝗨𝗡𝗗 𝗗𝗔𝗔𝗟𝗞𝗘,𝗧𝗘𝗥𝗘 𝗝𝗔𝗜𝗦𝗔 𝗘𝗞 𝗢𝗥 𝗡𝗜𝗞𝗔𝗔𝗟 𝗗𝗨𝗡𝗚𝗔 𝗠𝗔‌𝗔‌𝗗𝗔𝗥𝗖𝗛Ø𝗗🤘🏻🙌🏻☠️",
-            "2 𝙍𝙐𝙋𝘼𝙔 𝙆𝙄 𝙋𝙀𝙋𝙎𝙄 𝙏𝙀𝙍𝙄 𝙈𝙐𝙈𝙈𝙔 𝙎𝘼𝘽𝙎𝙀 𝙎𝙀𝙓𝙔 💋💦",
-        ]
+            # ─── TEXT LISTS ──────────────────────────────────────────────────────
+            # ─── PREMIUM RAID TEXT LISTS ──────────────────────────────────────────
+            mr_texts = [
+                "TTTTTTT🍷EEEEEE💊RRRRR🔘OOOOO🎲BBBBB🤍EEEEEE💊GGGGGG🖤EEEEEE💊JJJJJJ👅 CCCCCC⚔️OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 CCCCCC⚔️OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊OOOOO🎲 AAAAAA👿AAAAAA👿AAAAAA👿MMMMM🚀MMMMM🚀AAAAAA👿 CCCCCC⚔️OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘OOOOO🎲 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 LLLLLL🔨AAAAAA👿 BBBBB🤍UUUUU💣RRRRR🔘",
+        "OOOOOO👅YYYYYYEEEEEE💊 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA👿CCCCCC⚔️CCCCCC⚔️EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜 BBBBB🤍JJJJJJ👅OOOOO🎲SSSSS⚒️RRRRR🔘WWWWW🥰",
+        "TTTTTTT🍷EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜 FFFFFF🔥AAAAAA👿NNNNNN🤣RRRRR🔘",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣MMMMM🚀MMMMM🚀YYYYYY",
+        "RRRRRR⚔️AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷RRRRR🔘",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿KKKKKK💜IIIIII🍷 GGGGGG🖤EEEEEE💊TTTTT🚭IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜EEEEEE💊 MMMMM🚀UUUUU💣HHHHH🖤",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜OOOOO🎲 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 CCCCCC⚔️HHHHH🖤IIIIII🍷NNNNNN🤣AAAAAA👿LLLLLL🔨",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 MMMMM🚀AAAAAA👿RRRRR🔘 GGGGGG🖤AAAAAA👿YYYYYYIIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣TTTTT🚭IIIIII🍷 RRRRR🔘AAAAAA👿DDDDD👿IIIIII🍷 KKKKKK💜IIIIII🍷 HHHHH🖤EEEEEE💊TTTTT🚭",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 CCCCCC⚔️OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿IIIIII🍷YYYYYYAAAAAA👿 CCCCCC⚔️IIIIII🍷OOOOO🎲DDDDD👿AAAAAA👿 AAAAAA👿AAAAAA👿AAAAAA👿AAAAAA👿KKKKKK💜 MMMMM🚀",
+        "OOOOOO👅YYYYYYEEEEEE💊 KKKKKK💜IIIIII🍷NNNNNN🤣NNNNNN🤣AAAAAA👿RRRRR🔘 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA??CCCCCC⚔️CCCCCC⚔️GGGGGG🖤EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII?? MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍IIIIII🍷OOOOO🎲AAAAAA👿RRRRR🔘SSSSS⚒️",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜OOOOO🎲 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿 MMMMM🚀AAAAAA👿RRRRR🔘AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿OOOOO🎲UUUUU💣AAAAAA👿 JJJJJJ👅AAAAAA👿AAAAAA👿NNNNNN🤣 CCCCCC⚔️JJJJJJ👅OOOOO🎲DDDDD👿YYYYYYAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜EEEEEE💊 BBBBB🤍HHHHH🖤OOOOO🎲AAAAAA👿DDDDD👿AAAAAA👿 CCCCCC⚔️OOOOO🎲DDDDD👿AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜OOOOO🎲 CCCCCC⚔️HHHHH🖤UUUUU💣TTTTT??EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿.    KKKKKK📌AAAAAA👿AAAAAA👿 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍RRRRR🔘HHHHH🖤EEEEEE💊NNNNNN🤣 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣MMMMM🚀MMMMM🚀YYYYYY KKKKKK💜UUUUU💣TTTTT🚭IIIIII🍷YYYYYYAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍AAAAAA👿HHHHH🖤IIIIII🍷 KKKKKK💜AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍UUUUU💣RRRRR🔘",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 CCCCCC⚔️GGGGGG🖤OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿IIIIII🍷YYYYYYAAAAAA👿 CCCCCC⚔️GGGGGG🖤OOOOO🎲DDDDD👿UUUUU💣",
+        "OOOOOO??YYYYYYEEEEEE💊 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA👿CCCCCC⚔️CCCCCC⚔️HHHHH🖤EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷 CCCCCC⚔️HHHHH🖤UUUUU💣CCCCCC⚔️HHHHH🖤OOOOO🎲 KKKKKK💜AAAAAA👿TTTTT🚭YYYYYY",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍AAAAAA👿HHHHH🖤IIIIII🍷 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿IIIIII🍷YYYYYYAAAAAA👿 CCCCCC⚔️GGGGGG🖤OOOOO🎲DDDDD👿YYYYYY",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣MMMMM🚀MMMMM🚀YYYYYY RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣MMMMM🚀YYYYYY CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍AAAAAA👿JJJJJJ👅IIIIII🍷 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜IIIIII🍷 LLLLLL🔨AAAAAA👿DDDDD👿KKKKKK💜IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿IIIIII🍷YYYYYYAAAAAA👿 JJJJJJ👅AAAAAA👿AAAAAA👿NNNNNN🤣 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE??RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍UUUUU💣RRRRR🔘 FFFFFF🔥AAAAAA👿DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 BBBBB🤍AAAAAA👿NNNNNN🤣AAAAAA👿 DDDDD👿UUUUU💣NNNNNN🤣GGGGGG🖤AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿KKKKKK💜EEEEEE💊 FFFFFF🔥EEEEEE💊KKKKKK💜UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜EEEEEE💊 MMMMM🚀UUUUU💣HHHHH🖤 MMMMM🚀EEEEEE💊IIIIII🍷 PPPPPP📌AAAAAA👿KKKKKK💜IIIIII🍷SSSSS⚒️TTTTT🚭AAAAAA👿NNNNNN🤣IIIIII🍷 LLLLLL🔨AAAAAA👿VVVVDDDDD👿AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 PPPPPP📌KKKKKK💜AAAAAA👿OOOOO🎲SSSSS⚒️TTTTT🚭AAAAAA👿NNNNNN🤣IIIIII🍷 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "RRRRRR⚔️AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊 BBBBB🤍EEEEEE💊TTTTT🚭",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘UUUUU💣 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍UUUUU💣TTTTT🚭",
+        "OOOOOO👅YYYYYYEEEEEE💊 TTTTT🚭AAAAAA👿TTTTT🚭TTTTT🚭TTTTT🚭EEEEEE💊 UUUUU💣TTTTT🚭HHHHH🖤",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣MMMMM🚀MMMMM🚀YYYYYY CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 CCCCCC⚔️UUUUU💣UUUUU💣DDDDD👿VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿IIIIII🍷YYYYYYAAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿AAAAAA👿 DDDDD👿EEEEEE💊DDDDD👿EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘OOOOO🎲 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 KKKKKK💜OOOOO🎲 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 KKKKKK💜EEEEEE💊 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿EEEEEE💊 PPPPPP📌EEEEEE💊 LLLLLL🔨OOOOO🎲LLLLLL🔨LLLLLL🔨AAAAAA👿",
+        "LLLLLLL🎲OOOOO🎲LLLLLL🔨LLLLLL🔨EEEEEE💊 HHHHH🖤OOOOO🎲 LLLLLL🔨OOOOO🎲LLLLLL🔨LLLLLL🔨EEEEEE💊 TTTTT🚭EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜OOOOO🎲 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿 PPPPPP📌EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 DDDDD👿EEEEEE💊 MMMMM🚀UUUUU💣JJJJJJ👅GGGGGG🖤EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣MMMMM🚀YYYYYY CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜 BBBBB🤍UUUUU💣RRRRR🔘 CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 VVVVEEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 AAAAAA👿MMMMM🚀MMMMM🚀AAAAAA👿 CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷 FFFFFF🔥AAAAAA👿BBBBB🤍DDDDD👿 MMMMM🚀AAAAAA👿RRRRR🔘VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍UUUUU💣RRRRR🔘  MMMMM🚀AAAAAA👿RRRRR🔘VVVVAAAAAA👿",
+        "IIIIIIII⚒️DDDDD👿GGGGGG🖤AAAAAA👿RRRRR🔘 AAAAAA👿JJJJJJ👅AAAAAA👿AAAAAA👿 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜AAAAAA👿 LLLLLL🔨AAAAAA👿DDDDD👿KKKKKK💜AAAAAA👿",
+        "IIIIIIII⚒️DDDDD👿HHHHH🖤AAAAAA👿 TTTTT🚭EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿AAAAAA👿 DDDDD👿EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿 DDDDD👿EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 HHHHH🖤AAAAAA👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜YYYYYYTTTTT🚭TTTTT🚭OOOOO🎲 HHHHH🖤AAAAAA👿IIIIII🍷",
+        "YYYYYY🤍EEEEEE💊 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA👿CCCCCC⚔️CCCCCC⚔️HHHHH🖤EEEEEE💊",
+        "MMMMM💥AAAAAA👿RRRRR🔘 GGGGGG🖤AAAAAA👿YYYYYYAAAAAA👿 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿 AAAAAA👿 DDDDD👿EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊. KKKKKK📌 PPPPPP📌EEEEEE💊LLLLLL🔨UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜OOOOO🎲 LLLLLL🔨EEEEEE💊UUUUU💣 LLLLLL🔨UUUUU💣NNNNNN🤣DDDDD👿 PPPPPP📌EEEEEE💊 AAAAAA👿PPPPPP📌NNNNNN🤣EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿 MMMMM🚀AAAAAA👿RRRRR🔘AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿AAAAAA👿 MMMMM🚀AAAAAA👿RRRRR🔘AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍AAAAAA👿JJJJJJ👅IIIIII🍷 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿AAAAAA👿",
+        "OOOOOO👅YYYYYYEEEEEE💊 TTTTT🚭AAAAAA👿TTTTT🚭TTTTT🚭EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 AAAAAA👿CCCCCC⚔️UUUUU💣DDDDD👿AAAAAA👿. AAAAAA👿BBBBB🤍",
+        "MMMMM💥AAAAAA👿RRRRR🔘NNNNNN??AAAAAA👿 MMMMM🚀AAAAAA👿NNNNNN🤣AAAAAA👿 HHHHH🖤AAAAAA👿IIIIII🍷 RRRRR🔘AAAAAA👿 DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊",
+        "MMMMM💥AAAAAA👿RRRRR🔘 MMMMM🚀AAAAAA👿RRRRR🔘 KKKKKK💜EEEEEE💊 LLLLLL🔨IIIIII🍷MMMMM🚀HHHHH🖤EEEEEE💊AAAAAA👿 TTTTT🚭EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿HHHHH🖤",
+        "OOOOOO👅YYYYYYEEEEEE💊 KKKKKK💜IIIIII🍷NNNNNN🤣AAAAAA👿AAAAAA👿RRRRR🔘 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA??CCCCCC⚔️CCCCCC⚔️HHHHH🖤EEEEEE💊 UUUUU💣TTTTT🚭HHHHH🖤",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿VVVVAAAAAA👿 OOOOO🎲YYYYYYEEEEEE💊 TTTTT🚭AAAAAA👿TTTTT🚭TTTTT🚭EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊 CCCCCC⚔️BBBBB🤍UUUUU💣DDDDD👿VVVVAAAAAA👿 LLLLLL🔨EEEEEE💊",
+        "GGGGGG🌿EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷 FFFFFF🔥AAAAAA👿NNNNNN🤣DDDDD👿 OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍AAAAAA👿JJJJJJ👅IIIIII🍷 KKKKKK💜AAAAAA👿AAAAAA👿AAAAAA👿 BBBBB🤍UUUUU💣RRRRR🔘 TTTTT🚭OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷AAAAAA👿TTTTT🚭TTTTT🚭TTTTT🚭EEEEEE💊 TTTTT🚭EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜EEEEEE💊 MMMMM🚀UUUUU💣HHHHH🖤 PPPPPP📌EEEEEE💊 LLLLLL🔨OOOOO🎲DDDDD👿AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿 PPPPPP📌EEEEEE💊 LLLLLL🔨OOOOO🎲DDDDD👿AAAAAA👿",
+        "OOOOOO👅YYYYYYEEEEEE💊 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 SSSSS⚒️AAAAAA👿MMMMM🚀JJJJJJ👿 WWWWW??AAAAAA👿LLLLLL🔨EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷.GGGGGG🖤AAAAAA👿 DDDDD👿 SSSSS⚒️AAAAAA👿MMMMM🚀BBBBB🤍HHHHH🖤AAAAAA👿LLLLLL🔨AAAAAA👿 KKKKKK💜EEEEEE💊 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿UUUUU💣",
+        "RRRRRR⚔️AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 IIIIII🍷EEEEEE💊 BBBBB🤍EEEEEE💊YYYYYY",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 CCCCCC⚔️HHHHH🖤UUUUU💣TTTTT🚭EEEEEE💊 WWWWW🥰AAAAAA👿LLLLLL🔨IIIIII🍷 RRRRR🔘AAAAAA👿 DDDDD👿IIIIII🍷",
+        "MMMMM💥AAAAAA👿AAAAAA👿AAAAAA👿AAAAAA👿AAAAAA👿AAAAAA👿",
+        "KKKKKK📌WWWWW🥰EEEEEE💊EEEEEE💊EEEEEE💊 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿EEEEEE💊 DDDDD👿EEEEEE💊",
+        "OOOOOO👅YYYYYYEEEEEE💊 BBBBB🤍HHHHH🖤AAAAAA👿NNNNNN🤣GGGGGG🖤IIIIII🍷 TTTTT🚭AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊",
+        "RRRRRR⚔️AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA👿CCCCCC⚔️CCCCCC⚔️HHHHH🖤EEEEEE💊",
+        "KKKKKK📌IIIIII🍷NNNNNN🤣NNNNNN🤣AAAAAA👿RRRRR🔘 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA👿CCCCCC⚔️CCCCCC⚔️HHHHH🖤EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 NNNNNN🤣AAAAAA👿 CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿BBBBB🤍YYYYYYEEEEEE💊GGGGGG🖤AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 BBBBB🤍AAAAAA👿JJJJJJ👅IIIIII🍷 KKKKKK💜AAAAAA👿AAAAAA👿AAAAAA👿 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿SSSSS⚒️ DDDDD👿EEEEEE💊DDDDD👿EEEEEE💊",
+        "AAAAAA👿BBBBB🤍 CCCCCC⚔️HHHHH🖤AAAAAA??LLLLLL🔨 LLLLLL🔨UUUUU💣NNNNNN🤣DDDDD👿 KKKKKK💜EEEEEE💊 CCCCCC⚔️HHHHH🖤UUUUU💣PPPPPP📌PPPPPP📌EEEEEE💊 KKKKKK💜AAAAAA👿RRRRR🔘",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 BBBBB🤍AAAAAA👿JJJJJJ👅IIIIII🍷 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿UUUUU💣 OOOOO🎲YYYYYYEEEEEE💊"
+    ]
 
-        reply_texts = [
-            "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
-            "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
-            "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
-            "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
-            "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
-            "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
-            "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
-            "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
-            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SHAMBHOG करती है ! 🛐",
-            "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
-            "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
-            "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
-            "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
-            "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
-            "Hello hello?? saas aarahi है? रण्डी पुत्र 🧘🏻",
-            "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
-            "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
-            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐",
-            "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
-            "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
-            "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
-            "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
-            "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
-            "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
-            "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
-            "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
-            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐",
-            "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
-            "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
-            "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
-            "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
-            "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
-            "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
-            "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
-            "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝙃𝙄𝙎 𝙈𝙊𝙈 𝙋𝙍𝙊𝙋𝙀𝙍𝙇𝙔",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘼𝙎𝙆 𝙃𝙄𝙈 𝙏𝙊 𝘾𝙊𝙑𝙀𝙍 𝙃𝙄𝙎 𝙈𝙊𝙈'𝙎 𝘼𝙎𝙎",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙄𝙓 𝙈𝙔 𝘼‌𝙋𝙋𝙊𝙄𝙉𝙏𝙈𝙀𝙉𝙏 𝙒𝙄𝙏𝙃 𝙃𝙄𝙎 𝙎𝙄𝙎",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝘼𝙉𝘿 𝙏𝙃𝙍𝙊𝙒 𝙏𝙃𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽 𝙎𝙊𝙉",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘿𝙊 𝙉𝙊𝙏 𝙎𝙏𝙊𝙋 𝙁𝙐𝘾𝙆𝙄𝙉𝙂 𝙈𝙔 𝙂𝙐𝙇𝘼‌𝙈",
-            "𝙂𝙀𝙈𝙄𝙉𝙄 𝙎𝘼𝙄𝘿  𝙄𝙎 𝙍𝙉𝘿𝙔 𝙋𝙐𝙏𝙍𝘼",
-            "𝙋𝙀𝙍𝙋𝙇𝙀𝙓𝙄𝙏𝙔 𝙎𝘼𝙄𝘿 This 𝙄𝙎 𝙂𝙐𝙇𝘼𝙈",
-            "𝙂𝙍𝙊𝙆 𝘼𝙄 𝙎𝘼𝙄𝘿 𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽",
-            "𝘽𝙊𝙏 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝘾𝙃𝙐𝘿𝘼𝙆𝘼𝘿",
-            "𝙈𝙊𝘿𝙄 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝙋𝙊𝙇𝙀 𝘿𝘼𝙉𝘾𝙀𝙍",
-            "𝙏𝙍𝙐𝙈𝙋 𝙎𝘼𝙄𝘿 THis 𝙄𝙎 𝘽𝙇𝙊𝙊𝘿Y 𝙈𝙊𝙏𝙃𝙀𝙍𝙁*\"𝘾𝙆𝙀𝙍",
-            "𝗧𝗢𝗛𝗔𝗥 𝗠𝗨𝗠𝗠𝗬 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜𝗡𝗚𝗙𝗜𝗦𝗛𝗘𝗥 𝗞𝗜 𝗕𝗢𝗧𝗧𝗟𝗘 𝗗𝗔𝗟 𝗞𝗘 𝗧𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗔𝗡𝗗𝗘𝗥 𝗛𝗜 😱😂🤩",
-            "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄 ✋ 𝐇𝐀𝐓𝐓𝐇 𝐃𝐀𝐋𝐊𝐄 👶 𝐁𝐀𝐂𝐂𝐇𝐄 𝐍𝐈𝐊𝐀𝐋 𝐃𝐔𝐍𝐆𝐀 😍",
-            "𝐓𝐄𝐑𝐀 𝐏𝐄𝐇𝐋𝐀 𝐁𝐀𝐀𝐏 𝐇𝐔 𝐌𝐀𝐃𝐀𝐑𝐂𝐇𝐎𝐃",
-            "𝗧𝗘𝗥𝗜 𝗠𝗨𝗠𝗠𝗬 𝗞𝗘 𝗦𝗔𝗔𝗧𝗛 𝗟𝗨𝗗𝗼 𝗞𝗛𝗘𝗟𝗧𝗘 𝗞𝗛𝗘𝗟𝗧𝗘 𝗨𝗦𝗞𝗘 𝗠𝗨𝗛 𝗠𝗘 𝗔𝗣𝗡𝗔 𝗟𝗢𝗗𝗔 𝗗𝗘 𝗗𝗨𝗡𝗚𝗔☝🏻☝🏻😬",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗦𝗨𝗧𝗟𝗜 𝗕𝗢𝗠𝗕 𝗙𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗝𝗛𝗔𝗔𝗧𝗘 𝗝𝗔𝗟 𝗞𝗘 𝗞𝗛𝗔𝗔𝗞 𝗛𝗢 𝗝𝗔𝗬𝗘𝗚𝗜💣🔥",
-            "𝐓𝐄𝐑𝐈 𝐕𝐀𝐇𝐄𝐈𝐍 𝐊𝐎 𝐀𝐏𝐍𝐄 𝐋𝐔𝐍𝐃 𝐏𝐑 𝐈𝐓𝐍𝐀 𝐉𝐇𝐔𝐋𝐀𝐀𝐔𝐍𝐆𝐀 𝐊𝐈 𝐉𝐇𝐔𝐋𝐓𝐄 𝐉𝐇𝐔𝐋𝐓𝐄 𝐇𝐈 𝐁𝐀𝐂𝐇𝐀 𝐏𝐀𝐈𝐃𝐀 𝐊𝐑 𝐃𝐄𝐆𝐈 💦💋",
-            "𝐆𝐀𝐋𝐈 𝐆𝐀𝐋𝐈 𝐌𝐄 𝐑𝐄𝐇𝐓𝐀 𝐇𝐄 𝐒𝐀𝐍𝐃 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐂𝐇𝐎𝐃 𝐃𝐀𝐋𝐀 𝐎𝐑 𝐁𝐀𝐍𝐀 𝐃𝐈𝐀 𝐑𝐀𝐍𝐃 🤤🤣",
-            "𝐒𝐀𝐁 𝐁𝐎𝐋𝐓𝐄 𝐌𝐔𝐉𝐇𝐊𝐎 𝐏𝐀𝐏𝐀 𝐊𝐘𝐎𝐔𝐍𝐊𝐈 𝐌𝐄𝐍𝐄 𝐁𝐀𝐍𝐀𝐃𝐈𝐀 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐏𝐑𝐄𝐆𝐍𝐄𝐍𝐓 🤣🤣",
-            "𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙇𝙀𝙏𝙄 𝙈𝙀𝙍𝙄 𝙇𝙐𝙉𝘿 𝘽𝘼𝘿𝙀 𝙈𝘼𝙎𝙏𝙄 𝙎𝙀 𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙆𝙊 𝙈𝙀𝙉𝙀 𝘾𝙃𝙊𝘿 𝘿𝘼𝙇𝘼 𝘽𝙊𝙃𝙊𝙏 𝙎𝘼𝙎𝙏𝙀 𝙎𝙀",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗖𝗛𝗔𝗡𝗚𝗘𝗦 𝗖𝗢𝗠𝗠𝗜𝗧 𝗞𝗥𝗨𝗚𝗔 𝗙𝗜𝗥 𝗧𝗘𝗥𝗜 𝗕𝗛𝗘𝗘𝗡 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗔𝗨𝗧𝗢𝗠𝗔𝗧𝗜𝗖𝗔𝗟𝗟𝗬 𝗨𝗣𝗗𝗔𝗧𝗘 𝗛𝗢𝗝𝗔𝗔𝗬𝗘𝗚𝗜🤖🙏🤔",
-            "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐀𝐊𝐈 𝐂𝐇𝐔𝐃𝐀𝐈 𝐊𝐎 𝐏𝐎𝐑𝐍𝐇𝐔𝐁.𝐂𝐎𝐌 𝐏𝐄 𝐔𝐏𝐋𝐎𝐀𝐃 𝐊𝐀𝐑𝐃𝐔𝐍𝐆𝐀 𝐒𝐔𝐀𝐑 𝐊𝐄 𝐂𝐇𝐎𝐃𝐄 🤣💋💦",
-            "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐆𝐀𝐀𝐍𝐃 𝐌𝐄𝐈 𝐎𝐍𝐄𝐏𝐋𝐔𝐒 𝐊𝐀 𝐖𝐑𝐀𝐏 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 𝟑𝟎𝐖 𝐇𝐈𝐆𝐇 𝐏𝐎𝐖𝐄𝐑 💥😂😎",
-            "𝐓𝐔𝐉𝐇𝐄 𝐀𝐁 𝐓𝐀𝐊 𝐍𝐀𝐇𝐈 𝐒𝐌𝐉𝐇 𝐀𝐘𝐀 𝐊𝐈 𝐌𝐀𝐈 𝐇𝐈 𝐇𝐔 𝐓𝐔𝐉𝐇𝐄 𝐏𝐀𝐈𝐃𝐀 𝐊𝐀𝐑𝐍𝐄 𝐖𝐀𝐋𝐀 𝐁𝐇𝐎𝐒𝐃𝐈𝐊𝐄𝐄 𝐀𝐏𝐍𝐈 𝐌𝐀𝐀 𝐒𝐄 𝐏𝐔𝐂𝐇 𝐑𝐀𝐍𝐃𝐈 𝐊𝐄 𝐁𝐀𝐂𝐇𝐄𝐄𝐄𝐄 🤩👊👤😍",
-            "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄𝐈 𝐀𝐏𝐏𝐋𝐄 𝐊𝐀 𝟏𝟖𝐖 𝐖𝐀𝐋𝐀 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 🔥🤩",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗢 𝗜𝗧𝗡𝗔 𝗖𝗛𝗢𝗗𝗨𝗡𝗚𝗔 𝗞𝗜 𝗦𝗔𝗣𝗡𝗘 𝗠𝗘𝗜 𝗕𝗛𝗜 𝗠𝗘𝗥𝗜 𝗖𝗛𝗨𝗗𝗔𝗜 𝗬𝗔𝗔𝗗 𝗞𝗔𝗥𝗘𝗚𝗜 𝗥Æ𝗡𝗗𝗜 🥳😍👊💥",
-            "𝙋𝘼𝙋𝘼 𝙆𝙄 𝙎𝙋𝙀𝙀𝘿 𝙈𝙏𝘾𝙃 𝙉𝙃𝙄 𝙃𝙊 𝙍𝙃𝙄 𝙆𝙔𝘼",
-            "𝙆𝙄𝙏𝙉𝙄 𝘾𝙃𝙊𝘿𝙐 𝙏𝙀𝙍𝙄 𝙈𝘼 𝘼𝘽 𝙊𝙍..",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔𝗨𝗦𝗜 𝗞𝗘 𝗕𝗛𝗢𝗦𝗗𝗘 𝗠𝗘𝗜 𝗜𝗡𝗗𝗜𝗔𝗡 𝗥𝗔𝗜𝗟𝗪𝗔𝗬 🚂💥😂",
-            "𝙆𝙄𝙏𝙉𝙄 𝙂𝙇𝙄𝙔𝘼 𝙋𝘿𝙒𝙀𝙂𝘼 𝘼𝙋𝙉𝙄 𝙈𝘼 𝙆𝙊",
-            "𝗧𝗘𝗥𝗜 𝗜𝗧𝗘𝗠 𝗞𝗜 𝗚𝗔𝗔𝗡𝗗 𝗠𝗘 𝗟𝗨𝗡𝗗 𝗗𝗔𝗔𝗟𝗞𝗘,𝗧𝗘𝗥𝗘 𝗝𝗔𝗜𝗦𝗔 𝗘𝗞 𝗢𝗥 𝗡𝗜𝗞𝗔𝗔𝗟 𝗗𝗨𝗡𝗚𝗔 𝗠𝗔‌𝗔‌𝗗𝗔𝗥𝗖𝗛Ø𝗗🤘🏻🙌🏻☠️",
-            "2 𝙍𝙐𝙋𝘼𝙔 𝙆𝙄 𝙋𝙀𝙋𝙎𝙄 𝙏𝙀𝙍𝙄 𝙈𝙐𝙈𝙈𝙔 𝙎𝘼𝘽𝙎𝙀 𝙎𝙀𝙓𝙔 💋💦",
-            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐"
-        ]
 
-        fun_texts = [
-            "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
-            "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
-            "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
-            "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
-            "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
-            "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
-            "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
-            "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
-            "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
-            "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
-            "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
-            "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
-            "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
-            "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
-            "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
-            "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
-            "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
-            "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭"
-        ]
 
-        flag_texts = [
-            "🇮🇳 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ɴᴅɪᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇳",
-            "🇯🇵 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐉ᴀᴘᴀɴ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇯🇵",
-            "🇺🇸 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐒𝐀 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇺🇸",
-            "🇬🇧 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐊 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇬🇧",
-            "🇰🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐊ᴏʀᴇᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇰🇷",
-            "🇩🇪 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐆ᴇʀᴍᴀɴʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇩🇪",
-            "🇫🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐅ʀᴀɴᴄᴇ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇫🇷",
-            "🇮🇹 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ᴛᴀʟʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇹",
-            "🇧🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐁ʀᴀᴢɪʟ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇧🇷",
-            "🇨🇦 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐂ᴀɴᴀᴅᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇨🇦",
-        ]
+            
+            mr2_texts = [
+                "B⃠a⃠a⃠p⃠ b⃠h⃠i⃠ b⃠n⃠a⃠l⃠e⃠ m⃠u⃠j⃠e⃠ r⃠n⃠d⃠i⃠k⃠e⃠",
+        "T⃠e⃠r⃠a⃠ b⃠a⃠a⃠p⃠ r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ e⃠y⃠ y⃠a⃠a⃠d⃠ e⃠y⃠ t⃠u⃠j⃠h⃠e⃠",
+        "T⃠u⃠ a⃠p⃠n⃠i⃠ M⃠a⃠a⃠ c⃠u⃠d⃠a⃠ n⃠a⃠ t⃠y⃠m⃠p⃠a⃠s⃠s⃠",
+        "O⃠y⃠e⃠ u⃠n⃠f⃠u⃠n⃠n⃠y⃠ s⃠w⃠i⃠p⃠e⃠ m⃠t⃠t⃠ k⃠r⃠",
+        "O⃠h⃠ h⃠e⃠l⃠l⃠o⃠ b⃠i⃠h⃠a⃠r⃠i⃠ t⃠e⃠r⃠a⃠ b⃠a⃠a⃠p⃠ b⃠i⃠h⃠a⃠r⃠i⃠ o⃠r⃠ t⃠u⃠ v⃠ b⃠i⃠h⃠a⃠r⃠i⃠ a⃠a⃠u⃠k⃠a⃠t⃠ m⃠e⃠ r⃠h⃠a⃠ k⃠r⃠.",
+        "O⃠y⃠y⃠ k⃠i⃠n⃠n⃠e⃠r⃠ t⃠u⃠j⃠h⃠e⃠ g⃠c⃠ m⃠e⃠ a⃠a⃠n⃠e⃠ k⃠i⃠ p⃠e⃠r⃠m⃠i⃠s⃠s⃠i⃠o⃠n⃠ k⃠i⃠s⃠n⃠e⃠ d⃠i⃠.",
+        "C⃠u⃠d⃠k⃠e⃠ d⃠i⃠k⃠h⃠a⃠",
+        "C⃠u⃠d⃠k⃠e⃠ d⃠i⃠k⃠h⃠a⃠ e⃠k⃠ b⃠a⃠a⃠r⃠.",
+        "S⃠u⃠n⃠ s⃠u⃠n⃠ m⃠a⃠ c⃠u⃠d⃠a⃠.",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠c⃠a⃠ b⃠h⃠o⃠s⃠d⃠a⃠.",
+        "O⃠y⃠e⃠ c⃠h⃠o⃠t⃠i⃠ j⃠a⃠t⃠i⃠ k⃠e⃠ t⃠m⃠r⃠.",
+        "K⃠y⃠? j⃠l⃠d⃠i⃠ l⃠i⃠k⃠h⃠ k⃠i⃠d⃠d⃠e⃠.",
+        "B⃠i⃠h⃠a⃠r⃠i⃠ c⃠o⃠m⃠ g⃠a⃠n⃠g⃠ k⃠e⃠ b⃠a⃠a⃠p⃠ k⃠o⃠ t⃠a⃠g⃠ c⃠r⃠e⃠g⃠a⃠ t⃠u⃠",
+        "M⃠u⃠j⃠h⃠e⃠ c⃠y⃠a⃠ t⃠u⃠ b⃠i⃠h⃠a⃠r⃠i⃠ e⃠y⃠ t⃠m⃠k⃠c⃠ b⃠s⃠",
+        "J⃠a⃠l⃠d⃠i⃠ s⃠e⃠ r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ p⃠a⃠p⃠a⃠ b⃠o⃠l⃠",
+        "S⃠i⃠d⃠e⃠ h⃠o⃠j⃠a⃠ b⃠i⃠h⃠a⃠r⃠i⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ a⃠b⃠",
+        "H⃠y⃠e⃠ p⃠g⃠l⃠ b⃠h⃠g⃠ m⃠a⃠t⃠ a⃠c⃠h⃠e⃠ s⃠e⃠ c⃠u⃠d⃠",
+        "b⃠h⃠g⃠ n⃠y⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ t⃠u⃠ a⃠j⃠j⃠",
+        "H⃠y⃠e⃠ p⃠g⃠l⃠ k⃠e⃠ b⃠c⃠h⃠e⃠ b⃠h⃠a⃠g⃠ m⃠a⃠t⃠",
+        "H⃠y⃠e⃠ d⃠u⃠r⃠ h⃠a⃠t⃠t⃠ m⃠a⃠d⃠h⃠c⃠h⃠o⃠d⃠ k⃠e⃠ b⃠a⃠c⃠h⃠e⃠",
+        "k⃠o⃠i⃠ b⃠a⃠t⃠ n⃠y⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠ e⃠s⃠l⃠i⃠y⃠e⃠ m⃠a⃠f⃠ c⃠r⃠ r⃠h⃠a⃠ h⃠u⃠ t⃠u⃠j⃠h⃠e⃠",
+        "k⃠o⃠i⃠ b⃠a⃠a⃠t⃠ n⃠y⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ a⃠p⃠n⃠i⃠ t⃠u⃠ m⃠a⃠f⃠i⃠ d⃠e⃠ d⃠u⃠n⃠g⃠a⃠",
+        "A⃠c⃠h⃠e⃠ s⃠e⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ a⃠p⃠n⃠i⃠ t⃠u⃠ m⃠a⃠f⃠i⃠ m⃠i⃠l⃠ j⃠a⃠y⃠e⃠g⃠i⃠ t⃠u⃠j⃠h⃠e⃠",
+        "a⃠p⃠n⃠i⃠ m⃠a⃠ m⃠a⃠t⃠ c⃠h⃠u⃠d⃠a⃠ m⃠u⃠j⃠e⃠ s⃠w⃠i⃠p⃠e⃠ c⃠r⃠k⃠e⃠",
+        "A⃠c⃠h⃠e⃠ s⃠e⃠ a⃠p⃠n⃠i⃠ m⃠a⃠ c⃠u⃠d⃠w⃠a⃠ t⃠u⃠ s⃠w⃠i⃠p⃠e⃠ c⃠r⃠k⃠e⃠",
+        "F⃠r⃠ b⃠o⃠l⃠n⃠a⃠ n⃠a⃠ k⃠i⃠ c⃠u⃠d⃠w⃠a⃠ l⃠e⃠ a⃠p⃠n⃠i⃠ m⃠a⃠ s⃠w⃠i⃠p⃠e⃠ c⃠r⃠k⃠e⃠",
+        "C⃠y⃠a⃠ h⃠u⃠a⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ t⃠e⃠r⃠y⃠",
+        "p⃠r⃠ k⃠e⃠s⃠e⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ t⃠e⃠r⃠y⃠ m⃠a⃠",
+        "m⃠u⃠j⃠h⃠e⃠ p⃠t⃠a⃠ t⃠h⃠a⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "m⃠e⃠y⃠ n⃠y⃠ m⃠a⃠n⃠t⃠a⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ t⃠e⃠r⃠y⃠",
+        "t⃠e⃠r⃠i⃠ m⃠a⃠ r⃠n⃠d⃠y⃠",
+        "l⃠o⃠d⃠e⃠ s⃠e⃠ u⃠t⃠r⃠ m⃠c⃠",
+        "l⃠u⃠n⃠ m⃠t⃠ c⃠h⃠u⃠s⃠ m⃠e⃠r⃠a⃠",
+        "n⃠i⃠k⃠a⃠l⃠ m⃠a⃠d⃠a⃠r⃠c⃠h⃠d⃠",
+        "c⃠h⃠u⃠p⃠ o⃠y⃠e⃠ g⃠a⃠s⃠h⃠t⃠i⃠ k⃠ b⃠a⃠c⃠h⃠e⃠",
+        "m⃠a⃠k⃠i⃠c⃠h⃠u⃠t⃠ t⃠e⃠r⃠i⃠",
+        "c⃠h⃠u⃠p⃠ r⃠n⃠d⃠y⃠k⃠e⃠",
+        "m⃠a⃠ r⃠n⃠d⃠y⃠ t⃠e⃠r⃠i⃠",
+        "t⃠e⃠r⃠i⃠ m⃠a⃠ k⃠ h⃠a⃠t⃠h⃠ t⃠o⃠d⃠h⃠ k⃠ t⃠e⃠r⃠e⃠ b⃠a⃠a⃠p⃠ k⃠ m⃠u⃠h⃠ m⃠e⃠ f⃠a⃠s⃠a⃠d⃠u⃠n⃠g⃠a⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "l⃠e⃠a⃠v⃠e⃠ l⃠e⃠ t⃠u⃠ r⃠n⃠d⃠y⃠k⃠e⃠ p⃠a⃠s⃠a⃠n⃠d⃠ n⃠a⃠i⃠ a⃠y⃠a⃠ m⃠e⃠k⃠o⃠",
+        "l⃠e⃠a⃠v⃠e⃠ l⃠e⃠ t⃠u⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ i⃠d⃠e⃠r⃠ s⃠e⃠",
+        "L⃠e⃠a⃠v⃠e⃠ l⃠e⃠ j⃠l⃠d⃠i⃠ s⃠e⃠ w⃠r⃠n⃠a⃠ m⃠a⃠ c⃠h⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "L⃠e⃠a⃠v⃠e⃠ n⃠y⃠ l⃠e⃠g⃠a⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "S⃠m⃠j⃠h⃠ b⃠a⃠t⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠ t⃠e⃠r⃠y⃠ l⃠e⃠a⃠v⃠e⃠ l⃠e⃠",
+        "f⃠a⃠s⃠t⃠ l⃠e⃠a⃠v⃠e⃠ l⃠e⃠ k⃠a⃠m⃠j⃠o⃠r⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "t⃠u⃠t⃠o⃠ c⃠h⃠u⃠p⃠ r⃠n⃠d⃠y⃠k⃠",
+        "o⃠y⃠ h⃠i⃠j⃠d⃠e⃠ k⃠h⃠a⃠n⃠a⃠ k⃠h⃠a⃠ k⃠e⃠ a⃠a⃠ k⃠a⃠m⃠z⃠o⃠r⃠",
+        "t⃠e⃠r⃠i⃠ m⃠a⃠k⃠o⃠ i⃠l⃠y⃠ r⃠e⃠y⃠🌚😂",
+        "c⃠h⃠u⃠p⃠ c⃠h⃠a⃠p⃠ c⃠h⃠u⃠d⃠ t⃠m⃠k⃠c⃠",
+        "c⃠h⃠u⃠p⃠c⃠h⃠a⃠p⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ a⃠p⃠n⃠i⃠ t⃠u⃠",
+        "s⃠h⃠i⃠ s⃠e⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ a⃠p⃠n⃠i⃠ t⃠u⃠ c⃠h⃠u⃠p⃠c⃠h⃠a⃠p⃠",
+        "f⃠r⃠ s⃠e⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ t⃠u⃠ a⃠p⃠n⃠i⃠ c⃠h⃠u⃠p⃠c⃠h⃠a⃠p⃠",
+        "s⃠h⃠i⃠ s⃠e⃠ l⃠i⃠k⃠h⃠ w⃠r⃠n⃠a⃠ m⃠a⃠ c⃠h⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "m⃠a⃠ c⃠y⃠u⃠ c⃠h⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠ c⃠h⃠u⃠p⃠c⃠h⃠a⃠p⃠",
+        "p⃠r⃠o⃠o⃠f⃠ c⃠r⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠ g⃠y⃠i⃠ t⃠e⃠r⃠y⃠",
+        "p⃠r⃠o⃠o⃠f⃠ e⃠y⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "p⃠r⃠o⃠o⃠f⃠ h⃠o⃠ c⃠h⃠u⃠k⃠a⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "C⃠h⃠u⃠p⃠ c⃠h⃠i⃠l⃠l⃠a⃠r⃠",
+        "c⃠h⃠u⃠p⃠ c⃠h⃠u⃠p⃠ m⃠a⃠a⃠ k⃠ b⃠o⃠s⃠d⃠a⃠ t⃠e⃠r⃠y⃠",
+        "o⃠y⃠ h⃠i⃠j⃠d⃠e⃠ k⃠h⃠a⃠n⃠a⃠ k⃠h⃠a⃠ k⃠e⃠ a⃠a⃠ k⃠a⃠m⃠z⃠o⃠r⃠",
+        "c⃠h⃠u⃠p⃠ m⃠a⃠d⃠a⃠r⃠c⃠h⃠o⃠d⃠ ?",
+        "A⃠b⃠ t⃠k⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ h⃠o⃠g⃠i⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ ?",
+        "n⃠y⃠ n⃠y⃠ m⃠e⃠ k⃠u⃠c⃠h⃠ n⃠y⃠ j⃠a⃠n⃠t⃠a⃠ b⃠s⃠ t⃠e⃠r⃠i⃠ m⃠a⃠ r⃠n⃠d⃠y⃠ e⃠y⃠",
+        "S⃠b⃠s⃠e⃠ p⃠h⃠e⃠l⃠e⃠ a⃠p⃠n⃠i⃠ m⃠a⃠a⃠ k⃠o⃠ b⃠o⃠l⃠ c⃠h⃠u⃠d⃠n⃠a⃠ k⃠a⃠a⃠m⃠ k⃠r⃠e⃠",
+        "Y⃠a⃠h⃠a⃠ b⃠h⃠i⃠ c⃠h⃠u⃠d⃠a⃠ t⃠u⃠ r⃠n⃠d⃠y⃠c⃠e⃠ p⃠i⃠l⃠l⃠e⃠",
+        "t⃠e⃠r⃠i⃠m⃠a⃠k⃠a⃠b⃠o⃠s⃠d⃠a⃠",
+        "t⃠e⃠r⃠i⃠ t⃠o⃠ b⃠h⃠e⃠n⃠ c⃠u⃠d⃠e⃠g⃠i⃠",
+        "c⃠h⃠u⃠p⃠ r⃠n⃠d⃠y⃠k⃠e⃠ t⃠o⃠m⃠m⃠y⃠",
+        "n⃠i⃠k⃠a⃠l⃠ m⃠a⃠d⃠a⃠r⃠c⃠h⃠d⃠ c⃠u⃠d⃠k⃠e⃠ y⃠h⃠a⃠ s⃠e⃠",
+        "c⃠o⃠z⃠ t⃠e⃠r⃠i⃠ m⃠a⃠ a⃠n⃠d⃠h⃠i⃠ r⃠a⃠n⃠d⃠i⃠ h⃠e⃠",
+        "n⃠y⃠t⃠o⃠ b⃠a⃠a⃠p⃠ b⃠o⃠l⃠ m⃠u⃠j⃠h⃠e⃠",
+        "n⃠y⃠n⃠y⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ h⃠o⃠g⃠i⃠ r⃠n⃠d⃠i⃠i⃠ j⃠o⃠ c⃠h⃠u⃠d⃠w⃠a⃠t⃠i⃠ j⃠o⃠g⃠i⃠",
+        "t⃠r⃠y⃠ a⃠m⃠m⃠i⃠ c⃠e⃠ b⃠h⃠o⃠s⃠d⃠e⃠ m⃠e⃠ e⃠m⃠o⃠j⃠i⃠ d⃠a⃠l⃠ m⃠c⃠",
+        "c⃠y⃠a⃠ ? c⃠h⃠m⃠r⃠ c⃠h⃠u⃠d⃠ g⃠y⃠a⃠ c⃠y⃠a⃠ ?",
+        "t⃠m⃠ c⃠h⃠u⃠d⃠r⃠i⃠ h⃠o⃠g⃠i⃠ f⃠r⃠r⃠t⃠o⃠",
+        "c⃠y⃠a⃠ ? k⃠b⃠ ? p⃠g⃠l⃠ e⃠y⃠ c⃠y⃠a⃠ r⃠n⃠d⃠k⃠e⃠k⃠",
+        "c⃠y⃠a⃠ s⃠c⃠h⃠ m⃠e⃠y⃠ p⃠g⃠l⃠ e⃠y⃠ c⃠y⃠a⃠ t⃠u⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ c⃠u⃠d⃠w⃠a⃠ l⃠i⃠ t⃠u⃠n⃠e⃠ a⃠p⃠n⃠i⃠ m⃠a⃠",
+        "i⃠t⃠n⃠a⃠ s⃠c⃠h⃠ n⃠y⃠ b⃠o⃠l⃠ m⃠a⃠ c⃠h⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "s⃠c⃠h⃠ m⃠e⃠y⃠ p⃠g⃠l⃠ e⃠y⃠ t⃠u⃠ a⃠p⃠n⃠i⃠ m⃠a⃠ c⃠u⃠d⃠w⃠a⃠ l⃠i⃠a⃠ m⃠e⃠r⃠e⃠ s⃠t⃠h⃠",
+        "m⃠t⃠l⃠b⃠ t⃠m⃠r⃠",
+        "n⃠y⃠t⃠o⃠",
+        "p⃠u⃠r⃠a⃠ l⃠i⃠k⃠h⃠ m⃠c⃠",
+        "t⃠m⃠r⃠ f⃠r⃠r⃠t⃠o⃠",
+        "o⃠h⃠ o⃠k⃠ c⃠u⃠d⃠l⃠e⃠ f⃠i⃠r⃠",
+        "t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ k⃠a⃠ d⃠a⃠m⃠a⃠d⃠",
+        "c⃠y⃠a⃠ ? a⃠c⃠h⃠e⃠ s⃠e⃠ l⃠i⃠k⃠h⃠e⃠ p⃠e⃠h⃠l⃠e⃠ r⃠n⃠d⃠i⃠k⃠e⃠b⃠a⃠c⃠h⃠e⃠",
+        "n⃠y⃠t⃠o⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠o⃠d⃠n⃠e⃠ m⃠e⃠ v⃠y⃠a⃠s⃠t⃠ h⃠u⃠",
+        "n⃠y⃠t⃠o⃠ p⃠g⃠l⃠ e⃠y⃠ c⃠y⃠a⃠ k⃠u⃠c⃠h⃠ b⃠i⃠",
+        "o⃠y⃠e⃠e⃠ c⃠y⃠a⃠ ? c⃠h⃠u⃠d⃠ g⃠y⃠a⃠ ?",
+        "c⃠h⃠u⃠d⃠ m⃠t⃠ h⃠s⃠s⃠",
+        "y⃠u⃠r⃠ r⃠n⃠d⃠i⃠i⃠ m⃠o⃠m⃠",
+        "a⃠r⃠e⃠ s⃠b⃠k⃠i⃠ m⃠a⃠a⃠ r⃠n⃠d⃠i⃠i⃠ o⃠r⃠ t⃠e⃠r⃠i⃠ b⃠i⃠",
+        "a⃠r⃠e⃠ i⃠d⃠a⃠r⃠ c⃠u⃠d⃠l⃠e⃠ e⃠k⃠ b⃠a⃠a⃠r⃠",
+        "t⃠r⃠i⃠ m⃠a⃠a⃠ c⃠i⃠ t⃠r⃠h⃠",
+        "e⃠k⃠ l⃠i⃠n⃠e⃠ m⃠e⃠ t⃠m⃠r⃠",
+        "Q⃠",
+        "o⃠c⃠y⃠ a⃠b⃠ c⃠h⃠u⃠d⃠l⃠e⃠",
+        "p⃠e⃠h⃠e⃠l⃠e⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠o⃠d⃠u⃠",
+        "n⃠y⃠t⃠o⃠",
+        "q⃠ ?",
+        "h⃠y⃠y⃠y⃠ c⃠h⃠u⃠d⃠ k⃠e⃠ d⃠i⃠k⃠a⃠ e⃠k⃠ b⃠a⃠a⃠r⃠",
+        "o⃠y⃠e⃠e⃠ s⃠u⃠n⃠ d⃠o⃠s⃠t⃠ t⃠m⃠r⃠",
+        "b⃠h⃠a⃠g⃠ j⃠a⃠ r⃠a⃠a⃠n⃠d⃠ m⃠a⃠a⃠f⃠ c⃠r⃠r⃠ d⃠u⃠n⃠g⃠a⃠",
+        "o⃠y⃠e⃠e⃠ p⃠g⃠l⃠ r⃠n⃠d⃠i⃠i⃠ i⃠d⃠a⃠r⃠ a⃠a⃠",
+        "c⃠y⃠a⃠ t⃠m⃠r⃠ f⃠r⃠r⃠t⃠o⃠",
+        "o⃠y⃠e⃠e⃠ i⃠d⃠a⃠r⃠ a⃠a⃠k⃠e⃠ c⃠h⃠u⃠d⃠ l⃠e⃠ c⃠h⃠m⃠r⃠",
+        "n⃠y⃠t⃠o⃠ a⃠e⃠s⃠e⃠ h⃠i⃠ c⃠u⃠d⃠",
+        "o⃠y⃠e⃠e⃠ h⃠y⃠y⃠ a⃠i⃠s⃠e⃠ h⃠i⃠ c⃠u⃠d⃠ l⃠e⃠n⃠a⃠",
+        "o⃠r⃠ c⃠h⃠u⃠d⃠ l⃠e⃠",
+        "c⃠h⃠u⃠d⃠ k⃠e⃠ d⃠i⃠k⃠a⃠ o⃠r⃠",
+        "h⃠y⃠y⃠ c⃠h⃠u⃠d⃠o⃠ n⃠a⃠",
+        "c⃠h⃠u⃠d⃠o⃠ m⃠t⃠ b⃠h⃠a⃠g⃠ j⃠a⃠o⃠",
+        "b⃠y⃠y⃠e⃠e⃠ h⃠y⃠y⃠ c⃠y⃠a⃠ ?",
+        "Q⃠c⃠h⃠u⃠d⃠ q⃠ r⃠h⃠e⃠ h⃠o⃠ ?",
+        "p⃠g⃠l⃠ e⃠y⃠ c⃠y⃠a⃠ m⃠c⃠",
+        "c⃠h⃠u⃠d⃠ m⃠t⃠",
+        "c⃠y⃠a⃠ p⃠g⃠l⃠ r⃠n⃠d⃠i⃠i⃠ i⃠d⃠a⃠r⃠ a⃠a⃠",
+        "t⃠e⃠r⃠i⃠ a⃠m⃠m⃠i⃠ c⃠e⃠ b⃠h⃠o⃠s⃠d⃠e⃠ m⃠e⃠ c⃠h⃠a⃠p⃠p⃠a⃠l⃠",
+        "o⃠y⃠e⃠e⃠ i⃠d⃠a⃠r⃠ a⃠a⃠ m⃠c⃠",
+        "k⃠m⃠z⃠r⃠o⃠r⃠ e⃠y⃠ c⃠y⃠a⃠ r⃠n⃠d⃠i⃠e⃠k⃠",
+        "c⃠y⃠a⃠ l⃠i⃠k⃠h⃠ r⃠h⃠a⃠ ?",
+        "c⃠h⃠u⃠d⃠ t⃠h⃠a⃠ c⃠y⃠a⃠ ?",
+        "o⃠y⃠e⃠e⃠ s⃠l⃠i⃠d⃠e⃠ l⃠e⃠k⃠e⃠ b⃠a⃠a⃠t⃠ c⃠r⃠m⃠c⃠",
+        "i⃠d⃠a⃠r⃠ a⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠o⃠d⃠u⃠",
+        "o⃠y⃠e⃠e⃠ c⃠p⃠ m⃠t⃠ c⃠r⃠r⃠ c⃠h⃠u⃠d⃠l⃠e⃠",
+        "o⃠y⃠e⃠e⃠ h⃠y⃠y⃠ c⃠h⃠u⃠d⃠ k⃠e⃠ d⃠i⃠k⃠a⃠",
+        "i⃠d⃠a⃠r⃠ a⃠a⃠ t⃠r⃠y⃠ m⃠a⃠ s⃠c⃠h⃠o⃠f⃠u⃠ k⃠h⃠a⃠c⃠h⃠a⃠r⃠ k⃠h⃠a⃠c⃠h⃠a⃠r⃠",
+        "i⃠d⃠a⃠r⃠ a⃠a⃠ j⃠a⃠ m⃠c⃠",
+        "h⃠y⃠y⃠ i⃠d⃠a⃠r⃠ a⃠a⃠k⃠e⃠ c⃠h⃠u⃠d⃠l⃠e⃠",
+        "o⃠y⃠e⃠e⃠ k⃠m⃠z⃠o⃠r⃠ m⃠c⃠ i⃠d⃠a⃠r⃠ a⃠a⃠",
+        "y⃠e⃠ c⃠y⃠a⃠ t⃠m⃠r⃠",
+        "o⃠y⃠e⃠e⃠ n⃠y⃠ c⃠p⃠ n⃠y⃠ c⃠r⃠r⃠",
+        "o⃠y⃠e⃠e⃠ p⃠g⃠l⃠ m⃠t⃠ c⃠r⃠r⃠",
+        "c⃠u⃠d⃠l⃠e⃠ a⃠r⃠a⃠m⃠ s⃠e⃠ m⃠c⃠",
+        "p⃠g⃠l⃠ e⃠y⃠ c⃠y⃠a⃠ r⃠n⃠d⃠i⃠e⃠k⃠",
+        "c⃠p⃠ c⃠r⃠c⃠e⃠ c⃠h⃠u⃠d⃠e⃠g⃠a⃠ !",
+        "b⃠a⃠a⃠p⃠ ? m⃠c⃠ m⃠e⃠r⃠a⃠ c⃠o⃠i⃠ m⃠a⃠ b⃠a⃠a⃠p⃠ n⃠y⃠ e⃠y⃠ m⃠a⃠i⃠ u⃠p⃠a⃠r⃠ s⃠e⃠ r⃠o⃠c⃠k⃠e⃠t⃠ p⃠e⃠ b⃠e⃠t⃠h⃠ c⃠e⃠ b⃠s⃠s⃠ t⃠e⃠r⃠i⃠ m⃠a⃠ c⃠h⃠o⃠d⃠n⃠e⃠ a⃠y⃠a⃠ h⃠u⃠",
+        "C⃠h⃠o⃠t⃠a⃠ l⃠i⃠k⃠h⃠ r⃠n⃠d⃠i⃠ k⃠ b⃠a⃠c⃠h⃠e⃠",
+        "C⃠h⃠o⃠t⃠a⃠ l⃠i⃠k⃠h⃠a⃠ w⃠r⃠n⃠a⃠ t⃠r⃠y⃠ m⃠a⃠ r⃠n⃠d⃠y⃠",
+        "T⃠r⃠y⃠ m⃠a⃠ b⃠a⃠k⃠a⃠ c⃠o⃠d⃠e⃠g⃠a⃠",
+        "T⃠m⃠k⃠c⃠ m⃠a⃠i⃠n⃠ b⃠u⃠r⃠f⃠",
+        "B⃠h⃠i⃠k⃠a⃠r⃠i⃠ k⃠i⃠ j⃠h⃠a⃠t⃠ m⃠a⃠ c⃠u⃠d⃠a⃠ l⃠e⃠",
+        "C⃠h⃠o⃠d⃠k⃠e⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ m⃠a⃠r⃠j⃠a⃠y⃠e⃠g⃠i⃠",
+        "T⃠m⃠k⃠c⃠ m⃠a⃠i⃠n⃠ M⃠o⃠u⃠n⃠t⃠ E⃠v⃠e⃠r⃠e⃠s⃠t⃠",
+        "M⃠u⃠h⃠ m⃠e⃠y⃠ l⃠e⃠g⃠a⃠ l⃠u⃠n⃠d⃠ m⃠e⃠r⃠a⃠",
+        "H⃠i⃠j⃠d⃠e⃠ k⃠i⃠ j⃠h⃠a⃠t⃠ c⃠h⃠u⃠p⃠ w⃠r⃠n⃠a⃠ t⃠r⃠y⃠ m⃠a⃠ r⃠n⃠d⃠i⃠",
+        "M⃠e⃠n⃠u⃠ n⃠y⃠ p⃠t⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ r⃠a⃠n⃠d⃠y⃠",
+        "M⃠e⃠n⃠u⃠ k⃠i⃠ p⃠t⃠a⃠ m⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "M⃠e⃠n⃠u⃠ p⃠t⃠a⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "M⃠e⃠n⃠u⃠ s⃠b⃠ p⃠t⃠a⃠ m⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠ t⃠e⃠r⃠y⃠",
+        "M⃠e⃠n⃠u⃠ p⃠r⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ r⃠a⃠n⃠d⃠y⃠",
+        "R⃠a⃠n⃠d⃠y⃠ m⃠a⃠a⃠ t⃠e⃠r⃠y⃠ m⃠e⃠n⃠u⃠ p⃠t⃠a⃠",
+        "T⃠e⃠n⃠u⃠ o⃠r⃠ m⃠e⃠n⃠u⃠ p⃠t⃠a⃠ e⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "B⃠s⃠ b⃠s⃠ m⃠a⃠a⃠ c⃠u⃠d⃠w⃠a⃠ a⃠p⃠n⃠i⃠",
+        "B⃠s⃠ b⃠s⃠ m⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠ t⃠h⃠n⃠k⃠s⃠s⃠",
+        "B⃠s⃠ b⃠s⃠ c⃠h⃠u⃠d⃠w⃠a⃠ l⃠i⃠a⃠ t⃠u⃠ a⃠p⃠n⃠i⃠ m⃠a⃠a⃠",
+        "B⃠s⃠ b⃠s⃠ k⃠a⃠m⃠j⃠o⃠r⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "S⃠m⃠j⃠h⃠ g⃠y⃠a⃠ a⃠p⃠n⃠i⃠ m⃠a⃠ c⃠u⃠d⃠w⃠a⃠ l⃠e⃠ a⃠b⃠",
+        "s⃠m⃠j⃠h⃠ g⃠y⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "s⃠m⃠j⃠h⃠ g⃠y⃠a⃠ t⃠u⃠ s⃠a⃠b⃠i⃠t⃠ k⃠r⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "C⃠y⃠a⃠ h⃠u⃠a⃠ m⃠a⃠ c⃠u⃠d⃠w⃠a⃠ t⃠u⃠ a⃠p⃠n⃠i⃠",
+        "E⃠a⃠s⃠y⃠ m⃠a⃠a⃠ c⃠u⃠d⃠w⃠a⃠ l⃠e⃠ a⃠p⃠n⃠i⃠ t⃠u⃠",
+        "E⃠a⃠s⃠y⃠ w⃠8⃠ m⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ l⃠e⃠ a⃠p⃠n⃠i⃠ a⃠b⃠",
+        "S⃠a⃠n⃠s⃠ a⃠r⃠i⃠ h⃠a⃠ k⃠y⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠g⃠i⃠ a⃠j⃠j⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠ k⃠o⃠ b⃠i⃠n⃠a⃠ s⃠a⃠n⃠s⃠s⃠ l⃠e⃠t⃠e⃠ h⃠u⃠e⃠ c⃠h⃠o⃠d⃠u⃠n⃠g⃠a⃠",
+        "c⃠h⃠u⃠p⃠ r⃠a⃠n⃠d⃠i⃠k⃠e⃠ k⃠a⃠m⃠j⃠o⃠r⃠",
+        "a⃠p⃠n⃠i⃠ m⃠a⃠ n⃠o⃠r⃠m⃠i⃠e⃠ c⃠u⃠d⃠w⃠a⃠ l⃠e⃠ t⃠u⃠",
+        "f⃠r⃠ c⃠y⃠a⃠ n⃠o⃠r⃠m⃠i⃠e⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "b⃠a⃠s⃠ t⃠h⃠e⃠k⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ r⃠a⃠n⃠d⃠y⃠",
+        "b⃠a⃠s⃠ t⃠h⃠e⃠k⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠y⃠i⃠",
+        "k⃠a⃠m⃠j⃠o⃠r⃠ t⃠h⃠i⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ e⃠s⃠l⃠i⃠y⃠e⃠ c⃠u⃠d⃠ g⃠a⃠i⃠",
+        "M⃠a⃠i⃠ s⃠b⃠ j⃠a⃠n⃠t⃠a⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "c⃠h⃠l⃠ c⃠h⃠l⃠ h⃠t⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠y⃠i⃠",
+        "f⃠r⃠ k⃠a⃠i⃠s⃠e⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ m⃠a⃠a⃠ t⃠e⃠r⃠y⃠",
+        "m⃠a⃠a⃠ t⃠e⃠r⃠y⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "b⃠a⃠s⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "f⃠r⃠ r⃠a⃠n⃠d⃠y⃠ m⃠a⃠ t⃠e⃠r⃠y⃠ e⃠y⃠",
+        "K⃠a⃠m⃠j⃠o⃠r⃠ m⃠a⃠ k⃠a⃠ b⃠c⃠h⃠a⃠ t⃠u⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "b⃠h⃠o⃠t⃠ g⃠n⃠d⃠i⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ m⃠a⃠a⃠ t⃠e⃠r⃠y⃠",
+        "p⃠r⃠ k⃠a⃠i⃠s⃠e⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠ i⃠t⃠n⃠a⃠ g⃠n⃠d⃠a⃠",
+        "m⃠u⃠j⃠h⃠e⃠ c⃠y⃠a⃠ b⃠t⃠a⃠ r⃠h⃠a⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "m⃠u⃠j⃠h⃠e⃠ c⃠y⃠a⃠ p⃠t⃠a⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ t⃠e⃠r⃠y⃠",
+        "f⃠i⃠r⃠ m⃠u⃠j⃠h⃠e⃠ n⃠y⃠ p⃠t⃠a⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "p⃠t⃠a⃠ n⃠y⃠ k⃠o⃠n⃠ c⃠o⃠d⃠ d⃠i⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ k⃠o⃠",
+        "r⃠u⃠k⃠ a⃠a⃠y⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠o⃠d⃠k⃠e⃠",
+        "w⃠a⃠i⃠t⃠ c⃠r⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠o⃠d⃠ r⃠h⃠a⃠ h⃠u⃠",
+        "w⃠a⃠i⃠t⃠ c⃠r⃠ r⃠a⃠b⃠d⃠y⃠k⃠e⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ r⃠h⃠i⃠ e⃠y⃠ t⃠e⃠r⃠y⃠",
+        "w⃠a⃠i⃠t⃠ k⃠r⃠ s⃠m⃠j⃠h⃠ r⃠h⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠o⃠d⃠k⃠e⃠",
+        "w⃠a⃠i⃠t⃠ l⃠e⃠ t⃠h⃠o⃠d⃠a⃠ c⃠h⃠o⃠d⃠n⃠e⃠ d⃠e⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠",
+        "r⃠u⃠k⃠ j⃠a⃠ a⃠a⃠n⃠d⃠ r⃠k⃠h⃠ d⃠u⃠n⃠g⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠e⃠ l⃠i⃠y⃠e⃠",
+        "t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ f⃠a⃠m⃠o⃠u⃠s⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "m⃠a⃠a⃠n⃠ l⃠i⃠a⃠ m⃠e⃠n⃠e⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ s⃠a⃠l⃠i⃠ t⃠e⃠r⃠y⃠",
+        "m⃠a⃠a⃠n⃠ l⃠i⃠a⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "s⃠h⃠a⃠n⃠t⃠ b⃠e⃠t⃠h⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ t⃠u⃠ a⃠p⃠n⃠i⃠",
+        "s⃠h⃠a⃠n⃠t⃠ b⃠e⃠t⃠h⃠k⃠e⃠ c⃠h⃠u⃠d⃠w⃠a⃠ l⃠e⃠ a⃠p⃠n⃠i⃠ m⃠a⃠k⃠o⃠ t⃠u⃠",
+        "f⃠r⃠ s⃠e⃠ s⃠h⃠a⃠n⃠t⃠ B⃠e⃠t⃠h⃠ t⃠u⃠ c⃠u⃠d⃠ a⃠b⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ y⃠h⃠a⃠",
+        "m⃠e⃠r⃠e⃠ s⃠m⃠j⃠h⃠ n⃠y⃠ a⃠y⃠a⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "L⃠e⃠ k⃠e⃠l⃠a⃠ K⃠h⃠a⃠ t⃠u⃠ m⃠a⃠d⃠a⃠r⃠c⃠h⃠o⃠d⃠",
+        "H⃠y⃠e⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ c⃠y⃠a⃠",
+        "h⃠y⃠e⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ m⃠a⃠r⃠ g⃠a⃠i⃠ c⃠y⃠a⃠",
+        "H⃠y⃠e⃠ s⃠c⃠h⃠ b⃠t⃠a⃠ c⃠o⃠m⃠ c⃠o⃠d⃠ d⃠i⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠",
+        "C⃠h⃠l⃠ c⃠h⃠o⃠d⃠ d⃠i⃠a⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ k⃠o⃠ s⃠m⃠j⃠h⃠l⃠e⃠",
+        "B⃠a⃠k⃠i⃠ k⃠o⃠i⃠ d⃠i⃠k⃠k⃠a⃠t⃠ n⃠y⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "b⃠a⃠k⃠i⃠ s⃠b⃠ j⃠a⃠n⃠t⃠e⃠ e⃠y⃠ k⃠i⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠d⃠k⃠a⃠d⃠ e⃠y⃠ t⃠e⃠r⃠y⃠",
+        "m⃠u⃠j⃠h⃠e⃠ c⃠y⃠a⃠ p⃠t⃠a⃠ t⃠h⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠u⃠d⃠n⃠e⃠ w⃠l⃠i⃠ e⃠y⃠",
+        "p⃠r⃠ m⃠e⃠i⃠ k⃠a⃠i⃠s⃠e⃠ j⃠n⃠t⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ k⃠o⃠ k⃠o⃠i⃠ c⃠h⃠o⃠d⃠ d⃠i⃠a⃠",
+        "p⃠r⃠ m⃠e⃠r⃠a⃠ v⃠i⃠ m⃠a⃠n⃠n⃠a⃠ s⃠h⃠i⃠ t⃠h⃠a⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "p⃠r⃠ w⃠o⃠ g⃠l⃠t⃠ n⃠y⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "p⃠r⃠ w⃠o⃠ s⃠h⃠i⃠ e⃠y⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠d⃠k⃠a⃠d⃠ e⃠y⃠",
+        "p⃠r⃠ k⃠a⃠i⃠s⃠e⃠ k⃠i⃠a⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠ o⃠m⃠f⃠o⃠o⃠",
+        "b⃠u⃠r⃠ c⃠h⃠e⃠e⃠r⃠ d⃠u⃠n⃠g⃠a⃠ t⃠r⃠i⃠ m⃠a⃠ k⃠a⃠",
+        "t⃠e⃠r⃠i⃠ m⃠a⃠ k⃠e⃠ d⃠i⃠l⃠ m⃠e⃠ l⃠o⃠d⃠a⃠ m⃠a⃠r⃠k⃠e⃠ u⃠s⃠k⃠i⃠ d⃠h⃠a⃠d⃠k⃠a⃠n⃠ r⃠o⃠k⃠ d⃠u⃠n⃠g⃠a⃠",
+        "l⃠u⃠l⃠l⃠e⃠ k⃠h⃠a⃠ t⃠r⃠i⃠ m⃠a⃠k⃠a⃠b⃠h⃠o⃠s⃠d⃠a⃠",
+        "t⃠r⃠i⃠ b⃠h⃠n⃠ k⃠i⃠ b⃠h⃠o⃠s⃠d⃠i⃠ b⃠e⃠t⃠a⃠",
+        "t⃠r⃠i⃠ m⃠a⃠ r⃠n⃠d⃠i⃠ b⃠a⃠a⃠t⃠ k⃠h⃠t⃠m⃠",
+        "S⃠u⃠n⃠ e⃠k⃠ m⃠a⃠z⃠e⃠ k⃠i⃠ b⃠a⃠a⃠t⃠ b⃠a⃠t⃠a⃠o⃠ k⃠y⃠a⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠"
+        "c⃠o⃠d⃠u⃠ c⃠o⃠d⃠u⃠ m⃠a⃠k⃠o⃠ t⃠e⃠r⃠y⃠",
+        "a⃠j⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ o⃠y⃠e⃠",
+        "s⃠u⃠n⃠ s⃠u⃠n⃠ r⃠a⃠n⃠d⃠y⃠ m⃠a⃠k⃠e⃠ b⃠a⃠c⃠h⃠e⃠ t⃠u⃠",
+        "k⃠i⃠l⃠a⃠s⃠ n⃠y⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "m⃠u⃠j⃠h⃠e⃠ c⃠y⃠a⃠ p⃠t⃠a⃠ t⃠e⃠r⃠y⃠ b⃠h⃠e⃠n⃠ c⃠u⃠d⃠ g⃠a⃠i⃠",
+        "p⃠r⃠ p⃠r⃠ c⃠y⃠a⃠ h⃠o⃠t⃠e⃠ e⃠y⃠ t⃠m⃠k⃠c⃠",
+        "t⃠m⃠c⃠l⃠ s⃠u⃠n⃠l⃠e⃠",
+        "m⃠o⃠o⃠t⃠ d⃠u⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠i⃠ c⃠h⃠u⃠t⃠ m⃠e⃠y⃠",
+        "b⃠h⃠g⃠n⃠y⃠ c⃠u⃠d⃠k⃠e⃠ d⃠i⃠k⃠h⃠a⃠ f⃠r⃠",
+        "f⃠r⃠ s⃠e⃠ c⃠u⃠d⃠l⃠e⃠ t⃠u⃠",
+        "y⃠e⃠ v⃠i⃠ s⃠h⃠i⃠ e⃠y⃠ t⃠e⃠r⃠y⃠ m⃠k⃠c⃠ b⃠s⃠",
+        "a⃠j⃠ k⃠u⃠c⃠h⃠ n⃠y⃠ m⃠a⃠ c⃠u⃠d⃠w⃠a⃠ t⃠u⃠ a⃠p⃠n⃠i⃠",
+        "t⃠r⃠y⃠ k⃠r⃠ m⃠e⃠r⃠a⃠ l⃠u⃠n⃠d⃠ c⃠h⃠u⃠s⃠k⃠e⃠",
+        "t⃠o⃠r⃠m⃠a⃠k⃠i⃠b⃠u⃠r⃠ s⃠u⃠n⃠",
+        "t⃠o⃠r⃠ m⃠a⃠k⃠i⃠ f⃠u⃠d⃠d⃠i⃠ o⃠y⃠e⃠",
+        "H⃠a⃠y⃠e⃠ H⃠a⃠y⃠e⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠",
+        "o⃠y⃠e⃠ l⃠u⃠n⃠d⃠k⃠e⃠ p⃠a⃠s⃠i⃠n⃠e⃠..",
+        "k⃠u⃠t⃠t⃠e⃠ k⃠e⃠ t⃠a⃠t⃠t⃠e⃠ s⃠u⃠n⃠",
+        "k⃠u⃠t⃠t⃠a⃠ j⃠a⃠i⃠s⃠a⃠ c⃠u⃠d⃠ r⃠h⃠a⃠ t⃠u⃠",
+        "M⃠u⃠h⃠ m⃠e⃠i⃠ l⃠e⃠ m⃠e⃠r⃠a⃠..",
+        "j⃠h⃠a⃠a⃠t⃠ k⃠e⃠ p⃠i⃠s⃠s⃠u⃠ s⃠u⃠n⃠ t⃠m⃠k⃠c⃠",
+        "H⃠a⃠h⃠a⃠h⃠h⃠a⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "w⃠e⃠a⃠k⃠ t⃠a⃠t⃠t⃠e⃠ u⃠t⃠h⃠",
+        "w⃠e⃠a⃠k⃠ e⃠y⃠ t⃠u⃠ c⃠u⃠d⃠ r⃠h⃠a⃠",
+        "w⃠e⃠a⃠k⃠ a⃠c⃠h⃠e⃠ s⃠e⃠ c⃠u⃠d⃠ t⃠u⃠",
+        "w⃠e⃠a⃠k⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠u⃠d⃠ r⃠h⃠i⃠ d⃠e⃠k⃠h⃠",
+        "w⃠e⃠e⃠k⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ a⃠b⃠",
+        "m⃠u⃠j⃠h⃠e⃠ n⃠y⃠ r⃠o⃠k⃠ t⃠u⃠ w⃠e⃠a⃠k⃠ e⃠y⃠",
+        "c⃠h⃠u⃠p⃠ h⃠i⃠z⃠d⃠e⃠",
+        "o⃠k⃠a⃠t⃠ n⃠y⃠ m⃠e⃠r⃠i⃠ m⃠a⃠ c⃠u⃠d⃠w⃠a⃠ t⃠u⃠ a⃠p⃠n⃠i⃠",
+        "l⃠u⃠n⃠ l⃠e⃠g⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠i⃠ g⃠a⃠n⃠d⃠ m⃠e⃠i⃠ ?",
+        "t⃠e⃠r⃠y⃠ m⃠a⃠k⃠i⃠ b⃠a⃠c⃠h⃠i⃠ c⃠o⃠d⃠u⃠..",
+        "t⃠e⃠r⃠y⃠ b⃠h⃠e⃠n⃠ k⃠i⃠ c⃠h⃠u⃠t⃠ a⃠j⃠ f⃠a⃠d⃠ d⃠u⃠",
+        "s⃠p⃠e⃠e⃠d⃠ l⃠e⃠k⃠r⃠ a⃠a⃠ c⃠u⃠d⃠k⃠e⃠ d⃠i⃠k⃠h⃠a⃠",
+        "s⃠p⃠e⃠e⃠d⃠ n⃠y⃠ t⃠e⃠r⃠e⃠ a⃠n⃠d⃠r⃠ w⃠e⃠a⃠k⃠ p⃠r⃠o⃠s⃠n⃠",
+        "u⃠g⃠l⃠y⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ c⃠h⃠u⃠p⃠",
+        "m⃠a⃠k⃠a⃠f⃠u⃠d⃠d⃠a⃠t⃠e⃠r⃠y⃠",
+        "t⃠e⃠r⃠a⃠ b⃠a⃠a⃠p⃠ k⃠o⃠ t⃠a⃠g⃠ k⃠r⃠..?",
+        "a⃠c⃠h⃠e⃠ s⃠e⃠ t⃠a⃠g⃠ k⃠r⃠ r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ b⃠h⃠a⃠g⃠w⃠n⃠ k⃠o⃠..",
+        "c⃠u⃠d⃠k⃠e⃠ p⃠g⃠l⃠ n⃠y⃠ h⃠o⃠ t⃠u⃠",
+        "c⃠u⃠d⃠k⃠e⃠ p⃠g⃠l⃠ h⃠o⃠ r⃠h⃠a⃠ t⃠u⃠ k⃠i⃠d⃠",
+        "m⃠a⃠ t⃠o⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠ h⃠a⃠w⃠a⃠b⃠z⃠i⃠ c⃠r⃠..",
+        "b⃠s⃠ m⃠a⃠ c⃠o⃠d⃠n⃠i⃠ e⃠y⃠ t⃠e⃠r⃠y⃠",
+        "t⃠o⃠w⃠n⃠ m⃠e⃠i⃠ c⃠u⃠d⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠ l⃠e⃠k⃠r⃠",
+        "t⃠e⃠r⃠y⃠ m⃠a⃠ s⃠e⃠x⃠y⃠ k⃠o⃠ b⃠e⃠j⃠ - r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ b⃠h⃠g⃠w⃠n⃠ p⃠e⃠",
+        "s⃠p⃠e⃠e⃠d⃠ p⃠k⃠d⃠ c⃠p⃠ n⃠y⃠ k⃠r⃠",
+        "T⃠r⃠y⃠ m⃠a⃠ r⃠e⃠n⃠d⃠y⃠",
+        "B⃠h⃠k⃠k⃠ c⃠u⃠d⃠",
+        "t⃠e⃠y⃠ m⃠a⃠a⃠ r⃠n⃠d⃠i⃠",
+        "t⃠e⃠r⃠y⃠ b⃠e⃠h⃠e⃠n⃠ r⃠a⃠n⃠d⃠i⃠",
+        "C⃠u⃠d⃠ j⃠a⃠",
+        "t⃠e⃠r⃠y⃠ d⃠i⃠d⃠i⃠ r⃠n⃠d⃠i⃠",
+        "S⃠l⃠o⃠w⃠",
+        "t⃠e⃠r⃠i⃠ M⃠a⃠i⃠y⃠a⃠ c⃠i⃠o⃠d⃠u⃠",
+        "B⃠h⃠a⃠g⃠?",
+        "B⃠h⃠a⃠k⃠ c⃠u⃠d⃠",
+        "T⃠m⃠a⃠ c⃠o⃠d⃠u⃠",
+        "S⃠l⃠o⃠w⃠",
+        "S⃠l⃠o⃠w⃠ f⃠i⃠r⃠s⃠e⃠",
+        "C⃠u⃠d⃠g⃠r⃠i⃠b⃠",
+        "T⃠r⃠y⃠ m⃠a⃠ d⃠o⃠u⃠",
+        "t⃠b⃠k⃠c⃠ c⃠o⃠d⃠u⃠",
+        "N⃠e⃠t⃠ o⃠n⃠ o⃠f⃠f⃠ w⃠a⃠l⃠i⃠ r⃠n⃠d⃠y⃠",
+        "O⃠y⃠e⃠ t⃠r⃠y⃠ m⃠a⃠ c⃠o⃠d⃠u⃠",
+        "I⃠d⃠h⃠a⃠r⃠ a⃠a⃠k⃠e⃠ c⃠u⃠d⃠ c⃠h⃠u⃠p⃠ c⃠h⃠a⃠a⃠p⃠",
+        "t⃠b⃠k⃠c⃠ m⃠r⃠d⃠u⃠",
+        "o⃠i⃠ m⃠a⃠a⃠k⃠e⃠ l⃠o⃠d⃠e⃠e⃠",
+        "r⃠a⃠n⃠d⃠y⃠k⃠e⃠ b⃠e⃠e⃠j⃠",
+        "t⃠m⃠k⃠c⃠ c⃠h⃠o⃠d⃠u⃠",
+        "s⃠u⃠a⃠r⃠ k⃠e⃠ b⃠e⃠e⃠j⃠",
+        "n⃠e⃠t⃠ o⃠f⃠f⃠ o⃠n⃠ k⃠r⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ l⃠a⃠d⃠k⃠e⃠",
+        "T⃠r⃠y⃠ m⃠a⃠ c⃠u⃠d⃠i⃠ k⃠e⃠s⃠e⃠",
+        "C⃠h⃠u⃠p⃠ s⃠l⃠o⃠w⃠ m⃠a⃠d⃠h⃠a⃠r⃠c⃠o⃠d⃠",
+        "t⃠b⃠k⃠c⃠ c⃠o⃠d⃠u⃠ k⃠r⃠ m⃠s⃠g⃠ d⃠e⃠l⃠e⃠t⃠e⃠",
+        "o⃠i⃠ s⃠u⃠a⃠r⃠ k⃠e⃠ l⃠a⃠d⃠k⃠e⃠",
+        "t⃠m⃠k⃠c⃠ f⃠u⃠f⃠i⃠",
+        "t⃠e⃠r⃠y⃠ d⃠i⃠d⃠i⃠ c⃠h⃠u⃠d⃠i⃠",
+        "t⃠m⃠k⃠c⃠ d⃠i⃠k⃠h⃠a⃠",
+        "C⃠u⃠d⃠ a⃠b⃠",
+        "r⃠a⃠n⃠d⃠y⃠k⃠e⃠ c⃠u⃠d⃠",
+        "B⃠h⃠a⃠k⃠ c⃠u⃠d⃠",
+        "c⃠u⃠d⃠l⃠e⃠ t⃠b⃠k⃠c⃠ m⃠r⃠u⃠",
+        "t⃠m⃠k⃠l⃠ c⃠u⃠d⃠l⃠e⃠ g⃠r⃠i⃠b⃠",
+        "t⃠e⃠r⃠y⃠ b⃠e⃠h⃠e⃠n⃠ v⃠e⃠s⃠i⃠y⃠a⃠a⃠ r⃠n⃠d⃠i⃠",
+        "I⃠t⃠n⃠a⃠ g⃠n⃠d⃠a⃠ c⃠h⃠u⃠d⃠a⃠ t⃠u⃠ f⃠i⃠r⃠s⃠e⃠ n⃠e⃠t⃠ o⃠n⃠ o⃠f⃠f⃠",
+        "g⃠r⃠i⃠b⃠ k⃠e⃠ b⃠e⃠t⃠e⃠",
+        "B⃠h⃠a⃠g⃠ j⃠a⃠ l⃠o⃠d⃠e⃠ t⃠m⃠k⃠c⃠ m⃠a⃠r⃠u⃠ d⃠u⃠n⃠g⃠a⃠",
+        "t⃠b⃠k⃠c⃠ m⃠r⃠d⃠u⃠n⃠g⃠a⃠a⃠",
+        "b⃠h⃠a⃠g⃠ t⃠m⃠k⃠c⃠",
+        "b⃠h⃠a⃠g⃠ t⃠b⃠k⃠c⃠",
+        "t⃠b⃠k⃠c⃠ m⃠e⃠y⃠ c⃠p⃠",
+        "c⃠p⃠ t⃠b⃠k⃠c⃠ m⃠e⃠h⃠h⃠",
+        "c⃠p⃠ t⃠m⃠k⃠l⃠ m⃠e⃠h⃠",
+        "c⃠p⃠ b⃠o⃠l⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "A⃠b⃠e⃠ c⃠p⃠ b⃠o⃠l⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "d⃠o⃠u⃠b⃠l⃠e⃠ s⃠e⃠n⃠d⃠ k⃠o⃠ c⃠p⃠ t⃠m⃠k⃠c⃠ c⃠o⃠d⃠u⃠",
+        "t⃠b⃠k⃠c⃠ m⃠e⃠ c⃠p⃠ c⃠o⃠d⃠ d⃠u⃠n⃠g⃠a⃠ A⃠a⃠j⃠ m⃠e⃠h⃠h⃠",
+        "h⃠t⃠ t⃠b⃠k⃠c⃠ d⃠a⃠l⃠a⃠l⃠ k⃠e⃠ b⃠e⃠t⃠e⃠.",
+        "R⃠n⃠d⃠y⃠ j⃠l⃠d⃠i⃠ j⃠l⃠d⃠i⃠ c⃠u⃠d⃠q⃠ t⃠r⃠y⃠m⃠a⃠",
+        "P⃠a⃠r⃠a⃠ l⃠i⃠k⃠h⃠e⃠g⃠a⃠..",
+        "T⃠r⃠a⃠ r⃠n⃠d⃠h⃠b⃠h⃠a⃠k⃠",
+        "L⃠a⃠g⃠d⃠i⃠ k⃠e⃠ l⃠a⃠d⃠c⃠e⃠ c⃠p⃠ b⃠o⃠l⃠",
+        "c⃠p⃠ b⃠o⃠l⃠ l⃠a⃠g⃠d⃠i⃠ k⃠e⃠ b⃠e⃠t⃠e⃠..",
+        "c⃠u⃠d⃠k⃠e⃠ c⃠p⃠ b⃠o⃠l⃠",
+        "b⃠h⃠i⃠k⃠a⃠r⃠i⃠ l⃠u⃠n⃠d⃠ c⃠h⃠u⃠s⃠ m⃠e⃠r⃠a⃠.",
+        "L⃠o⃠w⃠ l⃠e⃠v⃠e⃠l⃠ c⃠p⃠ c⃠r⃠",
+        "c⃠p⃠ b⃠o⃠l⃠ l⃠o⃠w⃠ l⃠e⃠v⃠e⃠l⃠ w⃠e⃠a⃠k⃠",
+        "m⃠e⃠r⃠e⃠ l⃠u⃠n⃠d⃠ p⃠e⃠ e⃠y⃠ t⃠u⃠ h⃠i⃠j⃠d⃠e⃠",
+        "f⃠r⃠e⃠e⃠ c⃠u⃠d⃠w⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠",
+        "F⃠r⃠e⃠e⃠ m⃠e⃠y⃠ c⃠u⃠d⃠ t⃠u⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠"
+        "s⃠p⃠e⃠e⃠d⃠ n⃠y⃠ w⃠e⃠a⃠k⃠ t⃠a⃠t⃠t⃠e⃠ t⃠e⃠r⃠m⃠e⃠",
+        "k⃠i⃠t⃠n⃠i⃠ b⃠r⃠ c⃠u⃠d⃠w⃠a⃠y⃠e⃠g⃠a⃠ t⃠e⃠r⃠y⃠m⃠a⃠k⃠o⃠",
+        "l⃠u⃠n⃠d⃠ l⃠e⃠ r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ b⃠a⃠p⃠k⃠a⃠",
+        "l⃠u⃠n⃠ c⃠u⃠s⃠ j⃠a⃠l⃠d⃠i⃠ s⃠e⃠ r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ b⃠a⃠p⃠k⃠a⃠",
+        "k⃠o⃠i⃠ n⃠y⃠ d⃠e⃠k⃠h⃠ r⃠h⃠a⃠ c⃠u⃠d⃠l⃠e⃠ t⃠u⃠",
+        "c⃠u⃠d⃠l⃠e⃠ b⃠e⃠t⃠i⃠c⃠h⃠o⃠d⃠ a⃠c⃠h⃠e⃠ s⃠e⃠",
+        "m⃠a⃠k⃠i⃠ c⃠h⃠u⃠t⃠ t⃠e⃠r⃠y⃠ b⃠s⃠ y⃠e⃠h⃠i⃠ j⃠a⃠n⃠t⃠a⃠ m⃠e⃠y⃠",
+        "c⃠p⃠ b⃠o⃠l⃠e⃠g⃠a⃠ t⃠o⃠ t⃠m⃠k⃠c⃠",
+        "w⃠r⃠n⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠u⃠d⃠ j⃠a⃠y⃠e⃠g⃠i⃠",
+        "s⃠l⃠o⃠w⃠ e⃠y⃠ t⃠u⃠ k⃠i⃠d⃠",
+        "j⃠l⃠d⃠i⃠ l⃠i⃠k⃠h⃠..t⃠m⃠k⃠c⃠",
+        "j⃠l⃠d⃠i⃠ l⃠i⃠k⃠h⃠..r⃠a⃠n⃠d⃠c⃠e⃠ t⃠u⃠",
+        "t⃠y⃠m⃠ s⃠e⃠ p⃠h⃠l⃠e⃠ c⃠u⃠d⃠k⃠e⃠ d⃠i⃠k⃠h⃠a⃠",
+        "t⃠y⃠m⃠ h⃠o⃠g⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠u⃠d⃠w⃠a⃠",
+        "m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠ t⃠y⃠m⃠ s⃠e⃠ p⃠h⃠l⃠e⃠",
+        "u⃠t⃠h⃠ r⃠a⃠n⃠d⃠c⃠e⃠ k⃠e⃠ l⃠d⃠k⃠e⃠",
+        "m⃠a⃠c⃠a⃠b⃠o⃠s⃠d⃠a⃠t⃠e⃠r⃠y⃠",
+        "c⃠o⃠n⃠ k⃠b⃠ c⃠o⃠d⃠ d⃠i⃠a⃠ m⃠a⃠k⃠o⃠ t⃠e⃠r⃠y⃠",
+        "k⃠o⃠i⃠ h⃠o⃠g⃠a⃠ t⃠m⃠l⃠",
+        "m⃠a⃠c⃠h⃠a⃠r⃠ c⃠u⃠d⃠l⃠e⃠ t⃠u⃠",
+        "m⃠e⃠n⃠u⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠ c⃠o⃠d⃠n⃠a⃠ s⃠e⃠",
+        "t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠ b⃠o⃠l⃠ m⃠u⃠j⃠h⃠e⃠ c⃠o⃠d⃠ d⃠e⃠",
+        "b⃠s⃠ m⃠e⃠y⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ s⃠e⃠ c⃠u⃠d⃠n⃠a⃠ c⃠h⃠t⃠a⃠ h⃠u⃠",
+        "E⃠w⃠w⃠ m⃠a⃠k⃠a⃠ l⃠o⃠d⃠e⃠ u⃠t⃠h⃠",
+        "M⃠e⃠o⃠w⃠ c⃠r⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠ c⃠o⃠d⃠u⃠",
+        "l⃠u⃠n⃠d⃠ r⃠k⃠h⃠ d⃠i⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠e⃠ f⃠u⃠d⃠e⃠ p⃠e⃠",
+        "m⃠e⃠r⃠a⃠ l⃠u⃠n⃠d⃠ k⃠e⃠ b⃠a⃠l⃠ u⃠t⃠h⃠",
+        "k⃠i⃠d⃠e⃠e⃠ Z⃠i⃠n⃠d⃠a⃠ h⃠o⃠",
+        "m⃠a⃠r⃠ n⃠y⃠ k⃠i⃠d⃠d⃠e⃠ t⃠y⃠p⃠e⃠ k⃠r⃠",
+        "c⃠h⃠u⃠p⃠ b⃠k⃠l⃠",
+        "b⃠c⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠i⃠ c⃠h⃠u⃠t⃠",
+        "m⃠c⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ l⃠i⃠k⃠h⃠ f⃠a⃠s⃠t⃠",
+        "f⃠a⃠s⃠t⃠ l⃠i⃠k⃠h⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "f⃠a⃠s⃠t⃠ l⃠i⃠k⃠h⃠ k⃠a⃠m⃠z⃠o⃠r⃠"
+        "t⃠e⃠r⃠y⃠ m⃠a⃠k⃠i⃠ c⃠h⃠u⃠t⃠ c⃠l⃠a⃠i⃠m⃠ c⃠r⃠w⃠a⃠",
+        "a⃠w⃠z⃠ n⃠i⃠c⃠h⃠e⃠ r⃠a⃠n⃠d⃠c⃠e⃠ k⃠e⃠ b⃠c⃠h⃠e⃠",
+        "s⃠a⃠w⃠a⃠l⃠ n⃠y⃠ p⃠u⃠c⃠h⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠a⃠b⃠o⃠s⃠d⃠a⃠",
+        "f⃠y⃠t⃠e⃠r⃠ b⃠n⃠e⃠g⃠a⃠ l⃠a⃠g⃠d⃠e⃠ m⃠a⃠d⃠r⃠c⃠h⃠o⃠d⃠",
+        "o⃠y⃠e⃠ k⃠a⃠a⃠l⃠e⃠ r⃠o⃠ k⃠e⃠ d⃠i⃠k⃠h⃠a⃠",
+        "o⃠y⃠e⃠ k⃠a⃠a⃠l⃠e⃠ r⃠o⃠o⃠ n⃠y⃠",
+        "s⃠h⃠o⃠r⃠t⃠ n⃠y⃠ c⃠u⃠d⃠ t⃠u⃠ b⃠i⃠n⃠a⃠ r⃠u⃠k⃠e⃠",
+        "s⃠h⃠o⃠r⃠t⃠ n⃠y⃠ c⃠u⃠d⃠ t⃠u⃠ a⃠p⃠n⃠i⃠ m⃠a⃠k⃠o⃠ l⃠e⃠k⃠r⃠",
+        "t⃠e⃠r⃠y⃠ m⃠a⃠k⃠e⃠ s⃠t⃠h⃠ t⃠e⃠r⃠y⃠ b⃠h⃠e⃠n⃠ v⃠i⃠ c⃠u⃠d⃠w⃠a⃠ l⃠e⃠",
+        "t⃠e⃠r⃠y⃠ m⃠a⃠k⃠e⃠ s⃠t⃠h⃠ t⃠e⃠r⃠y⃠ d⃠i⃠d⃠i⃠ v⃠i⃠ c⃠u⃠d⃠ g⃠a⃠i⃠",
+        "C⃠h⃠a⃠t⃠ f⃠y⃠t⃠e⃠r⃠ b⃠n⃠e⃠g⃠a⃠ r⃠a⃠n⃠d⃠c⃠e⃠ c⃠o⃠d⃠u⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠",
+        "b⃠o⃠l⃠ r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ d⃠a⃠d⃠d⃠y⃠ e⃠y⃠",
+        "b⃠u⃠l⃠l⃠y⃠x⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ u⃠t⃠h⃠",
+        "m⃠a⃠r⃠ m⃠a⃠r⃠k⃠e⃠ c⃠u⃠d⃠ r⃠h⃠a⃠ t⃠u⃠",
+        "o⃠r⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ m⃠a⃠r⃠k⃠e⃠ c⃠u⃠d⃠ g⃠a⃠i⃠"
+        "J⃠a⃠l⃠d⃠i⃠ l⃠i⃠k⃠h⃠ r⃠n⃠d⃠y⃠k⃠e⃠ b⃠e⃠j⃠",
+        "O⃠r⃠ b⃠d⃠a⃠ l⃠i⃠k⃠h⃠ t⃠m⃠c⃠",
+        "O⃠r⃠ b⃠d⃠a⃠ 2⃠ l⃠i⃠n⃠e⃠ w⃠l⃠a⃠ l⃠i⃠k⃠h⃠ t⃠m⃠k⃠c⃠",
+        "O⃠r⃠ b⃠d⃠a⃠ o⃠y⃠e⃠ l⃠i⃠k⃠h⃠ t⃠m⃠l⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠ k⃠a⃠ b⃠u⃠r⃠",
+        "O⃠y⃠e⃠ k⃠e⃠e⃠d⃠e⃠",
+        "R⃠a⃠n⃠d⃠i⃠ k⃠e⃠ l⃠a⃠d⃠k⃠e⃠",
+        "J⃠a⃠l⃠d⃠i⃠ l⃠i⃠k⃠h⃠ t⃠e⃠r⃠i⃠ b⃠e⃠h⃠e⃠n⃠ c⃠h⃠o⃠d⃠u⃠",
+        "M⃠k⃠l⃠ u⃠t⃠h⃠ r⃠a⃠n⃠d⃠i⃠ k⃠e⃠ b⃠a⃠c⃠c⃠h⃠e⃠",
+        "T⃠e⃠r⃠i⃠ n⃠a⃠n⃠i⃠ m⃠e⃠r⃠i⃠ m⃠a⃠a⃠l⃠",
+        "T⃠e⃠j⃠ l⃠i⃠k⃠h⃠ r⃠a⃠n⃠d⃠c⃠e⃠",
+        "O⃠y⃠e⃠ m⃠a⃠a⃠k⃠e⃠ l⃠o⃠d⃠e⃠ m⃠r⃠e⃠n⃠g⃠a⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠o⃠d⃠y⃠",
+        "T⃠e⃠r⃠i⃠ M⃠a⃠i⃠y⃠a⃠ k⃠i⃠ g⃠a⃠n⃠d⃠",
+        "T⃠e⃠r⃠y⃠ d⃠a⃠d⃠i⃠ k⃠a⃠ f⃠u⃠d⃠d⃠a⃠",
+        "M⃠k⃠l⃠ u⃠t⃠h⃠ b⃠e⃠h⃠e⃠n⃠c⃠o⃠d⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠ k⃠i⃠ b⃠u⃠r⃠ d⃠e⃠",
+        "T⃠e⃠r⃠y⃠ m⃠a⃠a⃠ k⃠a⃠ f⃠u⃠d⃠d⃠a⃠ m⃠e⃠ l⃠a⃠u⃠d⃠a⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠v⃠a⃠",
+        "R⃠a⃠n⃠d⃠i⃠ k⃠e⃠ b⃠e⃠t⃠e⃠ m⃠a⃠r⃠ g⃠a⃠y⃠a⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠ k⃠i⃠ c⃠h⃠u⃠t⃠ m⃠r⃠u⃠",
+        "J⃠a⃠l⃠i⃠d⃠ k⃠r⃠ s⃠p⃠a⃠m⃠",
+        "M⃠c⃠ s⃠p⃠a⃠m⃠ r⃠o⃠k⃠e⃠n⃠g⃠a⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠k⃠i⃠ c⃠h⃠u⃠t⃠ s⃠p⃠a⃠m⃠ k⃠r⃠",
+        "s⃠p⃠a⃠m⃠ k⃠r⃠.⃠m⃠a⃠a⃠k⃠e⃠ l⃠o⃠d⃠e⃠",
+        "R⃠a⃠n⃠d⃠y⃠k⃠e⃠ c⃠h⃠o⃠d⃠e⃠ s⃠p⃠a⃠m⃠ k⃠r⃠ w⃠r⃠n⃠a⃠ c⃠u⃠d⃠ t⃠u⃠",
+        "S⃠p⃠a⃠m⃠ k⃠r⃠ k⃠i⃠d⃠",
+        "N⃠o⃠o⃠b⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠o⃠d⃠u⃠",
+        "R⃠n⃠d⃠y⃠k⃠e⃠ b⃠e⃠t⃠e⃠ m⃠a⃠r⃠ m⃠a⃠t⃠ t⃠u⃠",
+        "N⃠o⃠o⃠b⃠ j⃠a⃠l⃠d⃠i⃠ l⃠i⃠k⃠h⃠ w⃠r⃠n⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠",
+        "c⃠u⃠d⃠ g⃠a⃠i⃠ m⃠a⃠a⃠ t⃠e⃠r⃠y⃠ n⃠o⃠o⃠b⃠",
+        "u⃠t⃠h⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ n⃠o⃠o⃠b⃠",
+        "c⃠h⃠l⃠ c⃠u⃠d⃠k⃠e⃠ d⃠i⃠k⃠h⃠a⃠ n⃠o⃠o⃠b⃠",
+        "j⃠l⃠d⃠i⃠ t⃠y⃠p⃠ c⃠r⃠ n⃠o⃠o⃠b⃠ h⃠a⃠l⃠k⃠e⃠",
+        "c⃠u⃠d⃠ k⃠e⃠ p⃠g⃠l⃠ n⃠y⃠ h⃠o⃠ n⃠o⃠o⃠b⃠",
+        "c⃠u⃠d⃠ c⃠u⃠d⃠ k⃠e⃠ r⃠a⃠n⃠d⃠ b⃠n⃠j⃠a⃠ t⃠u⃠ n⃠o⃠o⃠b⃠",
+        "m⃠a⃠k⃠i⃠c⃠h⃠u⃠t⃠ t⃠e⃠r⃠y⃠ n⃠o⃠o⃠b⃠",
+        "g⃠a⃠n⃠d⃠a⃠ c⃠y⃠u⃠ c⃠u⃠d⃠ r⃠h⃠a⃠ t⃠u⃠ ?",
+        "i⃠t⃠n⃠a⃠ g⃠n⃠d⃠a⃠ n⃠y⃠ c⃠u⃠d⃠ a⃠c⃠h⃠e⃠ s⃠e⃠ c⃠u⃠d⃠",
+        "M⃠a⃠a⃠n⃠ l⃠e⃠ c⃠u⃠d⃠ g⃠y⃠a⃠ t⃠u⃠ s⃠u⃠n⃠ b⃠a⃠t⃠ a⃠b⃠",
+        "m⃠a⃠k⃠a⃠f⃠u⃠d⃠d⃠a⃠ f⃠a⃠t⃠ g⃠y⃠a⃠ t⃠e⃠r⃠y⃠ r⃠u⃠k⃠",
+    ]
+            br_texts = [
+                "ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝒷ᕗᕙ𝓃ᕗᕙ𝒶ᕗᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝑒ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒯ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓏ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓎ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝒹ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒯ᕗᕙ𝓊ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙℳᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝒶ᕗ ᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓎ᕗᕙ𝓂ᕗᕙ𝓅ᕗᕙ𝒶ᕗᕙ𝓈ᕗᕙ𝓈ᕗ",
+        "ᕙ𝒪ᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙ𝓊ᕗᕙ𝓃ᕗᕙ𝒻ᕗᕙ𝓊ᕗᕙ𝓃ᕗᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓈ᕗᕙ𝓌ᕗᕙ𝒾ᕗᕙ𝓅ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝓉ᕗᕙ𝓉ᕗ ᕙ𝓀ᕗᕙ𝓇ᕗ",
+        "ᕙ𝒪ᕗᕙ𝒽ᕗ ᕙ𝒽ᕗᕙ𝑒ᕗᕙ𝓁ᕗᕙ𝓁ᕗᕙ𝑜ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝑜ᕗᕙ𝓇ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓋ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝒶ᕗᕙ𝓊ᕗᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓉ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝓇ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝓇ᕗ.",
+        "ᕙ𝒪ᕗᕙ𝓎ᕗᕙ𝓎ᕗ ᕙ𝓀ᕗᕙ𝒾ᕗᕙ𝓃ᕗᕙ𝓃ᕗᕙ𝑒ᕗᕙ𝓇ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙℊᕗᕙ𝒸ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝑒ᕗ ᕙ𝓀ᕗᕙ𝒾ᕗ ᕙ𝓅ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓂ᕗᕙ𝒾ᕗᕙ𝓈ᕗᕙ𝓈ᕗᕙ𝒾ᕗᕙ𝑜ᕗᕙ𝓃ᕗ ᕙ𝓀ᕗᕙ𝒾ᕗᕙ𝓈ᕗᕙ𝓃ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝒾ᕗ.",
+        "ᕙ𝒞ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝒶ᕗ",
+        "ᕙ𝒞ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝑒ᕗᕙ𝓀ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓇ᕗ.",
+        "ᕙ𝒮ᕗᕙ𝓊ᕗᕙ𝓃ᕗ ᕙ𝒮ᕗᕙ𝓊ᕗᕙ𝓃ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝒶ᕗ.",
+        "ᕙ𝒯ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒸ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝓈ᕗᕙ𝒹ᕗᕙ𝒶ᕗ.",
+        "ᕙ𝒪ᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝓉ᕗᕙ𝒾ᕗ ᕙ𝒿ᕗᕙ𝒶ᕗᕙ𝓉ᕗᕙ𝒾ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓇ᕗ.",
+        "ᕙ𝒦ᕗᕙ𝓎ᕗ? ᕙ𝒿ᕗᕙ𝓁ᕗᕙ𝒹ᕗᕙ𝒾ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒽ᕗ ᕙ𝓀ᕗᕙ𝒾ᕗᕙ𝒹ᕗᕙ𝒹ᕗᕙ𝑒ᕗ.",
+        "ᕙℬᕗᕙ𝒾ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝒸ᕗᕙ𝑜ᕗᕙ𝓂ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙℊᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝓀ᕗᕙ𝑜ᕗ ᕙ𝓉ᕗᕙ𝒶ᕗᕙℊᕗ ᕙ𝒸ᕗᕙ𝓇ᕗᕙ𝑒ᕗᕙℊᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ",
+        "ᕙℳᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓀ᕗᕙ𝒸ᕗ ᕙ𝒷ᕗᕙ𝓈ᕗ",
+        "ᕙ𝒥ᕗᕙ𝒶ᕗᕙ𝓁ᕗᕙ𝒹ᕗᕙ𝒾ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓏ᕗ ᕙ𝓅ᕗᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓁ᕗ",
+        "ᕙ𝒮ᕗᕙ𝒾ᕗᕙ𝒹ᕗᕙ𝑒ᕗ ᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝒿ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝒶ᕗᕙ𝒷ᕗ",
+        "ᕙℋᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙℊᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓉ᕗ ᕙ𝒶ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ",
+        "ᕙ𝒷ᕗᕙ𝒽ᕗᕙℊᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝒶ᕗᕙ𝒿ᕗᕙ𝒿ᕗ",
+        "ᕙℋᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒷ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙℊᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓉ᕗ",
+        "ᕙℋᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝓊ᕗᕙ𝓇ᕗ ᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓉ᕗᕙ𝓉ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒹ᕗᕙ𝒽ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝒹ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓀ᕗᕙ𝑜ᕗᕙ𝒾ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝓉ᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝑒ᕗᕙ𝓈ᕗᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒻ᕗ ᕙ𝒸ᕗᕙ𝓇ᕗ ᕙ𝓇ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝒽ᕗᕙ𝓊ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓀ᕗᕙ𝑜ᕗᕙ𝒾ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓉ᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒻ᕗᕙ𝒾ᕗ ᕙ𝒹ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝓊ᕗᕙ𝓃ᕗᕙℊᕗᕙ𝒶ᕗ",
+        "ᕙ𝒜ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ??ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒻ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒾ᕗᕙ𝓁ᕗ ᕙ𝒿ᕗᕙ𝒶ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙℊᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓉ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝓌ᕗᕙ𝒾ᕗᕙ𝓅ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓇ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒜ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓈ᕗᕙ𝓌ᕗᕙ𝒾ᕗᕙ𝓅ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓇ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙℱᕗᕙ𝓇ᕗ ᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓁ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒾ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝓈ᕗᕙ𝓌ᕗᕙ𝒾ᕗᕙ𝓅ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓇ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒞ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓅ᕗᕙ𝓇ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ",
+        "ᕙ𝓂ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙ𝓉ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓂ᕗᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝓉ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓁ᕗᕙ𝑜ᕗᕙ𝒹ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓊ᕗᕙ𝓉ᕗᕙ𝓇ᕗ ᕙ𝓂ᕗᕙ𝒸ᕗ",
+        "ᕙ𝓁ᕗᕙ𝓊ᕗᕙ𝓃ᕗ ᕙ𝓂ᕗᕙ𝓉ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓈ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒶ᕗ",
+        "ᕙ𝓃ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓁ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒹ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝑜ᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝓈ᕗᕙ𝒽ᕗᕙ𝓉ᕗᕙ𝒾ᕗ ᕙ𝓀ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓀ᕗᕙ𝒾ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓉ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ",
+        "ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗ ᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓉ᕗᕙ𝒽ᕗ ᕙ𝓉ᕗᕙ𝑜ᕗᕙ𝒹ᕗᕙ𝒽ᕗ ᕙ𝓀ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝑒ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝓀ᕗ ᕙ𝓂ᕗᕙ𝓊ᕗᕙ𝒽ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝒻ᕗᕙ𝒶ᕗᕙ𝓈ᕗᕙ𝒶ᕗᕙ𝒹ᕗᕙ𝓊ᕗᕙ𝓃ᕗᕙℊᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝒶ᕗᕙ𝓋ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙ𝒶ᕗᕙ𝓈ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗ ᕙ𝓃ᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝒶ᕗᕙ??ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗᕙ𝓀ᕗᕙ𝑜ᕗ",
+        "ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝒶ᕗᕙ𝓋ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒾ᕗᕙ𝒹ᕗᕙ𝑒ᕗᕙ𝓇ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝒶ᕗᕙ𝓋ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝒿ᕗᕙ𝓁ᕗᕙ𝒹ᕗᕙ𝒾ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓌ᕗᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝒶ᕗᕙ𝓋ᕗᕙ𝑒ᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗᕙℊᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝒮ᕗᕙ𝓂ᕗᕙ𝒿ᕗᕙ𝒽ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝓉ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝒶ᕗᕙ𝓋ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒻ᕗᕙ𝒶ᕗᕙ𝓈ᕗᕙ𝓉ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝒶ᕗᕙ𝓋ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓂ᕗᕙ𝒿ᕗᕙ𝑜ᕗᕙ𝓇ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓉ᕗᕙ𝓊ᕗᕙ𝓉ᕗᕙ𝑜ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓎ᕗ ᕙ𝒽ᕗᕙ𝒾ᕗᕙ𝒿ᕗᕙ𝒹ᕗᕙ𝑒ᕗ ᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓂ᕗᕙ𝓏ᕗᕙ𝑜ᕗᕙ𝓇ᕗ",
+        "ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓀ᕗᕙ𝑜ᕗ ᕙ𝒾ᕗᕙ𝓁ᕗᕙ𝓎ᕗ ᕙ𝓇ᕗᕙ𝑒ᕗᕙ𝓎ᕗ 🌚😂",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓀ᕗᕙ𝒸ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ",
+        "ᕙ𝓈ᕗᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓅ᕗ",
+        "ᕙ𝒻ᕗᕙ𝓇ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ??ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓅ᕗ",
+        "ᕙ𝓈ᕗᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒽ᕗ ᕙ𝓌ᕗᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝓊ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓅ᕗ",
+        "ᕙ𝓅ᕗᕙ𝓇ᕗᕙ𝑜ᕗᕙ𝑜ᕗᕙ𝒻ᕗ ᕙ𝒸ᕗᕙ𝓇ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓅ᕗᕙ𝓇ᕗᕙ𝑜ᕗᕙ𝑜ᕗᕙ𝒻ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓅ᕗᕙ𝓇ᕗᕙ𝑜ᕗᕙ𝑜ᕗᕙ𝒻ᕗ ᕙ𝒽ᕗᕙ𝑜ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓀ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒾ᕗᕙ𝓁ᕗᕙ𝓁ᕗᕙ𝒶ᕗᕙ𝓇ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗ ᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓈ᕗᕙ𝒹ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ??ᕗᕙ𝓎ᕗ ᕙ𝒽ᕗᕙ𝒾ᕗᕙ𝒿ᕗᕙ𝒹ᕗᕙ𝑒ᕗ ᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓂ᕗᕙ𝓏ᕗᕙ𝑜ᕗᕙ𝓇ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒹ᕗᕙ𝓇ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝒹ᕗ ?",
+        "ᕙ𝒶ᕗᕙ𝒷ᕗ ᕙ𝓉ᕗᕙ𝓀ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒾ᕗ ᕙ𝒽ᕗᕙ𝑜ᕗᕙℊᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ?",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝓀ᕗᕙ𝓊ᕗᕙ𝒸ᕗᕙ𝒽ᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝒿ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝓉ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝓈ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ",
+        "ᕙ𝒮ᕗᕙ𝒷ᕗᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙ𝒽ᕗᕙ𝑒ᕗᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝑜ᕗ ᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓁ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓂ᕗ ᕙ𝓀ᕗᕙ𝓇ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓎ᕗᕙ𝒶ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝒸ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙ𝒾ᕗᕙ𝓁ᕗᕙ𝓁ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓈ᕗᕙ𝒹ᕗᕙ𝒶ᕗ",
+        "ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑜ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝑒ᕗᕙ𝓃ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝑒ᕗᕙℊᕗᕙ𝒾ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝑜ᕗᕙ𝓂ᕗᕙ𝓂ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓃ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓁ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒹ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝓎ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒸ᕗᕙ𝑜ᕗᕙ𝓏ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗ ᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓉ᕗᕙ𝑜ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓁ᕗ ᕙ𝓂ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒽ᕗᕙ𝑜ᕗᕙℊᕗᕙ𝒾ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝒾ᕗ ᕙ𝒿ᕗᕙ𝑜ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗᕙ𝓉ᕗᕙ𝒾ᕗ ᕙ𝒿ᕗᕙ𝑜ᕗᕙℊᕗᕙ𝒾ᕗ",
+        "ᕙ𝓉ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝒶ᕗᕙ𝓂ᕗᕙ𝓂ᕗᕙ𝒾ᕗ ᕙ𝒸ᕗᕙ𝑒ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝓈ᕗᕙ𝒹ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝑒ᕗᕙ𝓂ᕗᕙ𝑜ᕗᕙ𝒿ᕗᕙ𝒾ᕗ ᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓁ᕗ ᕙ𝓂ᕗᕙ𝒸ᕗ",
+        "ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ? ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓂ᕗᕙ𝓇ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ?",
+        "ᕙ𝓉ᕗᕙ𝓂ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝒽ᕗᕙ𝑜ᕗᕙℊᕗᕙ𝒾ᕗ ᕙ𝒻ᕗᕙ𝓇ᕗᕙ𝓇ᕗᕙ𝓉ᕗᕙ𝑜ᕗ",
+        "ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ? ᕙ𝓀ᕗᕙ𝒷ᕗ ? ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓀ᕗᕙ𝑒ᕗᕙ𝓀ᕗ",
+        "ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓈ᕗᕙ𝒸ᕗᕙ𝒽ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗᕙ𝓃ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ",
+        "ᕙ𝒾ᕗᕙ𝓉ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓈ᕗᕙ𝒸ᕗᕙ𝒽ᕗ ᕙ𝓃ᕗᕙ??ᕗ ᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓁ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓈ᕗᕙ𝒸ᕗᕙ𝒽ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝓉ᕗᕙ𝒽ᕗ",
+        "ᕙ𝓂ᕗᕙ𝓉ᕗᕙ𝓁ᕗᕙ𝒷ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓇ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓉ᕗᕙ𝑜ᕗ",
+        "ᕙ𝓅ᕗᕙ𝓊ᕗᕙ𝓇ᕗᕙ𝒶ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒽ᕗ ᕙ𝓂ᕗᕙ𝒸ᕗ",
+        "ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓇ᕗ ᕙ𝒻ᕗᕙ𝓇ᕗᕙ𝓇ᕗᕙ𝓉ᕗᕙ𝑜ᕗ",
+        "ᕙ𝑜ᕗᕙ𝒽ᕗ ᕙ𝑜ᕗᕙ𝓀ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝒻ᕗᕙ𝒾ᕗᕙ𝓇ᕗ",
+        "ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒶ᕗ ᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒹ᕗ",
+        "ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ? ᕙ𝒶ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙ𝑒ᕗᕙ𝒽ᕗᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝑒ᕗᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓉ᕗᕙ𝑜ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝒹ᕗᕙ𝓃ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝓋ᕗᕙ𝓎ᕗᕙ𝒶ᕗᕙ𝓈ᕗᕙ𝓉ᕗ ᕙ𝒽ᕗᕙ𝓊ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓉ᕗᕙ𝑜ᕗ ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝓊ᕗᕙ𝒸ᕗᕙ𝒽ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ? ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒶ᕗ ?",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓂ᕗᕙ𝓉ᕗ ᕙ𝒽ᕗᕙ𝓈ᕗᕙ𝓈ᕗ",
+        "ᕙ𝓎ᕗᕙ𝓊ᕗᕙ𝓇ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝑜ᕗᕙ𝓂ᕗ",
+        "ᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝒷ᕗᕙ𝓀ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝒾ᕗ ᕙ𝑜ᕗᕙ𝓇ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗ",
+        "ᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝑒ᕗ ᕙ𝒾ᕗᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓇ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝑒ᕗᕙ𝓀ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓇ᕗ",
+        "ᕙ𝓉ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓇ᕗᕙ𝒽ᕗ",
+        "ᕙ𝑒ᕗᕙ𝓀ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝓃ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓇ᕗ",
+        "ᕙ𝒬ᕗ",
+        "ᕙ𝑜ᕗᕙ𝒸ᕗᕙ𝓎ᕗ ᕙ𝒶ᕗᕙ𝒷ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓁ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓅ᕗᕙ𝑒ᕗᕙ𝒽ᕗᕙ𝑒ᕗᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝒹ᕗᕙ𝓊ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓉ᕗᕙ𝑜ᕗ",
+        "ᕙ𝓆ᕗ ?",
+        "ᕙ𝒽ᕗᕙ𝓎ᕗᕙ𝓎ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒶ᕗ ᕙ𝑒ᕗᕙ𝓀ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓇ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝓊ᕗᕙ𝓃ᕗ ᕙ𝒹ᕗᕙ𝑜ᕗᕙ𝓈ᕗᕙ𝓉ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓇ᕗ",
+        "ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙℊᕗ ᕙ𝒿ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝒻ᕗ ᕙ𝒸ᕗᕙ𝓇ᕗᕙ𝓇ᕗ ᕙ𝒹ᕗᕙ𝓊ᕗᕙ𝓃ᕗᕙℊᕗᕙ𝒶ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝒾ᕗ ᕙ𝒾ᕗᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓇ᕗ ᕙ𝒶ᕗᕙ𝒶ᕗ",
+        "ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓇ᕗ ᕙ𝒻ᕗᕙ𝓇ᕗᕙ𝓇ᕗᕙ𝓉ᕗᕙ𝑜ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙ𝑒ᕗ ᕙ𝒾ᕗᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓇ᕗ ᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓂ᕗᕙ𝓇ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓉ᕗᕙ𝑜ᕗ ᕙ𝒶ᕗᕙ𝑒ᕗᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙ𝑒ᕗ ᕙ𝒽ᕗᕙ𝓎ᕗᕙ𝓎ᕗ ᕙ𝒶ᕗᕙ𝒾ᕗᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝓃ᕗᕙ𝒶ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓇ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒶ᕗ ᕙ𝑜ᕗᕙ𝓇ᕗ",
+        "ᕙ𝒽ᕗᕙ𝓎ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝑜ᕗ ᕙ𝓃ᕗᕙ𝒶ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝑜ᕗ ᕙ𝓂ᕗᕙ𝓉ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙℊᕗ ᕙ𝒿ᕗᕙ𝒶ᕗᕙ𝑜ᕗ",
+        "ᕙ𝒷ᕗᕙ𝓎ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙ𝑒ᕗ ᕙ𝒽ᕗᕙ𝓎ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ?",
+        "ᕙ𝒬ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝒬ᕗ ᕙ𝓇ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝒽ᕗᕙ𝑜ᕗ ?",
+        "ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒸ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓂ᕗᕙ𝓉ᕗ",
+    ]
+            br2_texts = [
+                "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰⋰🇮​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇦​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇸​⋰⋰🇪​⋰⋰🇼​⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰⋰🇰​⋰⋰🇪​⋰⋰🇧​⋰⋰🇦​⋰⋰🇨​⋰⋰🇭​⋰⋰🇪​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇮​⋰⋰🇸​⋰⋰🇸​⋰⋰🇦​⋰⋰🇬​⋰⋰🇦​⋰",
+    "⋰🇦​⋰⋰🇦​⋰⋰🇯​⋰ ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇹​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇭​⋰⋰🇦​⋰⋰🇮​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇩​⋰⋰🇷​⋰⋰🇨​⋰⋰🇭​⋰⋰🇴​⋰⋰🇩​⋰, ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇹​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇪​⋰⋰🇳​⋰ ⋰🇰​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇹​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰",
+    "⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇯​⋰⋰🇦​⋰, ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇩​⋰⋰🇮​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰",
+    "⋰🇸​⋰⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰, ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇮​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇮​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇸​⋰⋰🇰​⋰⋰🇹​⋰⋰🇦​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇰​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰, ⋰🇹​⋰⋰🇲​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰",
+    "⋰🇸​⋰⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰ ⋰🇫​⋰⋰🇮​⋰⋰🇷​⋰⋰🇸​⋰⋰🇪​⋰, ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇹​⋰",
+    "⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇬​⋰⋰🇷​⋰⋰🇮​⋰⋰🇧​⋰, ⋰🇹​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇲​⋰⋰🇦​⋰ ⋰🇩​⋰⋰🇴​⋰⋰🇺​⋰",
+    "⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰, ⋰🇳​⋰⋰🇪​⋰⋰🇹​⋰ ⋰🇴​⋰⋰🇳​⋰ ⋰🇴​⋰⋰🇫​⋰⋰🇫​⋰ ⋰🇼​⋰⋰🇦​⋰⋰🇱​⋰⋰🇮​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰",
+    "⋰🇴​⋰⋰🇾​⋰⋰🇪​⋰ ⋰🇹​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇲​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰, ⋰🇮​⋰⋰🇩​⋰⋰🇭​⋰⋰🇦​⋰⋰🇷​⋰ ⋰🇦​⋰⋰🇦​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰",
+    "⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇷​⋰⋰🇩​⋰⋰🇺​⋰, ⋰🇴​⋰⋰🇮​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇦​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇴​⋰⋰🇩​⋰⋰🇪​⋰⋰🇪​⋰",
+    "⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇪​⋰⋰🇯​⋰, ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰",
+    "⋰🇸​⋰⋰🇺​⋰⋰🇦​⋰⋰🇷​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇪​⋰⋰🇯​⋰, ⋰🇳​⋰⋰🇪​⋰⋰🇹​⋰ ⋰🇴​⋰⋰🇫​⋰⋰🇫​⋰ ⋰🇴​⋰⋰🇳​⋰ ⋰🇰​⋰⋰🇷​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇦​⋰⋰🇩​⋰⋰🇰​⋰⋰🇪​⋰",
+    "⋰🇹​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇲​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇪​⋰⋰🇸​⋰⋰🇪​⋰, ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇵​⋰ ⋰🇸​⋰⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇩​⋰⋰🇭​⋰⋰🇦​⋰⋰🇷​⋰⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰",
+    "⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇷​⋰ ⋰🇲​⋰⋰🇸​⋰⋰🇬​⋰ ⋰🇩​⋰⋰🇪​⋰⋰🇱​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰, ⋰🇴​⋰⋰🇮​⋰ ⋰🇸​⋰⋰🇺​⋰⋰🇦​⋰⋰🇷​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇦​⋰⋰🇩​⋰⋰🇰​⋰⋰🇪​⋰",
+    "⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇫​⋰⋰🇺​⋰⋰🇫​⋰⋰🇮​⋰, ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇩​⋰⋰🇮​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰⋰🇮​⋰",
+    "⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇩​⋰⋰🇮​⋰⋰🇰​⋰⋰🇭​⋰⋰🇦​⋰, ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇦​⋰⋰🇧​⋰",
+    "⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰, ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇰​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰",
+    "⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇱​⋰⋰🇪​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇷​⋰⋰🇺​⋰, ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇱​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇱​⋰⋰🇪​⋰ ⋰🇬​⋰⋰🇷​⋰⋰🇮​⋰⋰🇧​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇭​⋰⋰🇪​⋰⋰🇳​⋰ ⋰🇻​⋰⋰🇪​⋰⋰🇸​⋰⋰🇮​⋰⋰🇾​⋰⋰🇦​⋰⋰🇦​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰, ⋰🇮​⋰⋰🇹​⋰⋰🇳​⋰⋰🇦​⋰ ⋰🇬​⋰⋰🇳​⋰⋰🇩​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰⋰🇦​⋰ ⋰🇹​⋰⋰🇺​⋰ ⋰🇫​⋰⋰🇮​⋰⋰🇷​⋰⋰🇸​⋰⋰🇪​⋰ ⋰🇳​⋰⋰🇪​⋰⋰🇹​⋰ ⋰🇴​⋰⋰🇳​⋰ ⋰🇴​⋰⋰🇫​⋰⋰🇫​⋰",
+    "⋰🇬​⋰⋰🇷​⋰⋰🇮​⋰⋰🇧​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰, ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇯​⋰⋰🇦​⋰ ⋰🇱​⋰⋰🇴​⋰⋰🇩​⋰⋰🇪​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇷​⋰⋰🇺​⋰ ⋰🇩​⋰⋰🇺​⋰⋰??​⋰⋰🇬​⋰⋰🇦​⋰",
+    "⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇷​⋰⋰🇩​⋰⋰🇺​⋰⋰🇳​⋰⋰🇬​⋰⋰🇦​⋰⋰🇦​⋰, ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰, ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇾​⋰ ⋰🇨​⋰⋰🇵​⋰",
+    "⋰🇨​⋰⋰🇵​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇭​⋰⋰🇭​⋰, ⋰🇨​⋰⋰🇵​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇱​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇭​⋰",
+    "⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰, ⋰🇦​⋰⋰🇧​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰",
+    "⋰🇩​⋰⋰🇴​⋰⋰🇺​⋰⋰🇧​⋰⋰🇱​⋰⋰🇪​⋰ ⋰🇸​⋰⋰🇪​⋰⋰🇳​⋰⋰🇩​⋰ ⋰🇰​⋰⋰🇴​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰, ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰ ⋰🇩​⋰⋰🇺​⋰⋰🇳​⋰⋰🇬​⋰⋰🇦​⋰ ⋰🇦​⋰⋰🇦​⋰⋰🇯​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇭​⋰⋰🇭​⋰",
+    "⋰🇭​⋰⋰🇹​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇩​⋰⋰🇦​⋰⋰🇱​⋰⋰🇦​⋰⋰🇱​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰., ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰ ⋰🇯​⋰⋰🇱​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇯​⋰⋰🇱​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇶​⋰ ⋰🇹​⋰⋰??​⋰⋰🇾​⋰⋰🇲​⋰⋰🇦​⋰",
+    "⋰🇵​⋰⋰🇦​⋰⋰🇷​⋰⋰🇦​⋰ ⋰🇱​⋰⋰🇮​⋰⋰🇰​⋰⋰🇭​⋰⋰🇪​⋰⋰🇬​⋰⋰🇦​⋰.., ⋰🇹​⋰⋰🇷​⋰⋰🇦​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇭​⋰⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇰​⋰",
+    "⋰🇱​⋰⋰🇦​⋰⋰🇬​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇦​⋰⋰🇩​⋰⋰🇨​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰, ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇱​⋰⋰🇦​⋰⋰🇬​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰..",
+    "⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰, ⋰🇧​⋰⋰🇭​⋰⋰🇮​⋰⋰🇰​⋰⋰🇦​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇱​⋰⋰🇺​⋰⋰🇳​⋰⋰🇩​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇸​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇷​⋰⋰🇦​⋰.",
+    "⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰ ⋰🇱​⋰⋰🇪​⋰⋰🇻​⋰⋰🇪​⋰⋰🇱​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇨​⋰⋰🇷​⋰, ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰ ⋰🇱​⋰⋰🇪​⋰⋰🇻​⋰⋰🇪​⋰⋰🇱​⋰ ⋰🇼​⋰⋰🇪​⋰⋰🇦​⋰⋰🇰​⋰",
+    "⋰🇲​⋰⋰🇪​⋰⋰🇷​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇺​⋰⋰🇳​⋰⋰🇩​⋰ ⋰🇵​⋰⋰🇪​⋰ ⋰🇪​⋰⋰🇾​⋰ ⋰🇹​⋰⋰🇺​⋰ ⋰🇭​⋰⋰🇮​⋰⋰🇯​⋰⋰🇩​⋰⋰🇪​⋰, ⋰🇫​⋰⋰🇷​⋰⋰🇪​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇼​⋰⋰🇦​⋰ ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇴​⋰",
+    "⋰🇫​⋰⋰🇷​⋰⋰🇪​⋰⋰🇪​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇾​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇹​⋰⋰🇺​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇭​⋰⋰🇦​⋰⋰🇮​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇹​⋰ ⋰🇨​⋰⋰🇱​⋰⋰🇦​⋰⋰🇮​⋰⋰🇲​⋰ ⋰🇨​⋰⋰🇷​⋰⋰🇼​⋰⋰🇦​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇮​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇸​⋰⋰🇰​⋰⋰🇹​⋰⋰🇦​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇪​⋰⋰🇳​⋰ ⋰🇻​⋰⋰🇪​⋰⋰🇸​⋰⋰🇮​⋰⋰🇾​⋰⋰🇦​⋰⋰🇦​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇯​⋰⋰🇦​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇩​⋰⋰🇮​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰⋰🇮​⋰, ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇩​⋰⋰🇮​⋰⋰🇰​⋰⋰🇭​⋰⋰🇦​⋰",
+    "⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇦​⋰⋰🇧​⋰, ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇰​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰, ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇱​⋰⋰🇪​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇷​⋰⋰🇺​⋰",
+    "⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇱​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇱​⋰⋰🇪​⋰ ⋰🇬​⋰⋰🇷​⋰⋰??​⋰⋰🇧​⋰, ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇭​⋰⋰🇪​⋰⋰🇳​⋰ ⋰🇻​⋰⋰🇪​⋰⋰🇸​⋰⋰🇮​⋰⋰🇾​⋰⋰🇦​⋰⋰🇦​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰",
+    "⋰🇮​⋰⋰🇹​⋰⋰🇳​⋰⋰🇦​⋰ ⋰🇬​⋰⋰🇳​⋰⋰🇩​⋰⋰??​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰⋰🇦​⋰ ⋰🇹​⋰⋰🇺​⋰ ⋰🇫​⋰⋰🇮​⋰⋰🇷​⋰⋰🇸​⋰⋰🇪​⋰ ⋰🇳​⋰⋰🇪​⋰⋰🇹​⋰ ⋰🇴​⋰⋰🇳​⋰ ⋰🇴​⋰⋰🇫​⋰⋰🇫​⋰, ⋰🇬​⋰⋰🇷​⋰⋰🇮​⋰⋰🇧​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇯​⋰⋰🇦​⋰ ⋰🇱​⋰⋰🇴​⋰⋰🇩​⋰⋰🇪​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇷​⋰⋰🇺​⋰ ⋰🇩​⋰⋰🇺​⋰⋰🇳​⋰⋰🇬​⋰⋰🇦​⋰, ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇷​⋰⋰🇩​⋰⋰🇺​⋰⋰🇳​⋰⋰🇬​⋰⋰🇦​⋰⋰🇦​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰, ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰",
+    "⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇾​⋰ ⋰🇨​⋰⋰🇵​⋰, ⋰🇨​⋰⋰🇵​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇭​⋰⋰🇭​⋰",
+    "⋰🇨​⋰⋰🇵​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇱​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇭​⋰, ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰",
+    "⋰🇦​⋰⋰🇧​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰, ⋰🇩​⋰⋰🇴​⋰⋰🇺​⋰⋰🇧​⋰⋰🇱​⋰⋰🇪​⋰ ⋰🇸​⋰⋰🇪​⋰⋰🇳​⋰⋰🇩​⋰ ⋰🇰​⋰⋰🇴​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰",
+    "⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰ ⋰🇩​⋰⋰🇺​⋰⋰🇳​⋰⋰🇬​⋰⋰🇦​⋰ ⋰🇦​⋰⋰🇦​⋰⋰🇯​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇭​⋰⋰🇭​⋰, ⋰🇭​⋰⋰🇹​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇩​⋰⋰🇦​⋰⋰🇱​⋰⋰🇦​⋰⋰🇱​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰.",
+    "⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰ ⋰🇯​⋰⋰🇱​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇯​⋰⋰🇱​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇶​⋰ ⋰🇹​⋰⋰🇷​⋰⋰🇾​⋰⋰🇲​⋰⋰🇦​⋰, ⋰🇵​⋰⋰🇦​⋰⋰🇷​⋰⋰🇦​⋰ ⋰🇱​⋰⋰🇮​⋰⋰🇰​⋰⋰🇭​⋰⋰🇪​⋰⋰🇬​⋰⋰🇦​⋰..",
+    "⋰🇹​⋰⋰🇷​⋰⋰🇦​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇭​⋰⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇰​⋰, ⋰🇱​⋰⋰🇦​⋰⋰🇬​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇦​⋰⋰🇩​⋰⋰🇨​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰",
+    "⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇱​⋰⋰🇦​⋰⋰🇬​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰.., ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇮​⋰⋰🇰​⋰⋰🇦​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇱​⋰⋰🇺​⋰⋰🇳​⋰⋰🇩​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇸​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇷​⋰⋰🇦​⋰., ⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰ ⋰🇱​⋰⋰🇪​⋰⋰🇻​⋰⋰🇪​⋰⋰🇱​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇨​⋰⋰🇷​⋰",
+    "⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰ ⋰🇱​⋰⋰🇪​⋰⋰🇻​⋰⋰🇪​⋰⋰🇱​⋰ ⋰🇼​⋰⋰🇪​⋰⋰🇦​⋰⋰🇰​⋰, ⋰🇲​⋰⋰🇪​⋰⋰🇷​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇺​⋰⋰🇳​⋰⋰🇩​⋰ ⋰🇵​⋰⋰🇪​⋰ ⋰🇪​⋰⋰🇾​⋰ ⋰🇹​⋰⋰🇺​⋰ ⋰🇭​⋰⋰🇮​⋰⋰🇯​⋰⋰🇩​⋰⋰🇪​⋰",
+    "⋰🇫​⋰⋰🇷​⋰⋰🇪​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇼​⋰⋰🇦​⋰ ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰??​⋰⋰🇦​⋰⋰🇰​⋰⋰🇴​⋰, ⋰🇫​⋰⋰🇷​⋰⋰🇪​⋰⋰🇪​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇾​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇹​⋰⋰🇺​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇹​⋰ ⋰🇨​⋰⋰🇱​⋰⋰🇦​⋰⋰🇮​⋰⋰🇲​⋰ ⋰🇨​⋰⋰🇷​⋰⋰🇼​⋰⋰🇦​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇮​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇸​⋰⋰🇰​⋰⋰🇹​⋰⋰🇦​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇪​⋰⋰🇳​⋰ ⋰🇻​⋰⋰🇪​⋰⋰🇸​⋰⋰🇮​⋰⋰🇾​⋰⋰🇦​⋰⋰🇦​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇯​⋰⋰🇦​⋰"
+    "⋰🇧⋰⋰🇭⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇮⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇫⋰⋰🇦⋰⋰🇹⋰⋰🇮⋰ ⋰🇭⋰⋰🇦⋰⋰🇮⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇭⋰⋰🇴⋰⋰🇯⋰⋰🇦⋰",
+    "⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰ ⋰🇯⋰⋰🇦⋰⋰🇾⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇭⋰⋰🇦⋰⋰🇮⋰",
+    "⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇫⋰⋰🇮⋰⋰🇷⋰⋰🇸⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇬⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇫⋰⋰🇦⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇳⋰⋰🇦⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇲⋰⋰🇦⋰⋰🇷⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰??⋰⋰🇪⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇨⋰⋰🇭⋰⋰🇦⋰⋰🇵⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇩⋰⋰🇮⋰⋰🇩⋰⋰🇮⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇫⋰⋰🇦⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇦⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰",
+    "⋰🇳⋰⋰🇪⋰⋰🇹⋰ ⋰🇴⋰⋰🇫⋰⋰🇫⋰ ⋰🇰⋰⋰🇷⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰, ⋰🇹⋰⋰🇧⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇰⋰⋰🇷⋰ ⋰🇲⋰⋰🇸⋰⋰🇬⋰ ⋰🇩⋰⋰🇪⋰⋰🇱⋰⋰🇪⋰⋰🇹⋰⋰🇪⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰",
+    "⋰🇹⋰⋰??⋰⋰🇰⋰⋰🇨⋰ ⋰🇲⋰⋰🇦⋰⋰🇷⋰⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇫⋰⋰🇦⋰⋰🇹⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰",
+    "⋰🇸⋰⋰🇱⋰⋰🇴⋰⋰🇼⋰ ⋰🇫⋰⋰🇮⋰⋰🇷⋰⋰🇸⋰⋰🇪⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰ ⋰🇯⋰⋰🇦⋰⋰🇾⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰",
+    "⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇬⋰⋰🇷⋰⋰🇮⋰⋰🇧⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰, ⋰🇹⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇩⋰⋰🇴⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇳⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇧⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇵⋰⋰🇺⋰⋰🇷⋰⋰🇦⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇧⋰⋰🇪⋰⋰🇨⋰⋰🇭⋰ ⋰🇩⋰⋰🇴⋰",
+    "⋰🇴⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇴⋰⋰🇩⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰",
+    "⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇪⋰⋰🇪⋰⋰🇯⋰, ⋰🇹⋰⋰🇲⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇰⋰⋰🇴⋰",
+    "⋰🇸⋰⋰🇺⋰⋰🇦⋰⋰🇷⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇪⋰⋰🇪⋰⋰🇯⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇧⋰⋰🇦⋰⋰🇩⋰⋰🇮⋰ ⋰🇭⋰⋰🇦⋰⋰🇮⋰",
+    "⋰🇹⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇮⋰ ⋰🇰⋰⋰🇪⋰⋰🇸⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇫⋰⋰🇮⋰⋰🇷⋰⋰🇸⋰⋰🇪⋰",
+    "⋰🇹⋰⋰🇧⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇰⋰⋰🇷⋰ ⋰🇲⋰⋰🇸⋰⋰🇬⋰ ⋰🇩⋰⋰🇪⋰⋰🇱⋰⋰🇪⋰⋰🇹⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰",
+    "⋰🇴⋰⋰🇮⋰ ⋰🇸⋰⋰🇺⋰⋰🇦⋰⋰🇷⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇦⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇺⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇭⋰⋰🇦⋰⋰🇮⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇯⋰⋰🇦⋰⋰🇾⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇯⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇱⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇬⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇫⋰⋰🇦⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇸⋰⋰🇱⋰⋰🇴⋰⋰🇼⋰ ⋰🇹⋰⋰🇾⋰⋰🇵⋰⋰🇪⋰⋰🇷⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰??⋰ ⋰🇧⋰⋰🇭⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇦⋰⋰🇦⋰⋰🇯⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇬⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇲⋰⋰🇪⋰⋰🇮⋰⋰🇳⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇸⋰⋰🇰⋰⋰🇹⋰⋰🇦⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇲⋰⋰🇦⋰⋰🇩⋰⋰🇷⋰⋰🇨⋰⋰🇴⋰⋰🇩⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇩⋰⋰🇮⋰⋰🇩⋰⋰🇮⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇫⋰⋰🇦⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇦⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰",
+    "⋰🇳⋰⋰🇪⋰⋰🇹⋰ ⋰🇴⋰⋰🇫⋰⋰🇫⋰ ⋰🇰⋰⋰🇷⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰, ⋰🇹⋰⋰🇧⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇰⋰⋰🇷⋰ ⋰🇲⋰⋰🇸⋰⋰🇬⋰ ⋰🇩⋰⋰🇪⋰⋰🇱⋰⋰🇪⋰⋰🇹⋰⋰🇪⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇲⋰⋰🇰⋰⋰🇨⋰ ⋰🇲⋰⋰🇦⋰⋰🇷⋰⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇫⋰⋰🇦⋰⋰🇹⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰",
+    "⋰🇸⋰⋰🇱⋰⋰🇴⋰⋰🇼⋰ ⋰??⋰⋰🇮⋰⋰🇷⋰⋰🇸⋰⋰🇪⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰ ⋰🇯⋰⋰🇦⋰⋰🇾⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰",
+    "⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇬⋰⋰🇷⋰⋰🇮⋰⋰🇧⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰, ⋰🇹⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇩⋰⋰🇴⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇳⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇧⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇵⋰⋰🇺⋰⋰🇷⋰⋰🇦⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇧⋰⋰🇪⋰⋰🇨⋰⋰🇭⋰ ⋰🇩⋰⋰🇴⋰",
+    "⋰🇴⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇴⋰⋰🇩⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰",
+    "⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇪⋰⋰🇪⋰⋰🇯⋰, ⋰🇹⋰⋰🇲⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇰⋰⋰🇴⋰",
+    "⋰🇸⋰⋰🇺⋰⋰🇦⋰⋰🇷⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇪⋰⋰🇪⋰⋰🇯⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇧⋰⋰🇦⋰⋰🇩⋰⋰🇮⋰ ⋰🇭⋰⋰🇦⋰⋰🇮⋰",
+    "⋰🇹⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇮⋰ ⋰🇰⋰⋰🇪⋰⋰🇸⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇫⋰⋰🇮⋰⋰🇷⋰⋰🇸⋰⋰🇪⋰",
+    "⋰🇹⋰⋰🇧⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇰⋰⋰🇷⋰ ⋰🇲⋰⋰🇸⋰⋰🇬⋰ ⋰🇩⋰⋰🇪⋰⋰🇱⋰⋰🇪⋰⋰🇹⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰",
+    "⋰🇴⋰⋰🇮⋰ ⋰🇸⋰⋰🇺⋰⋰🇦⋰⋰🇷⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇦⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇺⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇭⋰⋰🇦⋰⋰🇮⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇯⋰⋰🇦⋰⋰🇾⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇯⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇱⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇬⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇫⋰⋰🇦⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇸⋰⋰🇱⋰⋰🇴⋰⋰🇼⋰ ⋰🇹⋰⋰🇾⋰⋰🇵⋰⋰🇪⋰⋰🇷⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇦⋰⋰🇦⋰⋰🇯⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇰⋰⋰??⋰ ⋰🇬⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇲⋰⋰🇪⋰⋰🇮⋰⋰🇳⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇸⋰⋰🇰⋰⋰🇹⋰⋰🇦⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇲⋰⋰🇦⋰⋰🇩⋰⋰🇷⋰⋰🇨⋰⋰🇴⋰⋰🇩⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇩⋰⋰🇮⋰⋰🇩⋰⋰🇮⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇫⋰⋰🇦⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇦⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰"
+    "⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇵⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰ ⋰🇧⋰⋰🇳⋰⋰🇦⋰⋰🇱⋰⋰🇪⋰ ⋰🇲⋰⋰🇺⋰⋰🇯⋰⋰🇪⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇦⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇵⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇿⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇾⋰⋰🇦⋰⋰🇦⋰⋰🇩⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇹⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇹⋰⋰🇺⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇦⋰ ⋰🇳⋰⋰🇦⋰ ⋰🇹⋰⋰🇾⋰⋰🇲⋰⋰🇵⋰⋰🇦⋰⋰🇸⋰⋰🇸⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰ ⋰🇺⋰⋰🇳⋰⋰🇫⋰⋰🇺⋰⋰🇳⋰⋰🇳⋰⋰🇾⋰ ⋰🇸⋰⋰🇼⋰⋰🇮⋰⋰🇵⋰⋰🇪⋰ ⋰🇲⋰⋰🇹⋰⋰🇹⋰ ⋰🇰⋰⋰🇷⋰",
+    "⋰🇴⋰⋰🇭⋰ ⋰🇭⋰⋰🇪⋰⋰🇱⋰⋰🇱⋰⋰🇴⋰ ⋰🇧⋰⋰🇮⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇦⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇵⋰ ⋰🇧⋰⋰🇮⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇴⋰⋰🇷⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇻⋰ ⋰🇧⋰⋰🇮⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇦⋰⋰🇺⋰⋰🇰⋰⋰🇦⋰⋰🇹⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇷⋰⋰🇭⋰⋰🇦⋰ ⋰🇰⋰⋰🇷⋰.",
+    "⋰🇴⋰⋰🇾⋰⋰🇾⋰ ⋰🇰⋰⋰🇮⋰⋰🇳⋰⋰🇳⋰⋰🇪⋰⋰🇷⋰ ⋰🇹⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰ ⋰🇬⋰⋰🇨⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇦⋰⋰🇦⋰⋰🇳⋰⋰🇪⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇵⋰⋰🇪⋰⋰🇷⋰⋰🇲⋰⋰🇮⋰⋰🇸⋰⋰🇸⋰⋰🇮⋰⋰🇴⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰⋰🇸⋰⋰🇳⋰⋰🇪⋰ ⋰🇩⋰⋰🇮⋰.",
+    "⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰ ⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇭⋰⋰🇦⋰",
+    "⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰ ⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇭⋰⋰🇦⋰ ⋰🇪⋰⋰🇰⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇷⋰.",
+    "⋰🇸⋰⋰🇺⋰⋰🇳⋰ ⋰🇸⋰⋰🇺⋰⋰🇳⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇦⋰.",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰??⋰ ⋰🇲⋰⋰🇦⋰⋰🇨⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇦⋰.",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇹⋰⋰🇮⋰ ⋰🇯⋰⋰🇦⋰⋰🇹⋰⋰🇮⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇹⋰⋰🇲⋰⋰🇷⋰.",
+    "⋰🇰⋰⋰🇾⋰? ⋰🇯⋰⋰🇱⋰⋰🇩⋰⋰🇮⋰ ⋰🇱⋰⋰🇮⋰⋰🇰⋰⋰🇭⋰ ⋰🇰⋰⋰🇮⋰⋰🇩⋰⋰🇩⋰⋰🇪⋰.",
+    "⋰🇧⋰⋰🇮⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇨⋰⋰🇴⋰⋰🇲⋰ ⋰🇬⋰⋰🇦⋰⋰🇳⋰⋰🇬⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇵⋰ ⋰🇰⋰⋰🇴⋰ ⋰🇹⋰⋰🇦⋰⋰🇬⋰ ⋰🇨⋰⋰🇷⋰⋰🇪⋰⋰🇬⋰⋰🇦⋰ ⋰🇹⋰⋰🇺⋰",
+    "⋰🇲⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇧⋰⋰🇮⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇹⋰⋰🇲⋰⋰🇰⋰⋰🇨⋰ ⋰🇧⋰⋰🇸⋰",
+    "⋰🇯⋰⋰🇦⋰⋰🇱⋰⋰🇩⋰⋰🇮⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇿⋰ ⋰🇵⋰⋰🇦⋰⋰🇵⋰⋰🇦⋰ ⋰🇧⋰⋰🇴⋰⋰🇱⋰",
+    "⋰🇸⋰⋰🇮⋰⋰🇩⋰⋰🇪⋰ ⋰🇭⋰⋰🇴⋰⋰🇯⋰⋰🇦⋰ ⋰🇧⋰⋰🇮⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇦⋰⋰🇮⋰ ⋰🇦⋰⋰🇧⋰",
+    "⋰🇭⋰⋰🇾⋰⋰🇪⋰ ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇧⋰⋰🇭⋰⋰🇬⋰ ⋰🇲⋰⋰🇦⋰⋰🇹⋰ ⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇬⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇦⋰⋰🇯⋰⋰🇯⋰",
+    "⋰🇭⋰⋰🇾⋰⋰🇪⋰ ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇲⋰⋰🇦⋰⋰🇹⋰",
+    "⋰🇭⋰⋰🇾⋰⋰🇪⋰ ⋰🇩⋰⋰🇺⋰⋰🇷⋰ ⋰🇭⋰⋰🇦⋰⋰🇹⋰⋰🇹⋰ ⋰🇲⋰⋰🇦⋰⋰🇩⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇰⋰⋰🇴⋰⋰🇮⋰ ⋰🇧⋰⋰🇦⋰⋰🇹⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇪⋰⋰🇸⋰⋰🇱⋰⋰🇮⋰⋰🇾⋰⋰🇪⋰ ⋰🇲⋰⋰🇦⋰⋰🇫⋰ ⋰🇨⋰⋰🇷⋰ ⋰🇷⋰⋰🇭⋰⋰🇦⋰ ⋰🇭⋰⋰🇺⋰ ⋰🇹⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇰⋰⋰🇴⋰⋰🇮⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇹⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇲⋰⋰🇦⋰⋰🇫⋰⋰🇮⋰ ⋰🇩⋰⋰🇪⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇲⋰⋰🇦⋰⋰🇫⋰⋰🇮⋰ ⋰🇲⋰⋰🇮⋰⋰🇱⋰ ⋰🇯⋰⋰🇦⋰⋰🇾⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰ ⋰🇹⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇦⋰ ⋰🇲⋰⋰🇺⋰⋰🇯⋰⋰🇪⋰ ⋰🇸⋰⋰🇼⋰⋰🇮⋰⋰🇵⋰⋰🇪⋰ ⋰🇨⋰⋰🇷⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇸⋰⋰🇼⋰⋰🇮⋰⋰🇵⋰⋰🇪⋰ ⋰🇨⋰⋰🇷⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇫⋰⋰🇷⋰ ⋰🇧⋰⋰🇴⋰⋰🇱⋰⋰🇳⋰⋰🇦⋰ ⋰🇳⋰⋰🇦⋰ ⋰??⋰⋰🇮⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇱⋰⋰🇪⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇸⋰⋰🇼⋰⋰🇮⋰⋰🇵⋰⋰🇪⋰ ⋰🇨⋰⋰🇷⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇭⋰⋰🇺⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇵⋰⋰🇷⋰ ⋰🇰⋰⋰🇪⋰⋰🇸⋰⋰🇪⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰",
+    "⋰🇲⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰ ⋰🇵⋰⋰🇹⋰⋰🇦⋰ ⋰🇹⋰⋰🇭⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇦⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇲⋰⋰🇪⋰⋰🇾⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰⋰🇳⋰⋰🇹⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰",
+    "⋰🇱⋰⋰🇴⋰⋰🇩⋰⋰🇪⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇺⋰⋰🇹⋰⋰🇷⋰ ⋰🇲⋰⋰??⋰",
+    "⋰🇱⋰⋰🇺⋰⋰🇳⋰ ⋰🇲⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇸⋰ ⋰🇲⋰⋰🇪⋰⋰🇷⋰⋰🇦⋰",
+    "⋰🇳⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰⋰🇱⋰ ⋰🇲⋰⋰🇦⋰⋰🇩⋰⋰🇦⋰⋰🇷⋰⋰🇨⋰⋰🇭⋰⋰🇩⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇴⋰⋰🇾⋰⋰🇪⋰ ⋰🇬⋰⋰🇦⋰⋰🇸⋰⋰🇭⋰⋰🇹⋰⋰🇮⋰ ⋰🇰⋰ ⋰🇧⋰⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇮⋰⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇲⋰⋰🇦⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇰⋰ ⋰🇭⋰⋰🇦⋰⋰🇹⋰⋰🇭⋰ ⋰🇹⋰⋰🇴⋰⋰🇩⋰⋰🇭⋰ ⋰🇰⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇪⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇵⋰ ⋰🇰⋰ ⋰🇲⋰⋰🇺⋰⋰🇭⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇫⋰⋰🇦⋰⋰🇸⋰⋰🇦⋰⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇱⋰⋰🇪⋰⋰🇦⋰⋰??⋰⋰🇪⋰ ⋰🇱⋰⋰🇪⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇵⋰⋰🇦⋰⋰🇸⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇳⋰⋰🇦⋰⋰🇮⋰ ⋰🇦⋰⋰🇾⋰⋰🇦⋰ ⋰🇲⋰⋰🇪⋰⋰🇰⋰⋰🇴⋰",
+    "⋰🇱⋰⋰🇪⋰⋰🇦⋰⋰🇻⋰⋰🇪⋰ ⋰🇱⋰⋰🇪⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇮⋰⋰🇩⋰⋰🇪⋰⋰🇷⋰ ⋰🇸⋰⋰🇪⋰",
+    "⋰🇱⋰⋰🇪⋰⋰🇦⋰⋰🇻⋰⋰🇪⋰ ⋰🇱⋰⋰🇪⋰ ⋰🇯⋰⋰🇱⋰⋰🇩⋰⋰🇮⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇼⋰⋰🇷⋰⋰🇳⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇦⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇱⋰⋰🇪⋰⋰🇦⋰⋰🇻⋰⋰🇪⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇱⋰⋰🇪⋰⋰🇬⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇸⋰⋰🇲⋰⋰🇯⋰⋰🇭⋰ ⋰🇧⋰⋰🇦⋰⋰🇹⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇱⋰⋰🇪⋰⋰🇦⋰⋰🇻⋰⋰🇪⋰ ⋰🇱⋰⋰🇪⋰",
+    "⋰🇫⋰⋰🇦⋰⋰🇸⋰⋰🇹⋰ ⋰🇱⋰⋰🇪⋰⋰🇦⋰⋰🇻⋰⋰🇪⋰ ⋰🇱⋰⋰🇪⋰ ⋰🇰⋰⋰🇦⋰⋰🇲⋰⋰🇯⋰⋰🇴⋰⋰🇷⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇹⋰⋰🇺⋰⋰🇹⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰",
+    "⋰🇴⋰⋰🇾⋰ ⋰🇭⋰⋰🇮⋰⋰🇯⋰⋰🇩⋰⋰🇪⋰ ⋰🇰⋰⋰🇭⋰⋰🇦⋰⋰🇳⋰⋰🇦⋰ ⋰🇰⋰⋰🇭⋰⋰🇦⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇦⋰⋰🇦⋰ ⋰🇰⋰⋰🇦⋰⋰🇲⋰⋰🇿⋰⋰🇴⋰⋰🇷⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇴⋰ ⋰🇮⋰⋰🇱⋰⋰🇾⋰ ⋰🇷⋰⋰🇪⋰⋰🇾",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇨⋰⋰🇭⋰⋰🇦⋰⋰🇵⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇹⋰⋰🇲⋰⋰🇰⋰⋰🇨⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰⋰🇨⋰⋰🇭⋰⋰🇦⋰⋰🇵⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇹⋰⋰🇺⋰",
+    "⋰🇸⋰⋰🇭⋰⋰🇮⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰⋰🇨⋰⋰🇭⋰⋰🇦⋰⋰🇵⋰",
+    "⋰🇫⋰⋰🇷⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰??⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰⋰🇨⋰⋰🇭⋰⋰🇦⋰⋰🇵⋰",
+    "⋰🇸⋰⋰🇭⋰⋰🇮⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇱⋰⋰🇮⋰⋰🇰⋰⋰🇭⋰ ⋰🇼⋰⋰🇷⋰⋰🇳⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇦⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇾⋰⋰🇺⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇦⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰⋰🇨⋰⋰🇭⋰⋰🇦⋰⋰🇵⋰",
+    "⋰🇵⋰⋰🇷⋰⋰🇴⋰⋰🇴⋰⋰🇫⋰ ⋰🇨⋰⋰🇷⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇵⋰⋰🇷⋰⋰🇴⋰⋰🇴⋰⋰🇫⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇪⋰⋰🇾⋰",
+    "⋰🇵⋰⋰🇷⋰⋰🇴⋰⋰🇴⋰⋰🇫⋰ ⋰🇭⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇰⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇨⋰⋰🇭⋰⋰🇮⋰⋰🇱⋰⋰🇱⋰⋰🇦⋰⋰🇷⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇰⋰ ⋰🇧⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇦⋰ ⋰🇹⋰⋰🇪⋰⋰??⋰⋰🇾⋰",
+    "⋰🇴⋰⋰🇾⋰ ⋰🇭⋰⋰🇮⋰⋰🇯⋰⋰🇩⋰⋰🇪⋰ ⋰🇰⋰⋰🇭⋰⋰🇦⋰⋰🇳⋰⋰🇦⋰ ⋰🇰⋰⋰🇭⋰⋰🇦⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇦⋰⋰🇦⋰ ⋰🇰⋰⋰🇦⋰⋰🇲⋰⋰🇿⋰⋰🇴⋰⋰🇷⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇩​⋰⋰🇷​⋰⋰🇨​⋰⋰🇭​⋰⋰🇴​⋰⋰🇩​⋰ ?",
+    "⋰🇦⋰⋰🇧⋰ ⋰🇹⋰⋰🇰⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰ ⋰🇭⋰⋰🇴⋰⋰🇬⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ?",
+    "⋰🇳⋰⋰🇾⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇰⋰⋰🇺⋰⋰🇨⋰⋰🇭⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇯⋰⋰🇦⋰⋰🇳⋰⋰🇹⋰⋰🇦⋰ ⋰🇧⋰⋰🇸⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇪⋰⋰🇾⋰",
+    "⋰🇸⋰⋰🇧⋰⋰🇸⋰⋰🇪⋰ ⋰🇵⋰⋰🇭⋰⋰🇪⋰⋰🇱⋰⋰🇪⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇰⋰⋰🇴⋰ ⋰🇧⋰⋰🇴⋰⋰🇱⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇳⋰⋰🇦⋰ ⋰🇰⋰⋰🇦⋰⋰🇲⋰ ⋰🇰⋰⋰🇷⋰⋰🇪⋰",
+    "⋰🇾⋰⋰🇦⋰⋰🇭⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇦⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇨⋰⋰🇪⋰ ⋰🇵⋰⋰🇮⋰⋰🇱⋰⋰🇱⋰⋰🇪⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰⋰🇧⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇹⋰⋰🇴⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇹⋰⋰🇴⋰⋰🇲⋰⋰🇲⋰⋰🇾⋰",
+    "⋰🇳⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰⋰🇱⋰ ⋰🇲⋰⋰🇦⋰⋰🇩⋰⋰🇦⋰⋰🇷⋰⋰🇨⋰⋰🇭⋰⋰🇩⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰ ⋰🇾⋰⋰🇭⋰⋰🇦⋰ ⋰🇸⋰⋰🇪⋰",
+    "⋰🇨⋰⋰🇴⋰⋰🇿⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇭⋰⋰🇮⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰ ⋰🇭⋰⋰🇪⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇹⋰⋰🇴⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇵⋰ ⋰🇧⋰⋰🇴⋰⋰🇱⋰ ⋰🇲⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇳⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇭⋰⋰🇴⋰⋰🇬⋰⋰🇮⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⊶⊶🇮⋰ ⋰🇯⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰⋰🇹⋰⋰🇮⋰ ⋰🇯⋰⋰🇴⋰⋰🇬⋰⋰🇮⋰",
+    "⋰🇹⋰⋰🇷⋰⋰🇾⋰ ⋰🇦⋰⋰🇲⋰⋰🇲⋰⋰🇮⋰ ⋰🇨⋰⋰🇪⋰ ⋰🇧⋰⋰🇭⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇪⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇪⋰⋰🇲⋰⋰🇴⋰⋰🇯⋰⋰🇮⋰ ⋰🇩⋰⋰🇦⋰⋰🇱⋰ ⋰🇲⋰⋰🇨⋰",
+    "⋰🇨⋰⋰🇾⋰⋰🇦⋰ ? ⋰🇨⋰⋰🇭⋰⋰🇲⋰⋰🇷⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇦⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ?",
+    "⋰🇹⋰⋰🇲⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇷⋰⋰🇮⋰ ⋰🇭⋰⋰🇴⋰⋰🇬⋰⋰🇮⋰ ⋰🇫⋰⋰🇷⋰⋰🇷⋰⋰🇹⋰⋰🇴⋰",
+    "⋰🇨⋰⋰🇾⋰⋰🇦⋰ ? ⋰🇰⋰⋰🇧⋰ ? ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰⋰🇰⋰",
+    "⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇸⋰⋰🇨⋰⋰🇭⋰ ⋰🇲⋰⋰🇪⋰⋰🇾⋰ ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇱⋰⋰🇮⋰ ⋰🇹⋰⋰🇺⋰⋰🇳⋰⋰🇪⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰",
+    "⋰🇮⋰⋰🇹⋰⋰🇳⋰⋰🇦⋰ ⋰🇸⋰⋰🇨⋰⋰🇭⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇧⋰⋰🇴⋰⋰🇱⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇦⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇸⋰⋰🇨⋰⋰🇭⋰ ⋰🇲⋰⋰🇪⋰⋰🇾⋰ ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇱⋰⋰🇮⋰⋰🇦⋰ ⋰🇲⋰⋰🇪⋰⋰🇷⋰⋰🇪⋰ ⋰🇸⋰⋰🇹⋰⋰🇭⋰",
+    "⋰🇲⋰⋰🇹⋰⋰🇱⋰⋰🇧⋰ ⋰🇹⋰⋰🇲⋰⋰🇷⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇹⋰⋰🇴⋰",
+    "⋰🇵⋰⋰🇺⋰⋰🇷⋰⋰🇦⋰ ⋰🇱⋰⋰🇮⋰⋰🇰⋰⋰🇭⋰ ⋰🇲⋰⋰🇨⋰",
+    "⋰🇹⋰⋰🇲⋰⋰🇷⋰ ⋰🇫⋰⋰🇷⋰⋰🇷⋰⋰🇹⋰⋰🇴⋰",
+    "⋰🇴⋰⋰🇭⋰ ⋰🇴⋰⋰🇰⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇱⋰⋰🇪⋰ ⋰🇫⋰⋰🇮⋰⋰🇷⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇰⋰⋰🇦⋰ ⋰🇩⋰⋰🇦⋰⋰🇲⋰⋰🇦⋰⋰🇩⋰",
+    "⋰🇨⋰⋰🇾⋰⋰🇦⋰ ? ⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇱⋰⋰🇮⋰⋰🇰⋰⋰🇭⋰⋰🇪⋰ ⋰🇵⋰⋰🇪⋰⋰🇭⋰⋰🇱⋰⋰🇪⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇪⋰⋰🇧⋰⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇹⋰⋰🇴⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰⋰🇳⋰⋰🇪⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇻⋰⋰🇾⋰⋰🇦⋰⋰🇸⋰⋰🇹⋰ ⋰🇭⋰⋰🇺⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇹⋰⋰🇴⋰ ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇰⋰⋰🇺⋰⋰🇨⋰⋰🇭⋰ ⋰🇧⋰⋰🇮⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰⋰🇪⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ? ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇦⋰ ?",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇲⋰⋰🇹⋰ ⋰🇭⋰⋰🇸⋰⋰🇸⋰",
+    "⋰🇾⋰⋰🇺⋰⋰🇷⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⊶⊶🇮⋰ ⋰🇲⋰⋰🇴⋰⋰🇲⋰",
+    "⋰🇦⋰⋰🇷⋰⋰🇪⋰ ⋰🇸⋰⋰🇧⋰⋰🇰⋰⋰🇮⋰ ⋰🇲⋰⋰??⋰⋰🇦⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⊶⊶🇮⋰ ⋰🇴⋰⋰🇷⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇮⋰",
+    "⋰🇦⋰⋰🇷⋰⋰🇪⋰ ⋰🇮⋰⋰🇩⋰⋰🇦⋰⋰🇷⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇱⋰⋰🇪⋰ ⋰🇪⋰⋰🇰⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇷⋰",
+    "⋰🇹⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇮⋰ ⋰🇹⋰⋰🇷⋰⋰🇭⋰",
+    "⋰🇪⋰⋰🇰⋰ ⋰🇱⋰⋰🇮⋰⋰🇳⋰⋰🇪⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇹⋰⋰🇲⋰⋰🇷⋰",
+    "⋰🇶⋰",
+    "⋰🇴⋰⋰🇨⋰⋰🇾⋰ ⋰🇦⋰⋰🇧⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇱⋰⋰🇪⋰",
+    "⋰🇵⋰⋰🇪⋰⋰🇭⋰⋰🇪⋰⋰🇱⋰⋰🇪⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇹⋰⋰🇴⋰",
+    "⋰🇶⋰ ?",
+    "⋰??⋰⋰🇾⋰⋰🇾⋰⋰🇾⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰ ⋰🇪⋰⋰🇰⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇷⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰⋰🇪⋰ ⋰🇸⋰⋰🇺⋰⋰🇳⋰ ⋰🇩⋰⋰🇴⋰⋰🇸⋰⋰🇹⋰ ⋰🇹⋰⋰🇲⋰⋰🇷⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇯⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰⋰🇫⋰ ⋰🇨⋰⋰🇷⋰⋰🇷⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰⋰🇪⋰ ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⊶⊶🇮⋰ ⋰🇮⋰⋰🇩⋰⋰🇦⋰⋰🇷⋰ ⋰🇦⋰⋰🇦⋰",
+    "⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇹⋰⋰🇲⋰⋰🇷⋰ ⋰🇫⋰⋰🇷⋰⋰🇷⋰⋰🇹⋰⋰🇴⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰⋰🇪⋰ ⋰🇮⋰⋰🇩⋰⋰🇦⋰⋰🇷⋰ ⋰🇦⋰⋰🇦⋰⋰🇰⋰⋰🇪⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇱⋰⋰🇪⋰ ⋰🇨⋰⋰🇭⋰⋰🇲⋰⋰🇷⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇹⋰⋰🇴⋰ ⋰🇦⋰⋰🇪⋰⋰🇸⋰⋰🇪⋰ ⋰🇭⋰⋰🇮⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰⋰🇪⋰ ⋰🇭⋰⋰🇾⋰⋰🇾⋰ ⋰🇦⋰⋰🇮⋰⋰🇸⋰⋰🇪⋰ ⋰🇭⋰⋰🇮⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇱⋰⋰🇪⋰⋰🇳⋰⋰🇦⋰",
+    "⋰🇴⋰⋰🇷⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇱⋰⋰🇪⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰ ⋰🇴⋰⋰🇷⋰",
+    "⋰🇭⋰⋰🇾⋰⋰🇾⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇴⋰ ⋰??⋰⋰🇦⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇴⋰ ⋰🇲⋰⋰🇹⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇯⋰⋰🇦⋰⋰🇴⋰",
+    "⋰🇧⋰⋰🇾⋰⋰🇾⋰⋰🇪⋰⋰🇪⋰ ⋰🇭⋰⋰🇾⋰⋰🇾⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ?",
+    "⋰🇶⋰⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇶⋰ ⋰🇷⋰⋰🇭⋰⋰🇪⋰ ⋰🇭⋰⋰🇴⋰ ?",
+    "⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇲⋰⋰🇨⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇲⋰⋰🇹⋰",
+    ]
+            br3_texts = [
+                "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄾⋰⋰🄻⋰ ⋰🅃⋰⋰🄾⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄳⋰⋰??⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄼⋰⋰🅄⋰⋰🄷⋰ ⋰🄼⋰⋰🄴⋰ ⋰🅁⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰⋰🄳⋰ ⋰🄳⋰⋰🅄⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰ ⋰??⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄼⋰⋰🄴⋰ ⋰🄻⋰⋰🄾⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄼⋰⋰🄰⋰⋰🅂⋰⋰🄰⋰⋰🄻⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🄵⋰⋰🄰⋰⋰🄼⋰⋰🄴⋰ ⋰🄻⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄿⋰⋰🄴⋰ ⋰🅃⋰⋰🄷⋰⋰🄰⋰⋰🄿⋰⋰🄿⋰⋰🄰⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄼⋰⋰🄴⋰ ⋰🄻⋰⋰🄾⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🅄⋰",
+    "⋰🅇⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰ ⋰🅄⋰⋰🅃⋰⋰🄷⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🄷⋰⋰🄴⋰⋰🅁⋰⋰🄲⋰⋰🄷⋰⋰??⋰⋰🄳⋰",
+    "⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🄽⋰⋰🄰⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🄳⋰⋰🄺⋰⋰🄴⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄱⋰⋰🅄⋰⋰🄳⋰⋰🄷⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🄳⋰⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄸⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🄷⋰⋰🄴⋰⋰🅁⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰ ⋰🄲⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰ ⋰🅄⋰⋰🅃⋰⋰🄷⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄰⋰⋰🄺⋰⋰🄴⋰⋰🄻⋰⋰🄰⋰ ⋰🄿⋰⋰🄰⋰⋰🄽⋰ ⋰🄼⋰⋰🄸⋰⋰🅃⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄸⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰⋰🄸⋰ ⋰🅇⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄷⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰⋰🅃⋰ ⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄲⋰⋰🄷⋰⋰🄰⋰⋰🄿⋰⋰🄿⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🄻⋰⋰🄻⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄽⋰⋰🄰⋰⋰🄽⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄾⋰⋰🄾⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄴⋰⋰🅁⋰⋰🅁⋰ ⋰🄵⋰⋰🄰⋰⋰🄰⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰⋰🅃⋰ ⋰🅂⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰⋰🅁⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰⋰🄻⋰⋰🄻⋰⋰🄻⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰⋰🄹⋰⋰🄹⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄵⋰⋰🄰⋰⋰🄰⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰ ⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰??⋰⋰🅈⋰⋰🅈⋰⋰🅈⋰ ⋰🄺⋰⋰🅁⋰⋰🅁⋰⋰🅁⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄽⋰⋰🄸⋰⋰🄻⋰⋰🄰⋰⋰🄰⋰⋰🄼⋰⋰🄼⋰⋰🄼⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰⋰🄽⋰⋰🄽⋰ ⋰🄺⋰⋰🄾⋰⋰🄾⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄺⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰⋰🄰⋰⋰🄰⋰ ⋰🅂⋰⋰🄴⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄶⋰⋰🄶⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰🄻⋰⋰🅈⋰⋰🅈⋰⋰🅈⋰ ⋰🄳⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰⋰🅃⋰ ⋰🄼⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰⋰🄽⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰ ⋰🄼⋰⋰🄴⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰⋰🄽⋰ ⋰🄷⋰⋰🄰⋰⋰🅃⋰⋰🄷⋰⋰🄷⋰⋰🄷⋰ ⋰🄳⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🄻⋰⋰🄻⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰⋰🄹⋰⋰🄹⋰⋰🄹⋰ ⋰??⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰⋰🄽⋰⋰🄽⋰",
+    "⋰🅂⋰⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄿⋰⋰🄰⋰⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅂⋰⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄻⋰⋰🄴⋰⋰🄺⋰⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰⋰🅁⋰ ⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🄰⋰⋰🅁⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🅂⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰🄻⋰⋰🅈⋰⋰🅈⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰ ⋰🄽⋰⋰🄰⋰⋰🄽⋰⋰🄸⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄰⋰⋰🅄⋰⋰🄻⋰⋰🄰⋰⋰🄳⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄰⋰⋰🅄⋰⋰🄻⋰⋰🄰⋰⋰🄳⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🄰⋰⋰🅁⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄳⋰ ⋰🄺⋰⋰🄸⋰⋰🄳⋰⋰🄳⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🅂⋰⋰🄰⋰⋰🅃⋰⋰🄷⋰ ⋰🅂⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🅅⋰⋰🄾⋰⋰🄸⋰⋰🄲⋰⋰🄴⋰ ⋰🄷⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🅂⋰⋰🄴⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🅂⋰⋰🄰⋰⋰🄺⋰⋰🅃⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄱⋰⋰🄰⋰⋰🄰⋰⋰🄿⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄸⋰⋰🄶⋰⋰🄽⋰⋰🄾⋰⋰🅁⋰⋰🄴⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🅄⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄸⋰⋰🄶⋰⋰🄽⋰⋰🄾⋰⋰🅁⋰⋰🄴⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🅁⋰⋰🄰⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰ ⋰??⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄰⋰⋰🅃⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄰⋰ ⋰🄻⋰⋰🄾⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄻⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄰⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄰⋰⋰🄰⋰⋰🄿⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄻⋰⋰🄸⋰ ⋰🄹⋰⋰🅄⋰⋰🄱⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄴⋰⋰🄽⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰??⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄽⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄼⋰⋰🄰⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄱⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🅂⋰⋰🄴⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄴⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄰⋰⋰🅃⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄴⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄻⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰ ⋰🄰⋰⋰🄱⋰ ⋰🅃⋰⋰🅄⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄴⋰ ⋰🄿⋰⋰🄴⋰⋰🅁⋰ ⋰🄶⋰⋰??⋰⋰🅄⋰⋰🄼⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄻⋰⋰🄴⋰⋰🄺⋰⋰🄸⋰⋰🄽⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄹⋰⋰🄷⋰⋰🅄⋰⋰🄺⋰⋰🄽⋰⋰🄴⋰ ⋰🄽⋰⋰🄰⋰⋰🄸⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰ ⋰🄱⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄰⋰ ⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰🄻⋰⋰🅈⋰ ⋰🄷⋰⋰🄾⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄳⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰ ⋰🄹⋰⋰🄰⋰⋰🅈⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄽⋰⋰🄰⋰ ⋰🄲⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰⋰🅄⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🅃⋰⋰🄾⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄱⋰⋰🄾⋰⋰🄻⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄰⋰⋰🅃⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄷⋰⋰🄾⋰⋰🄹⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🅄⋰⋰🅃⋰⋰🄷⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄵⋰⋰🄴⋰⋰🄽⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🄿⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🅁⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄺⋰⋰🄾⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰??⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰ ⋰🄹⋰⋰🄰⋰⋰🅈⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄴⋰ ⋰🄿⋰⋰🄴⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄳⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🄾⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄼⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🅂⋰⋰🄰⋰⋰🅃⋰⋰🄷⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄱⋰⋰🄷⋰⋰🄸⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄷⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰??⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🅂⋰⋰🄴⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🄶⋰⋰🄰⋰⋰🄸⋰⋰🅁⋰⋰🄱⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄰⋰⋰🅄⋰⋰🄻⋰⋰🄰⋰⋰🄳⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄱⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄿⋰ ⋰🄺⋰⋰🄸⋰ ⋰🅂⋰⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🅃⋰⋰🄲⋰⋰🄷⋰ ⋰🄺⋰⋰🅁⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰ ⋰🄶⋰⋰🄰⋰⋰🅁⋰⋰🄸⋰⋰🄱⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄴⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄴⋰⋰🄴⋰⋰🄹⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰??⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄺⋰⋰🄾⋰ ⋰🅃⋰⋰🄰⋰⋰🄶⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰⋰🅁⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄰⋰⋰🅃⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄴⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄻⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰ ⋰🄰⋰⋰🄱⋰ ⋰🅃⋰⋰🅄⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄴⋰ ⋰🄿⋰⋰🄴⋰⋰🅁⋰ ⋰🄶⋰⋰🄷⋰⋰🅄⋰⋰🄼⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄻⋰⋰🄴⋰⋰🄺⋰⋰🄸⋰⋰🄽⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄹⋰⋰🄷⋰⋰🅄⋰⋰🄺⋰⋰🄽⋰⋰🄴⋰ ⋰🄽⋰⋰🄰⋰⋰🄸⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰ ⋰🄱⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄰⋰ ⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰🄻⋰⋰🅈⋰ ⋰🄷⋰⋰🄾⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄳⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰??⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰??⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰ ⋰🄹⋰⋰🄰⋰⋰🅈⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄽⋰⋰🄰⋰ ⋰🄲⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰⋰🅄⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🅃⋰⋰🄾⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄱⋰⋰🄾⋰⋰🄻⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄰⋰⋰🅃⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰??⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄷⋰⋰🄾⋰⋰🄹⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🅄⋰⋰🅃⋰⋰🄷⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄵⋰⋰🄴⋰⋰🄽⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰??⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🄿⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🅁⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄺⋰⋰🄾⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰ ⋰🄹⋰⋰🄰⋰⋰🅈⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄴⋰ ⋰🄿⋰⋰🄴⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄳⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🄾⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄼⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🅂⋰⋰🄰⋰⋰🅃⋰⋰🄷⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄱⋰⋰🄷⋰⋰🄸⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄷⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🅂⋰⋰🄴⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🄶⋰⋰🄰⋰⋰🄸⋰⋰🅁⋰⋰🄱⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄰⋰⋰🅄⋰⋰🄻⋰⋰🄰⋰⋰🄳⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄱⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄿⋰ ⋰🄺⋰⋰🄸⋰ ⋰🅂⋰⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🅃⋰⋰🄲⋰⋰🄷⋰ ⋰🄺⋰⋰🅁⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰ ⋰🄶⋰⋰🄰⋰⋰🅁⋰⋰🄸⋰⋰🄱⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄴⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄴⋰⋰🄴⋰⋰🄹⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄺⋰⋰🄾⋰ ⋰🅃⋰⋰🄰⋰⋰🄶⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰⋰🅁⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰"
+    ]
 
-        heart_replies = [
-            "𓂃˖˳·˖ ִֶָ ⋆❤️͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚❤️ ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆🧡͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚🧡 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💛͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💛 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💚͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💚 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💙͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💙 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💜͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💜 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆🖤͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚🖤 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆🤍͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚🤍 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆🤎͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚🤎 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💖͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💖 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💗͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💗 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💓͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💓 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💞͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💞 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💕͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💕 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💘͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💘 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💝͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💝 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💟͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💟 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆❣️͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚❣️ ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆❤️‍🔥͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚❤️‍🔥 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆❤️‍🩹͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚❤️‍🩹 ݁˖⭑.ᐟ",
-        ]
+            sqr_texts = [
+                "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓐ ⊶Ⓑ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ, ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓒ⊶Ⓐ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓑ⊶Ⓗ⊶Ⓘ ⊶Ⓑ⊶Ⓝ⊶Ⓐ⊶Ⓛ⊶Ⓔ ⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓔ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓐ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓩ ⊶Ⓔ⊶Ⓨ ⊶Ⓨ⊶Ⓐ⊶Ⓐ⊶Ⓓ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓐ ⊶Ⓝ⊶Ⓐ ⊶Ⓣ⊶Ⓨ⊶Ⓜ⊶Ⓟ⊶Ⓐ⊶Ⓢ⊶Ⓢ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ ⊶Ⓤ⊶Ⓝ⊶Ⓕ⊶Ⓤ⊶Ⓝ⊶Ⓝ⊶Ⓨ ⊶Ⓢ⊶Ⓦ⊶Ⓘ⊶Ⓟ⊶Ⓔ ⊶Ⓜ⊶Ⓣ⊶Ⓣ ⊶Ⓚ⊶Ⓡ",
+    "⊶Ⓞ⊶Ⓗ ⊶Ⓗ⊶Ⓔ⊶Ⓛ⊶Ⓛ⊶Ⓞ ⊶Ⓑ⊶Ⓘ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓐ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓑ⊶Ⓘ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓞ⊶Ⓡ ⊶Ⓣ⊶Ⓤ ⊶Ⓥ ⊶Ⓑ⊶Ⓘ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓤ⊶Ⓚ⊶Ⓐ⊶Ⓣ ⊶Ⓜ⊶Ⓔ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ⊶Ⓚ⊶Ⓡ.",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓨ ⊶Ⓚ⊶Ⓘ⊶Ⓝ⊶Ⓝ⊶Ⓔ⊶Ⓡ ⊶Ⓣ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓖ⊶Ⓒ ⊶Ⓜ⊶Ⓔ ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓔ ⊶Ⓚ⊶Ⓘ ⊶Ⓟ⊶Ⓔ⊶Ⓡ⊶Ⓜ⊶Ⓘ⊶Ⓢ⊶Ⓢ⊶Ⓘ⊶Ⓞ⊶Ⓝ ⊶Ⓚ⊶Ⓘ⊶Ⓢ⊶Ⓝ⊶Ⓔ ⊶Ⓓ⊶Ⓘ.",
+    "⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓐ",
+    "⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓔ⊶Ⓚ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓡ.",
+    "⊶Ⓢ⊶Ⓤ⊶Ⓝ ⊶Ⓢ⊶Ⓤ⊶Ⓝ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓐ.",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓒ⊶Ⓐ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ.",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓣ⊶Ⓘ ⊶Ⓙ⊶Ⓐ⊶Ⓣ⊶Ⓘ ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓜ⊶Ⓡ.",
+    "⊶Ⓚ⊶Ⓨ? ⊶Ⓙ⊶Ⓛ⊶Ⓓ⊶Ⓘ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ ⊶Ⓚ⊶Ⓘ⊶Ⓓ⊶Ⓓ⊶Ⓔ.",
+    "⊶Ⓑ⊶Ⓘ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓒ⊶Ⓞ⊶Ⓜ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓖ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓚ⊶Ⓞ ⊶Ⓣ⊶Ⓐ⊶Ⓖ ⊶Ⓒ⊶Ⓡ⊶Ⓔ⊶Ⓖ⊶Ⓐ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓑ⊶Ⓘ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓜ⊶Ⓚ⊶Ⓒ ⊶Ⓑ⊶Ⓢ",
+    "⊶Ⓙ⊶Ⓐ⊶Ⓛ⊶Ⓓ⊶Ⓘ ⊶Ⓢ⊶Ⓔ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓩ ⊶Ⓟ⊶Ⓐ⊶Ⓟ⊶Ⓐ ⊶Ⓑ⊶Ⓞ⊶Ⓛ",
+    "⊶Ⓢ⊶Ⓘ⊶Ⓓ⊶Ⓔ ⊶Ⓗ⊶Ⓞ⊶Ⓙ⊶Ⓐ ⊶Ⓑ⊶Ⓘ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓐ⊶Ⓑ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓔ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓑ⊶Ⓗ⊶Ⓖ ⊶Ⓜ⊶Ⓐ⊶Ⓣ ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ",
+    "⊶Ⓑ⊶Ⓗ⊶Ⓖ ⊶Ⓝ⊶Ⓨ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓙ⊶Ⓙ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓔ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓐ⊶Ⓖ ⊶Ⓜ⊶Ⓐ⊶Ⓣ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓔ ⊶Ⓓ⊶Ⓤ⊶Ⓡ ⊶Ⓗ⊶Ⓐ⊶Ⓣ⊶Ⓣ ⊶Ⓜ⊶Ⓐ⊶Ⓓ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓚ⊶Ⓞ⊶Ⓘ ⊶Ⓑ⊶Ⓐ⊶Ⓣ ⊶Ⓝ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ ⊶Ⓔ⊶Ⓢ⊶Ⓛ⊶Ⓘ⊶Ⓨ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓕ ⊶Ⓒ⊶Ⓡ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ⊶Ⓗ⊶Ⓤ ⊶Ⓣ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓚ⊶Ⓞ⊶Ⓘ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓣ ⊶Ⓝ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓣ⊶Ⓤ ⊶Ⓜ⊶Ⓐ⊶Ⓕ⊶Ⓘ ⊶Ⓓ⊶Ⓔ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓣ⊶Ⓤ ⊶Ⓜ⊶Ⓐ⊶Ⓕ⊶Ⓘ ⊶Ⓜ⊶Ⓘ⊶Ⓛ ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓖ⊶Ⓘ ⊶Ⓣ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓣ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓐ ⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓔ ⊶Ⓢ⊶Ⓦ⊶Ⓘ⊶Ⓟ⊶Ⓔ ⊶Ⓒ⊶Ⓡ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓢ⊶Ⓦ⊶Ⓘ⊶Ⓟ⊶Ⓔ ⊶Ⓒ⊶Ⓡ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓑ⊶Ⓞ⊶Ⓛ⊶Ⓝ⊶Ⓐ ⊶Ⓝ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓢ⊶Ⓦ⊶Ⓘ⊶Ⓟ⊶Ⓔ ⊶Ⓒ⊶Ⓡ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓗ⊶Ⓤ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓚ⊶Ⓔ⊶Ⓢ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓣ⊶Ⓗ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓨ ⊶Ⓝ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓝ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ",
+    "⊶Ⓛ⊶Ⓞ⊶Ⓓ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓤ⊶Ⓣ⊶Ⓡ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓛ⊶Ⓤ⊶Ⓝ ⊶Ⓜ⊶Ⓣ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓢ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓐ",
+    "⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓓ⊶Ⓐ⊶Ⓡ⊶Ⓒ⊶Ⓗ⊶Ⓓ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓞ⊶Ⓨ⊶Ⓔ ⊶Ⓖ⊶Ⓐ⊶Ⓢ⊶Ⓗ⊶Ⓣ⊶Ⓘ ⊶Ⓚ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓘ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓚ ⊶Ⓗ⊶Ⓐ⊶Ⓣ⊶Ⓗ ⊶Ⓣ⊶Ⓞ⊶Ⓓ⊶Ⓗ ⊶Ⓚ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓚ ⊶Ⓜ⊶Ⓤ⊶Ⓗ ⊶Ⓜ⊶Ⓔ ⊶Ⓕ⊶Ⓐ⊶Ⓢ⊶Ⓐ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓛ⊶Ⓔ⊶Ⓐ⊶Ⓥ⊶Ⓔ ⊶Ⓛ⊶Ⓔ ⊶Ⓣ⊶Ⓤ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓟ⊶Ⓐ⊶Ⓢ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓝ⊶Ⓐ⊶Ⓘ ⊶Ⓐ⊶Ⓨ⊶Ⓐ ⊶Ⓜ⊶Ⓔ⊶Ⓚ⊶Ⓞ",
+    "⊶Ⓛ⊶Ⓔ⊶Ⓐ⊶Ⓥ⊶Ⓔ ⊶Ⓛ⊶Ⓔ ⊶Ⓣ⊶Ⓤ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓘ⊶Ⓓ⊶Ⓔ⊶Ⓡ ⊶Ⓢ⊶Ⓔ",
+    "⊶Ⓛ⊶Ⓔ⊶Ⓐ⊶Ⓥ⊶Ⓔ ⊶Ⓛ⊶Ⓔ ⊶Ⓙ⊶Ⓛ⊶Ⓓ⊶Ⓘ ⊶Ⓢ⊶Ⓔ ⊶Ⓦ⊶Ⓡ⊶Ⓝ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓛ⊶Ⓔ⊶Ⓐ⊶Ⓥ⊶Ⓔ ⊶Ⓝ⊶Ⓨ ⊶Ⓛ⊶Ⓔ⊶Ⓖ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ ⊶Ⓑ⊶Ⓐ⊶Ⓣ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓛ⊶Ⓔ⊶Ⓐ⊶Ⓥ⊶Ⓔ ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓕ⊶Ⓐ⊶Ⓢ⊶Ⓣ ⊶Ⓛ⊶Ⓔ⊶Ⓐ⊶Ⓥ⊶Ⓔ ⊶Ⓛ⊶Ⓔ ⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓙ⊶Ⓞ⊶Ⓡ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓤ⊶Ⓣ⊶Ⓞ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ",
+    "⊶Ⓞ⊶Ⓨ ⊶Ⓗ⊶Ⓘ⊶Ⓙ⊶Ⓓ⊶Ⓔ ⊶Ⓚ⊶Ⓗ⊶Ⓐ⊶Ⓝ⊶Ⓐ ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓩ⊶Ⓞ⊶Ⓡ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓞ ⊶Ⓘ⊶Ⓛ⊶Ⓨ ⊶Ⓡ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓣ⊶Ⓜ⊶Ⓚ⊶Ⓒ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓢ⊶Ⓗ⊶Ⓘ ⊶Ⓢ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓣ⊶Ⓤ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓢ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ",
+    "⊶Ⓢ⊶Ⓗ⊶Ⓘ ⊶Ⓢ⊶Ⓔ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ ⊶Ⓦ⊶Ⓡ⊶Ⓝ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓨ⊶Ⓤ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶ⓒ⊶ⓤ⊶ⓓ⊶ⓦ⊶ⓐ",
+    "⊶Ⓟ⊶Ⓡ⊶Ⓞ⊶Ⓞ⊶Ⓕ ⊶Ⓒ⊶Ⓡ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ⊶Ⓞ⊶Ⓞ⊶Ⓕ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ⊶Ⓞ⊶Ⓞ⊶Ⓕ ⊶Ⓗ⊶Ⓞ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓚ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓒ⊶Ⓗ⊶Ⓘ⊶Ⓛ⊶Ⓛ⊶Ⓐ⊶Ⓡ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ ⊶Ⓑ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓞ⊶Ⓨ ⊶Ⓗ⊶Ⓘ⊶Ⓙ⊶Ⓓ⊶Ⓔ ⊶Ⓚ⊶Ⓗ⊶Ⓐ⊶Ⓝ⊶Ⓐ ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓩ⊶Ⓞ⊶Ⓡ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶ⓜ⊶ⓐ⊶ⓓ⊶ⓡ⊶ⓒ⊶ⓗ⊶ⓞ⊶ⓓ?",
+    "⊶Ⓐ⊶Ⓑ ⊶Ⓣ⊶Ⓚ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓗ⊶Ⓞ⊶Ⓖ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ?",
+    "⊶Ⓝ⊶Ⓨ ⊶Ⓝ⊶Ⓨ ⊶Ⓜ⊶Ⓔ ⊶Ⓚ⊶Ⓤ⊶Ⓒ⊶Ⓗ ⊶Ⓝ⊶Ⓨ ⊶Ⓙ⊶Ⓐ⊶Ⓝ⊶Ⓣ⊶Ⓐ ⊶Ⓑ⊶Ⓢ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓢ⊶Ⓑ⊶Ⓢ⊶Ⓔ ⊶Ⓟ⊶Ⓗ⊶Ⓔ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓞ ⊶Ⓑ⊶Ⓞ⊶Ⓛ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓝ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓜ ⊶Ⓚ⊶Ⓡ⊶Ⓔ",
+    "⊶Ⓨ⊶Ⓐ⊶Ⓗ⊶Ⓐ ⊶Ⓑ⊶Ⓗ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓒ⊶Ⓔ ⊶Ⓟ⊶Ⓘ⊶Ⓛ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓐ⊶Ⓑ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓣ⊶Ⓞ ⊶Ⓑ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓔ⊶Ⓖ⊶Ⓘ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓞ⊶Ⓜ⊶Ⓜ⊶Ⓨ",
+    "⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓓ⊶Ⓐ⊶Ⓡ⊶Ⓒ⊶Ⓗ⊶Ⓓ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓚ⊶Ⓔ ⊶Ⓨ⊶Ⓗ⊶Ⓐ ⊶Ⓢ⊶Ⓔ",
+    "⊶Ⓒ⊶Ⓞ⊶Ⓩ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓗ⊶Ⓘ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓣ⊶Ⓞ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓑ⊶Ⓞ⊶Ⓛ ⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓝ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓗ⊶Ⓞ⊶Ⓖ⊶Ⓘ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶⊶Ⓘ ⊶Ⓙ⊶Ⓞ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ⊶Ⓣ⊶Ⓘ ⊶Ⓙ⊶Ⓞ⊶Ⓖ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓡ⊶Ⓨ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓘ ⊶Ⓒ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓔ⊶Ⓜ⊶Ⓞ⊶Ⓙ⊶Ⓘ ⊶Ⓓ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ? ⊶Ⓒ⊶Ⓗ⊶Ⓜ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓐ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ?",
+    "⊶Ⓣ⊶Ⓜ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓡ⊶Ⓘ ⊶Ⓗ⊶Ⓞ⊶Ⓖ⊶Ⓘ ⊶Ⓕ⊶Ⓡ⊶Ⓡ⊶Ⓣ⊶Ⓞ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ? ⊶Ⓚ⊶Ⓑ ? ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓔ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓚ⊶Ⓔ⊶Ⓚ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓢ⊶Ⓒ⊶Ⓗ ⊶Ⓜ⊶Ⓔ⊶Ⓨ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓔ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓘ ⊶Ⓣ⊶Ⓤ⊶Ⓝ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ",
+    "⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓐ ⊶Ⓢ⊶Ⓒ⊶Ⓗ ⊶Ⓝ⊶Ⓨ ⊶Ⓑ⊶Ⓞ⊶Ⓛ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓢ⊶Ⓒ⊶Ⓗ ⊶Ⓜ⊶Ⓔ⊶Ⓨ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓘ⊶Ⓐ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓔ ⊶Ⓢ⊶Ⓣ⊶Ⓗ",
+    "⊶Ⓜ⊶Ⓣ⊶Ⓛ⊶Ⓑ ⊶Ⓣ⊶Ⓜ⊶Ⓡ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓣ⊶Ⓞ",
+    "⊶Ⓟ⊶Ⓤ⊶Ⓡ⊶Ⓐ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓣ⊶Ⓜ⊶Ⓡ ⊶Ⓕ⊶Ⓡ⊶Ⓡ⊶Ⓣ⊶Ⓞ",
+    "⊶Ⓞ⊶Ⓗ ⊶Ⓞ⊶Ⓚ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ ⊶Ⓕ⊶Ⓘ⊶Ⓡ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓐ ⊶Ⓓ⊶Ⓐ⊶Ⓜ⊶Ⓐ⊶Ⓓ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ? ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓔ ⊶Ⓟ⊶Ⓔ⊶Ⓗ⊶Ⓛ⊶Ⓔ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓔ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓣ⊶Ⓞ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓝ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓥ⊶Ⓨ⊶Ⓐ⊶Ⓢ⊶Ⓣ ⊶Ⓗ⊶Ⓤ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓣ⊶Ⓞ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓔ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓚ⊶Ⓤ⊶Ⓒ⊶Ⓗ ⊶Ⓑ⊶Ⓘ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ? ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓐ ?",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓜ⊶Ⓣ ⊶Ⓗ⊶Ⓢ⊶Ⓢ",
+    "⊶Ⓨ⊶Ⓤ⊶Ⓡ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶⊶Ⓘ ⊶Ⓜ⊶Ⓞ⊶Ⓜ",
+    "⊶Ⓐ⊶Ⓡ⊶Ⓔ ⊶Ⓢ⊶Ⓑ⊶Ⓚ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶⊶Ⓘ ⊶Ⓞ⊶Ⓡ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓘ",
+    "⊶Ⓐ⊶Ⓡ⊶Ⓔ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ ⊶Ⓔ⊶Ⓚ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓡ",
+    "⊶Ⓣ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓘ ⊶Ⓣ⊶Ⓡ⊶Ⓗ",
+    "⊶Ⓔ⊶Ⓚ ⊶Ⓛ⊶Ⓘ⊶Ⓝ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓣ⊶Ⓜ⊶Ⓡ",
+    "⊶Ⓠ",
+    "⊶Ⓞ⊶Ⓒ⊶Ⓨ ⊶Ⓐ⊶Ⓑ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓟ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓛ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓤ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓣ⊶Ⓞ",
+    "⊶Ⓠ ?",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓨ⊶Ⓨ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓐ ⊶Ⓔ⊶Ⓚ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓡ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓢ⊶Ⓤ⊶Ⓝ ⊶Ⓓ⊶Ⓞ⊶Ⓢ⊶Ⓣ ⊶Ⓣ⊶Ⓜ⊶Ⓡ",
+    "⊶Ⓑ⊶Ⓗ⊶Ⓐ⊶Ⓖ ⊶Ⓙ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓕ ⊶Ⓒ⊶Ⓡ⊶Ⓡ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶⊶Ⓘ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓜ⊶Ⓡ ⊶Ⓕ⊶Ⓡ⊶Ⓡ⊶Ⓣ⊶Ⓞ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓛ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓜ⊶Ⓡ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓣ⊶Ⓞ ⊶Ⓐ⊶Ⓔ⊶Ⓢ⊶Ⓔ ⊶Ⓗ⊶Ⓘ ⊶Ⓒ⊶Ⓤ⊶Ⓓ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓗ⊶Ⓨ⊶Ⓨ ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓗ⊶Ⓘ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓛ⊶Ⓔ⊶Ⓝ⊶Ⓐ",
+    "⊶Ⓞ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓐ ⊶Ⓞ⊶Ⓡ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓨ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓞ ⊶Ⓝ⊶Ⓐ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓞ ⊶Ⓜ⊶Ⓣ ⊶Ⓑ⊶Ⓗ⊶Ⓐ⊶Ⓖ ⊶Ⓙ⊶Ⓐ⊶Ⓞ",
+    "⊶Ⓑ⊶Ⓨ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓗ⊶Ⓨ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ?",
+    "⊶Ⓠ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓠ ⊶Ⓡ⊶Ⓗ⊶Ⓔ ⊶Ⓗ⊶Ⓞ ?",
+    "⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓔ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓜ⊶Ⓣ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶⊶Ⓘ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓘ ⊶Ⓒ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶Ⓟ⊶Ⓐ⊶Ⓛ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓚ⊶Ⓜ⊶Ⓩ⊶Ⓡ⊶Ⓞ⊶Ⓡ ⊶Ⓔ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓔ⊶Ⓚ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ?",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓣ⊶Ⓗ⊶Ⓐ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ?",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓢ⊶Ⓛ⊶Ⓘ⊶Ⓓ⊶Ⓔ ⊶Ⓛ⊶Ⓔ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶ⒶⓉ ⊶Ⓒ⊶Ⓡ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓤ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓒ⊶Ⓟ ⊶Ⓜ⊶Ⓣ ⊶Ⓒ⊶Ⓡ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓗ⊶Ⓨ⊶Ⓨ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓐ",
+    "⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓢ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓕ⊶Ⓤ ⊶Ⓚ⊶Ⓗ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓡ ⊶Ⓚ⊶Ⓗ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓡ",
+    "⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ ⊶Ⓙ⊶Ⓐ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓨ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓚ⊶Ⓜ⊶Ⓩ⊶Ⓞ⊶Ⓡ ⊶Ⓜ⊶Ⓒ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ",
+    "⊶Ⓨ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓜ⊶Ⓡ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓝ⊶Ⓨ ⊶Ⓒ⊶Ⓟ ⊶Ⓝ⊶Ⓨ ⊶Ⓒ⊶Ⓡ⊶Ⓡ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓜ⊶Ⓣ ⊶Ⓒ⊶Ⓡ⊶Ⓡ",
+    "⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓡ⊶ⒶⓂ ⊶Ⓢ⊶Ⓔ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓔ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓔ⊶Ⓚ",
+    "⊶Ⓒ⊶Ⓟ ⊶Ⓒ⊶Ⓡ⊶Ⓒ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓔ⊶Ⓖ⊶Ⓐ !",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ? ⊶Ⓜ⊶Ⓒ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓐ ⊶Ⓒ⊶Ⓞ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓝ⊶Ⓨ ⊶Ⓔ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓘ ⊶Ⓤ⊶Ⓟ⊶Ⓐ⊶Ⓡ ⊶Ⓢ⊶Ⓔ ⊶Ⓡ⊶Ⓞ⊶Ⓒ⊶Ⓚ⊶Ⓔ⊶Ⓣ ⊶Ⓟ⊶Ⓔ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓗ ⊶Ⓒ⊶Ⓔ ⊶ⒷⓈⓈ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓝ⊶Ⓔ ⊶Ⓐ⊶Ⓨ⊶Ⓐ ⊶Ⓗ⊶Ⓤ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓣ⊶Ⓐ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ ⊶Ⓚ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓣ⊶Ⓐ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓦ⊶Ⓡ⊶Ⓝ⊶Ⓐ ⊶ⓉⓇ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ",
+    "⊶Ⓣ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓑ⊶Ⓐ⊶Ⓚ⊶Ⓐ ⊶Ⓒ⊶Ⓞ⊶Ⓓ⊶Ⓔ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓜ⊶Ⓚ⊶Ⓒ ⊶Ⓜ⊶Ⓐ⊶Ⓘ⊶Ⓝ ⊶Ⓑ⊶Ⓤ⊶Ⓡ⊶Ⓕ",
+    "⊶Ⓑ⊶Ⓗ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓚ⊶Ⓘ ⊶Ⓙ⊶Ⓗ⊶Ⓐ⊶Ⓣ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓐ ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓖ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓜ⊶Ⓚ⊶Ⓒ ⊶Ⓜ⊶Ⓐ⊶Ⓘ⊶Ⓝ ⊶Ⓜ⊶Ⓞ⊶Ⓤ⊶Ⓝ⊶Ⓣ ⊶Ⓔ⊶Ⓥ⊶Ⓔ⊶Ⓡ⊶Ⓔ⊶Ⓢ⊶Ⓣ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓗ ⊶Ⓜ⊶Ⓔ⊶Ⓨ ⊶Ⓛ⊶Ⓔ⊶Ⓖ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓐ",
+    "⊶Ⓗ⊶Ⓘ⊶Ⓙ⊶Ⓓ⊶Ⓔ ⊶Ⓚ⊶Ⓘ ⊶Ⓙ⊶Ⓗ⊶Ⓐ⊶Ⓣ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓦ⊶Ⓡ⊶Ⓝ⊶Ⓐ ⊶ⓉⓇ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓝ⊶Ⓨ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓚ⊶Ⓘ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓢ⊶Ⓑ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓟ⊶Ⓡ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ",
+    "⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓟ⊶Ⓣ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓞ⊶Ⓡ ⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓔ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓑ⊶Ⓢ ⊶Ⓑ⊶Ⓢ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ",
+    "⊶Ⓑ⊶Ⓢ ⊶Ⓑ⊶Ⓢ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓣ⊶Ⓗ⊶Ⓝ⊶Ⓚ⊶Ⓢ⊶Ⓢ",
+    "⊶Ⓑ⊶Ⓢ ⊶Ⓑ⊶Ⓢ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓘ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ",
+    "⊶Ⓑ⊶Ⓢ ⊶Ⓑ⊶Ⓢ ⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓙ⊶Ⓞ⊶Ⓡ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ ⊶Ⓖ⊶Ⓨ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓑ",
+    "⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ ⊶Ⓖ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ ⊶Ⓖ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓢ⊶Ⓐ⊶Ⓑ⊶Ⓘ⊶Ⓣ ⊶Ⓚ⊶Ⓡ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓗ⊶Ⓤ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ",
+    "⊶Ⓔ⊶Ⓐ⊶Ⓢ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓔ⊶Ⓐ⊶Ⓢ⊶Ⓨ ⊶Ⓦ⊶8 ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓐ⊶Ⓑ",
+    "⊶Ⓢ⊶Ⓐ⊶Ⓝ⊶Ⓢ ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓗ⊶Ⓐ ⊶Ⓚ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓖ⊶Ⓘ ⊶Ⓐ⊶Ⓙ⊶Ⓙ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓞ ⊶Ⓑ⊶Ⓘ⊶Ⓝ⊶Ⓐ ⊶Ⓢ⊶Ⓐ⊶Ⓝ⊶Ⓢ⊶Ⓢ ⊶Ⓛ⊶Ⓔ⊶Ⓣ⊶Ⓔ ⊶Ⓗ⊶Ⓤ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓔ ⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓙ⊶Ⓞ⊶Ⓡ",
+    "⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓝ⊶Ⓞ⊶Ⓡ⊶Ⓜ⊶Ⓘ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓔ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓝ⊶Ⓞ⊶Ⓡ⊶Ⓜ⊶Ⓘ⊶Ⓔ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓢ ⊶Ⓣ⊶Ⓗ⊶Ⓔ⊶Ⓚ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓢ ⊶Ⓣ⊶Ⓗ⊶Ⓔ⊶Ⓚ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ",
+    "⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓙ⊶Ⓞ⊶Ⓡ ⊶Ⓣ⊶Ⓗ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓔ⊶Ⓢ⊶Ⓛ⊶Ⓘ⊶Ⓨ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ",
+    "⊶Ⓜ⊶Ⓐ⊶Ⓘ ⊶Ⓢ⊶Ⓑ ⊶Ⓙ⊶Ⓐ⊶Ⓝ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓛ ⊶Ⓒ⊶Ⓗ⊶Ⓛ ⊶Ⓗ⊶Ⓣ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓚ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓢ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓙ⊶Ⓞ⊶Ⓡ ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓐ ⊶Ⓑ⊶Ⓒ⊶Ⓗ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓣ ⊶Ⓖ⊶Ⓝ⊶Ⓓ⊶Ⓘ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓚ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓐ ⊶Ⓖ⊶Ⓝ⊶Ⓓ⊶Ⓐ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓑ⊶Ⓣ⊶Ⓐ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓕ⊶Ⓘ⊶Ⓡ ⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓝ⊶Ⓨ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓝ⊶Ⓨ ⊶Ⓚ⊶Ⓞ⊶Ⓝ ⊶Ⓒ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓘ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓞ",
+    "⊶Ⓡ⊶Ⓤ⊶Ⓚ ⊶Ⓐ⊶Ⓐ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓞ⊶Ⓓ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓦ⊶Ⓐ⊶Ⓘ⊶Ⓣ ⊶Ⓒ⊶Ⓡ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓞ⊶Ⓓ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ⊶Ⓗ⊶Ⓤ",
+    "⊶Ⓦ⊶Ⓐ⊶Ⓘ⊶Ⓣ ⊶Ⓒ⊶Ⓡ ⊶Ⓡ⊶Ⓐ⊶Ⓑ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓡ⊶Ⓗ⊶Ⓘ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓦ⊶Ⓐ⊶Ⓘ⊶Ⓣ ⊶Ⓚ⊶Ⓡ ⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓞ⊶Ⓓ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓦ⊶Ⓐ⊶Ⓘ⊶Ⓣ ⊶Ⓛ⊶Ⓔ ⊶Ⓣ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓝ⊶Ⓔ ⊶Ⓓ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓞ",
+    "⊶Ⓡ⊶Ⓤ⊶Ⓚ ⊶Ⓙ⊶Ⓐ ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓡ⊶Ⓚ⊶Ⓗ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓛ⊶Ⓘ⊶Ⓨ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓕ⊶Ⓐ⊶Ⓜ⊶Ⓞ⊶Ⓤ⊶Ⓢ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓐ⊶ⒶⓃ ⊶Ⓛ⊶Ⓘ⊶Ⓐ ⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓢ⊶Ⓐ⊶Ⓛ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓐ⊶ⒶⓃ ⊶Ⓛ⊶Ⓘ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓢ⊶Ⓗ⊶Ⓐ⊶Ⓝ⊶Ⓣ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓗ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ",
+    "⊶Ⓢ⊶Ⓗ⊶Ⓐ⊶Ⓝ⊶Ⓣ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓗ⊶Ⓚ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓞ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓢ⊶Ⓔ ⊶Ⓢ⊶Ⓗ⊶Ⓐ⊶Ⓝ⊶Ⓣ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓗ ⊶Ⓣ⊶Ⓤ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓐ⊶Ⓑ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓨ⊶Ⓗ⊶Ⓐ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓔ ⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ ⊶Ⓝ⊶Ⓨ ⊶Ⓐ⊶Ⓨ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓛ⊶Ⓔ ⊶ⓛ⊶ⓤ⊶ⓝ⊶ⓓ ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓜ⊶Ⓐ⊶Ⓓ⊶Ⓐ⊶Ⓡ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓒ⊶Ⓨ⊶Ⓐ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓒ⊶Ⓨ⊶Ⓐ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓔ ⊶Ⓢ⊶Ⓒ⊶Ⓗ ⊶Ⓑ⊶Ⓣ⊶Ⓐ ⊶Ⓒ⊶Ⓞ⊶Ⓜ ⊶Ⓒ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓘ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓞ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓛ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓘ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓞ ⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓚ⊶Ⓞ⊶Ⓘ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓚ⊶Ⓐ⊶Ⓣ ⊶Ⓝ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓢ⊶Ⓑ ⊶Ⓙ⊶Ⓐ⊶Ⓝ⊶Ⓣ⊶Ⓔ ⊶Ⓔ⊶Ⓨ ⊶Ⓚ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓓ⊶Ⓚ⊶Ⓐ⊶Ⓓ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓣ⊶Ⓗ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓝ⊶Ⓔ ⊶Ⓦ⊶Ⓛ⊶Ⓘ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓜ⊶Ⓔ⊶Ⓘ ⊶Ⓚ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓙ⊶Ⓝ⊶Ⓣ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓞ ⊶Ⓚ⊶Ⓞ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓘ⊶Ⓐ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓐ ⊶Ⓥ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓝ⊶Ⓝ⊶Ⓐ ⊶Ⓢ⊶Ⓗ⊶Ⓘ ⊶Ⓣ⊶Ⓗ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓦ⊶Ⓞ ⊶Ⓖ⊶Ⓛ⊶Ⓣ ⊶Ⓝ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓦ⊶Ⓞ ⊶Ⓢ⊶Ⓗ⊶Ⓘ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓓ⊶Ⓚ⊶Ⓐ⊶Ⓓ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓚ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓚ⊶Ⓘ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓞ⊶Ⓜ⊶Ⓕ⊶Ⓞ⊶Ⓞ",
+    "⊶Ⓑ⊶Ⓤ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓔ⊶Ⓔ⊶Ⓡ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓣ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓛ ⊶Ⓜ⊶Ⓔ ⊶Ⓛ⊶Ⓞ⊶Ⓓ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓚ⊶Ⓔ ⊶Ⓤ⊶Ⓢ⊶Ⓚ⊶Ⓘ ⊶Ⓓ⊶Ⓗ⊶Ⓐ⊶Ⓓ⊶Ⓚ⊶Ⓐ⊶Ⓝ ⊶Ⓡ⊶Ⓞ⊶Ⓚ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓛ⊶Ⓤ⊶Ⓛ⊶Ⓛ⊶Ⓔ ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓣ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓐ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓗ⊶Ⓝ ⊶Ⓚ⊶Ⓘ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ ⊶Ⓑ⊶Ⓐ⊶ⒶⓉ ⊶Ⓚ⊶Ⓗ⊶ⓉⓂ",
+    "⊶Ⓢ⊶Ⓤ⊶Ⓝ ⊶Ⓔ⊶Ⓚ ⊶Ⓜ⊶Ⓐ⊶Ⓩ⊶Ⓔ ⊶Ⓚ⊶Ⓘ ⊶Ⓑ⊶Ⓐ⊶ⒶⓉ ⊶Ⓑ⊶Ⓐ⊶Ⓣ⊶Ⓐ⊶Ⓞ ⊶Ⓚ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶रैं⊶डी ⊶Ⓗ⊶Ⓐ⊶Ⓘ",
+    "⊶Ⓒ⊶Ⓞ⊶Ⓓ⊶Ⓤ ⊶Ⓒ⊶Ⓞ⊶Ⓓ⊶Ⓤ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓞ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓐ⊶Ⓙ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓞ⊶Ⓨ⊶Ⓔ",
+    "⊶Ⓢ⊶Ⓤ⊶Ⓝ ⊶Ⓢ⊶Ⓤ⊶Ⓝ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓚ⊶Ⓘ⊶Ⓛ⊶Ⓐ⊶Ⓢ ⊶Ⓝ⊶Ⓨ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓑ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓟ⊶Ⓡ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓗ⊶Ⓞ⊶Ⓣ⊶Ⓔ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓜ⊶Ⓚ⊶Ⓒ",
+    "⊶Ⓣ⊶Ⓜ⊶Ⓒ⊶Ⓛ ⊶Ⓢ⊶Ⓤ⊶Ⓝ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓜ⊶Ⓞ⊶Ⓞ⊶Ⓣ ⊶Ⓓ⊶Ⓤ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓑ⊶Ⓗ⊶Ⓖ⊶Ⓝ⊶Ⓨ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓕ⊶Ⓡ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓢ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓨ⊶Ⓔ ⊶Ⓥ⊶Ⓘ ⊶Ⓢ⊶Ⓗ⊶Ⓘ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓚ⊶Ⓒ ⊶Ⓑ⊶Ⓢ",
+    "⊶Ⓐ⊶Ⓙ ⊶Ⓚ⊶Ⓤ⊶Ⓒ⊶Ⓗ ⊶Ⓝ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓡ⊶Ⓨ ⊶Ⓚ⊶Ⓡ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓢ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓞ⊶Ⓡ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓘ⊶Ⓑ⊶Ⓤ⊶Ⓡ ⊶Ⓢ⊶Ⓤ⊶Ⓝ",
+    "⊶Ⓣ⊶Ⓞ⊶Ⓡ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓕ⊶Ⓤ⊶Ⓓ⊶Ⓓ⊶Ⓘ ⊶Ⓞ⊶Ⓨ⊶Ⓔ",
+    "⊶Ⓗ⊶Ⓐ⊶Ⓨ⊶Ⓔ ⊶Ⓗ⊶Ⓐ⊶Ⓨ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ⊶Ⓚ⊶Ⓔ ⊶Ⓟ⊶Ⓐ⊶Ⓢ⊶Ⓘ⊶Ⓝ⊶Ⓔ..",
+    "⊶Ⓚ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓔ ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓐ⊶Ⓣ⊶Ⓣ⊶Ⓔ ⊶Ⓢ⊶Ⓤ⊶Ⓝ",
+    "⊶Ⓚ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓐ ⊶Ⓙ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓗ ⊶Ⓜ⊶Ⓔ⊶Ⓘ ⊶Ⓛ⊶Ⓔ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓐ..",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓣ ⊶Ⓚ⊶Ⓔ ⊶Ⓕ⊶Ⓔ⊶Ⓝ⊶Ⓚ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓝ⊶Ⓞ⊶Ⓝ ⊶Ⓢ⊶Ⓣ⊶Ⓞ⊶Ⓟ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓕ⊶Ⓐ⊶ⒶⓉ ⊶Ⓖ⊶Ⓐ⊶Ⓨ⊶Ⓘ ⊶Ⓐ⊶Ⓙ⊶Ⓣ⊶Ⓞ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓗ⊶Ⓐ⊶Ⓝ ⊶Ⓚ⊶Ⓐ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ ⊶Ⓜ⊶Ⓔ ⊶Ⓚ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓐ ⊶Ⓚ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ ⊶Ⓒ⊶Ⓗ⊶Ⓘ⊶Ⓟ⊶Ⓚ⊶Ⓐ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓝ⊶Ⓞ⊶Ⓝ ⊶Ⓢ⊶Ⓣ⊶Ⓞ⊶Ⓟ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓖ⊶Ⓞ⊶Ⓛ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶ⒶⓇ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓤ⊶Ⓢ⊶Ⓢ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶100 ⊶Ⓒ⊶Ⓗ⊶Ⓔ⊶Ⓓ⊶Ⓓ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓓ⊶Ⓘ⊶Ⓓ⊶Ⓘ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶Ⓟ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓓ⊶Ⓘ⊶Ⓓ⊶Ⓘ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓦ⊶Ⓐ⊶Ⓢ⊶Ⓘ⊶Ⓡ ⊶Ⓗ⊶Ⓞ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓔ ⊶Ⓛ⊶Ⓐ⊶Ⓥ⊶Ⓓ⊶Ⓔ ⊶Ⓟ⊶Ⓐ⊶Ⓡ ⊶Ⓤ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓛ ⊶Ⓤ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓛ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓣ⊶Ⓘ ⊶Ⓗ⊶Ⓐ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓘ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶Ⓟ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓘ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓣ⊶Ⓐ⊶Ⓜ⊶Ⓐ⊶Ⓣ⊶Ⓐ⊶Ⓡ ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓐ⊶Ⓡ⊶Ⓐ⊶Ⓗ ⊶Ⓛ⊶Ⓐ⊶ⒶⓁ ⊶Ⓗ⊶Ⓞ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓓ⊶Ⓘ⊶Ⓓ⊶Ⓘ ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓕ⊶Ⓐ⊶ⒶⓅ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓑ⊶Ⓘ⊶Ⓒ⊶Ⓗ ⊶Ⓑ⊶Ⓐ⊶Ⓙ⊶Ⓐ⊶Ⓡ ⊶Ⓜ⊶Ⓔ ⊶Ⓝ⊶Ⓘ⊶Ⓛ⊶Ⓐ⊶Ⓜ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓚ⊶Ⓐ⊶Ⓕ⊶Ⓕ⊶Ⓐ⊶Ⓝ ⊶Ⓜ⊶Ⓔ ⊶Ⓓ⊶Ⓐ⊶Ⓕ⊶Ⓐ⊶Ⓝ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓙ⊶Ⓐ⊶Ⓓ⊶Ⓐ ⊶Ⓝ⊶Ⓐ ⊶Ⓤ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓛ ⊶Ⓦ⊶Ⓐ⊶Ⓡ⊶Ⓝ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓔ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓢ⊶Ⓐ⊶Ⓢ⊶Ⓣ⊶Ⓐ ⊶Ⓚ⊶Ⓔ⊶Ⓨ⊶Ⓑ⊶Ⓞ⊶Ⓐ⊶Ⓡ⊶Ⓓ ⊶Ⓛ⊶Ⓐ⊶Ⓖ⊶Ⓐ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓐ⊶Ⓖ⊶Ⓐ⊶Ⓡ ⊶Ⓣ⊶Ⓤ ⊶Ⓒ⊶Ⓟ ⊶Ⓑ⊶Ⓞ⊶Ⓛ⊶Ⓔ⊶Ⓖ⊶Ⓐ ⊶Ⓣ⊶Ⓞ ⊶Ⓜ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓖ⊶Ⓐ⊶Ⓡ⊶Ⓐ⊶Ⓜ ⊶Ⓜ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓗ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓤ⊶Ⓡ ⊶Ⓜ⊶Ⓔ ⊶Ⓗ⊶Ⓐ⊶Ⓣ⊶Ⓗ⊶Ⓞ⊶Ⓡ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓚ⊶Ⓘ⊶Ⓛ⊶Ⓛ⊶Ⓘ ⊶Ⓣ⊶Ⓗ⊶Ⓞ⊶Ⓚ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓙ⊶Ⓙ⊶Ⓘ ⊶Ⓢ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶Ⓟ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ ⊶Ⓕ⊶Ⓐ⊶ⒶⓉ ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓙ⊶Ⓐ⊶ⒶⓃ ⊶Ⓚ⊶Ⓔ ⊶Ⓒ⊶Ⓐ⊶Ⓝ⊶Ⓒ⊶Ⓔ⊶Ⓡ ⊶Ⓦ⊶Ⓐ⊶Ⓛ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶Ⓟ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓝ⊶Ⓞ⊶Ⓝ ⊶Ⓢ⊶Ⓣ⊶Ⓞ⊶Ⓟ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓙ⊶Ⓐ⊶ⒶⓃ ⊶Ⓚ⊶Ⓔ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ ⊶Ⓖ⊶Ⓛ⊶Ⓘ⊶Ⓣ⊶Ⓒ⊶Ⓗ ⊶Ⓣ⊶Ⓨ⊶Ⓟ⊶Ⓘ⊶Ⓝ⊶Ⓖ ⊶Ⓚ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓥ⊶Ⓐ⊶Ⓢ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓗ⊶Ⓐ⊶Ⓘ ⊶Ⓢ⊶Ⓐ⊶Ⓑ⊶Ⓚ⊶Ⓐ ⊶Ⓜ⊶Ⓤ⊶Ⓗ ⊶Ⓜ⊶Ⓔ⊶Ⓗ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ ⊶Ⓛ⊶Ⓔ⊶Ⓚ⊶Ⓡ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓐ ⊶Ⓚ⊶Ⓗ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓐ⊶Ⓝ ⊶Ⓚ⊶Ⓞ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓛ⊶Ⓐ⊶Ⓣ⊶Ⓘ ⊶Ⓗ⊶Ⓐ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓤ ⊶Ⓞ⊶Ⓡ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓐ ⊶Ⓚ⊶Ⓗ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓐ⊶Ⓝ ⊶Ⓚ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓑ⊶Ⓘ⊶Ⓒ⊶Ⓗ ⊶Ⓑ⊶Ⓐ⊶Ⓙ⊶Ⓐ⊶Ⓡ ⊶Ⓜ⊶Ⓔ ⊶Ⓜ⊶Ⓞ⊶Ⓙ⊶Ⓡ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓦ⊶Ⓐ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓔ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ ⊶Ⓖ⊶Ⓞ⊶Ⓛ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶ⒶⓇ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓓ⊶Ⓤ⊶Ⓢ⊶Ⓡ⊶Ⓐ ⊶Ⓑ⊶Ⓛ⊶Ⓐ⊶Ⓒ⊶Ⓚ ⊶Ⓗ⊶Ⓞ⊶Ⓛ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓝ⊶Ⓐ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓚ⊶Ⓐ⊶Ⓕ⊶Ⓕ⊶Ⓐ⊶Ⓝ ⊶Ⓜ⊶Ⓔ ⊶Ⓓ⊶Ⓐ⊶Ⓕ⊶Ⓐ⊶Ⓝ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓘ⊶ⓨ⊶Ⓞ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓖ⊶Ⓞ⊶Ⓓ⊶Ⓩ⊶Ⓘ⊶Ⓛ⊶Ⓛ⊶Ⓐ ⊶Ⓚ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ ⊶Ⓓ⊶Ⓐ⊶Ⓛ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓖ⊶Ⓞ⊶Ⓓ⊶Ⓩ⊶Ⓘ⊶Ⓛ⊶Ⓛ⊶Ⓐ ⊶Ⓚ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓕ⊶Ⓐ⊶ⒶⓇ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓢ⊶Ⓔ ⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓓ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓨ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓕ⊶Ⓛ⊶Ⓨ ⊶Ⓚ⊶Ⓘ⊶Ⓢ⊶Ⓢ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓟ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓘ ⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓓ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓤ⊶Ⓜ⊶Ⓜ⊶Ⓨ ⊶Ⓚ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓒ⊶Ⓗ⊶Ⓘ⊶ⓨ⊶Ⓞ ⊶Ⓚ⊶Ⓞ ⊶Ⓚ⊶Ⓐ⊶Ⓣ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓟ⊶Ⓐ⊶Ⓚ⊶Ⓚ⊶Ⓐ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓙ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓚ⊶Ⓗ⊶Ⓤ⊶Ⓝ⊶Ⓝ ⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓤ⊶Ⓢ⊶Ⓢ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓟ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓘ ⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓓ⊶Ⓞ⊶Ⓝ⊶Ⓐ⊶Ⓣ⊶Ⓔ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶Ⓟ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓗ⊶Ⓐ⊶Ⓡ ⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓓ⊶Ⓘ⊶Ⓓ⊶Ⓘ ⊶Ⓚ⊶Ⓔ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ ⊶Ⓨ⊶Ⓞ⊶Ⓖ⊶Ⓘ ⊶Ⓙ⊶Ⓘ ⊶Ⓚ⊶Ⓐ ⊶Ⓑ⊶Ⓤ⊶Ⓛ⊶Ⓛ⊶Ⓓ⊶Ⓞ⊶Ⓩ⊶Ⓔ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓛ⊶Ⓐ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓓ⊶Ⓘ⊶Ⓓ⊶Ⓘ ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓕ⊶Ⓛ⊶Ⓐ⊶Ⓣ ⊶Ⓗ⊶Ⓞ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓙ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓐ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ ⊶Ⓕ⊶Ⓐ⊶ⒶⓉ ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓓ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓐ⊶Ⓚ⊶49 ⊶Ⓢ⊶Ⓔ ⊶Ⓖ⊶Ⓞ⊶Ⓛ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓖ⊶Ⓞ⊶Ⓛ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶9 ⊶Ⓤ⊶Ⓝ⊶Ⓘ⊶Ⓥ⊶Ⓔ⊶Ⓡ⊶Ⓢ ⊶Ⓐ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓐ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓓ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓔ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶ⓨ⊶Ⓞ ⊶Ⓚ⊶Ⓐ ⊶Ⓚ⊶Ⓞ⊶Ⓣ⊶Ⓗ⊶Ⓐ ⊶Ⓑ⊶Ⓐ⊶Ⓝ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓞ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ⊶Ⓝ⊶Ⓔ ⊶Ⓚ⊶Ⓞ ⊶Ⓑ⊶Ⓐ⊶Ⓘ⊶Ⓣ⊶Ⓗ⊶Ⓐ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓞ⊶Ⓣ⊶Ⓗ⊶Ⓔ ⊶Ⓟ⊶Ⓐ⊶Ⓡ⊶Ⓡ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓚ⊶Ⓞ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓒ⊶Ⓗ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ ⊶Ⓑ⊶Ⓐ⊶Ⓗ⊶Ⓐ⊶Ⓝ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓙ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓔ⊶Ⓖ⊶Ⓐ ⊶Ⓣ⊶Ⓞ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓐ⊶Ⓝ⊶Ⓒ⊶Ⓔ⊶Ⓡ ⊶Ⓦ⊶Ⓐ⊶Ⓛ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓔ ⊶Ⓚ⊶Ⓞ ⊶Ⓣ⊶Ⓘ⊶Ⓚ⊶Ⓣ⊶Ⓞ⊶Ⓚ ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓐ⊶Ⓡ⊶Ⓐ⊶Ⓗ ⊶Ⓑ⊶Ⓐ⊶Ⓝ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓘ⊶Ⓢ⊶Ⓢ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓢ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓚ⊶Ⓐ ⊶Ⓟ⊶Ⓞ⊶Ⓦ⊶Ⓔ⊶Ⓡ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓐ",
+    "⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓐ⊶Ⓖ⊶Ⓔ⊶Ⓖ⊶Ⓐ ⊶Ⓣ⊶Ⓞ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓞ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓔ ⊶Ⓜ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓗ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶ⒶⓇ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓟ⊶Ⓞ⊶Ⓛ⊶Ⓘ⊶Ⓒ⊶Ⓔ ⊶Ⓚ⊶Ⓐ ⊶Ⓓ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓤ⊶Ⓢ⊶Ⓢ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓚ⊶Ⓐ ⊶Ⓦ⊶Ⓞ⊶Ⓡ⊶Ⓚ⊶Ⓞ⊶Ⓤ⊶Ⓣ ⊶Ⓗ⊶Ⓞ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓐ ⊶Ⓔ⊶Ⓝ⊶Ⓔ⊶Ⓡ⊶Ⓖ⊶Ⓨ ⊶Ⓗ⊶Ⓐ⊶Ⓘ ⊶Ⓚ⊶Ⓘ ⊶Ⓔ⊶Ⓚ ⊶Ⓑ⊶Ⓐ⊶ⒶⓇ ⊶Ⓜ⊶Ⓔ ⊶10 ⊶Ⓛ⊶Ⓞ⊶Ⓖ⊶Ⓞ ⊶Ⓚ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ⊶Ⓐ ⊶Ⓛ⊶Ⓔ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓒ⊶Ⓗ⊶Ⓐ ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓨ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓑ⊶Ⓗ⊶Ⓐ⊶Ⓖ⊶Ⓔ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓚ⊶Ⓞ ⊶Ⓤ⊶Ⓛ⊶Ⓣ⊶Ⓐ ⊶Ⓛ⊶Ⓐ⊶Ⓣ⊶Ⓚ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ ⊶Ⓗ⊶Ⓞ⊶Ⓛ⊶Ⓛ⊶Ⓞ⊶Ⓦ ⊶Ⓟ⊶Ⓤ⊶Ⓡ⊶Ⓟ⊶Ⓛ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶ⒶⓇ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓔ⊶Ⓓ⊶Ⓓ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ"
+    ]
+            
+            sq2_texts = [
+                "⋰Ⓑ⋰⋰⒪⋰⋰⒧⋰ ⋰⒯⋰⋰⒪⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰Ⓓ⋰⋰⒤⋰⋰Ⓓ⋰⋰⒤⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒠⋰ ⋰⒨⋰⋰⒰⋰⋰⒣⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒭⋰⋰⒜⋰⋰⒢⋰⋰⒜⋰⋰⒟⋰ ⋰⒟⋰⋰⒰⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒮⋰⋰⒜⋰⋰⒧⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒡⋰⋰⒜⋰⋰⒨⋰⋰⒠⋰ ⋰⒧⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒫⋰⋰⒠⋰ ⋰⒯⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰⋰⒫⋰⋰⒜⋰⋰⒟⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒰⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰⋰⒰⋰",
+        "⋰⒳⋰⋰⒣⋰⋰⒜⋰⋰⒧⋰ ⋰⒰⋰⋰⒯⋰⋰⒣⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒣⋰⋰⒠⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰",
+        "⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒩⋰⋰⒜⋰ ⋰⒩⋰⋰⒜⋰⋰⒣⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒧⋰⋰⒜⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒝⋰⋰⒰⋰⋰⒟⋰⋰⒣⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒧⋰⋰⒜⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒣⋰⋰⒠⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰ ⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒧⋰ ⋰⒰⋰⋰⒯⋰⋰⒣⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒜⋰⋰⒦⋰⋰⒠⋰⋰⒧⋰⋰⒜⋰ ⋰⒫⋰⋰⒜⋰⋰⒩⋰ ⋰⒨⋰⋰⒤⋰⋰⒯⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒳⋰⋰⒣⋰⋰⒜⋰⋰⒧⋰ ⋰⒥⋰⋰⒤⋰⋰⒩⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒣⋰⋰⒪⋰ ⋰⒥⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰⋰⒯⋰⋰⒯⋰ ⋰⒫⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰ ⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰⋰⒫⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰⋰⒧⋰⋰⒧⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒩⋰⋰⒜⋰⋰⒩⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒦⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒝⋰⋰⒪⋰⋰⒪⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒠⋰⋰⒠⋰⋰⒭⋰⋰⒭⋰ ⋰⒡⋰⋰⒜⋰⋰⒜⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰⋰⒯⋰⋰⒯⋰ ⋰⒮⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒭⋰⋰⒭⋰ ⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰⋰⒧⋰⋰⒧⋰⋰⒧⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰⋰⒥⋰⋰⒥⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒝⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒡⋰⋰⒜⋰⋰⒜⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒠⋰⋰⒫⋰⋰⒧⋰⋰⒴⋰⋰⒴⋰⋰⒴⋰ ⋰⒦⋰⋰⒭⋰⋰⒭⋰⋰⒭⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰⋰⒩⋰ ⋰⒦⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒝⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒩⋰⋰⒤⋰⋰⒧⋰⋰⒜⋰⋰⒜⋰⋰⒨⋰⋰⒨⋰⋰⒨⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰⋰⒩⋰⋰⒩⋰ ⋰⒦⋰⋰⒪⋰⋰⒪⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰ ⋰⒤⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒜⋰⋰⒜⋰ ⋰⒮⋰⋰⒠⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒭⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰⋰⒢⋰⋰⒢⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒠⋰⋰⒫⋰⋰⒧⋰⋰⒴⋰⋰⒴⋰⋰⒴⋰ ⋰⒟⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒦⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒦⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰⋰⒯⋰⋰⒯⋰ ⋰⒨⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰ ⋰⒧⋰⋰⒰⋰⋰⒩⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰⋰⒩⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰⋰⒯⋰ ⋰⒨⋰⋰⒠⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰⋰⒩⋰ ⋰⒣⋰⋰⒜⋰⋰⒯⋰⋰⒣⋰⋰⒣⋰⋰⒣⋰ ⋰⒟⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰⋰⒧⋰⋰⒧⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰⋰⒥⋰⋰⒥⋰⋰⒥⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰⋰⒩⋰⋰⒩⋰",
+        "⋰⒮⋰⋰⒫⋰⋰⒠⋰⋰⒠⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒫⋰⋰⒜⋰⋰⒦⋰⋰⒜⋰⋰⒜⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰",
+        "⋰⒮⋰⋰⒫⋰⋰⒠⋰⋰⒠⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒧⋰⋰⒠⋰⋰⒦⋰⋰⒦⋰⋰⒜⋰⋰⒭⋰⋰⒭⋰⋰⒭⋰ ⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰",
+        "⋰⒭⋰⋰⒠⋰⋰⒫⋰⋰⒧⋰⋰⒴⋰⋰⒴⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰⋰⒤⋰⋰⒮⋰⋰⒠⋰ ⋰⒦⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰ ⋰⒩⋰⋰⒜⋰⋰⒩⋰⋰⒤⋰ ⋰⒦⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰⋰⒯⋰ ⋰⒦⋰⋰⒜⋰⋰⒜⋰ ⋰⒝⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒝⋰⋰⒜⋰⋰⒩⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒦⋰⋰⒜⋰⋰⒯⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒜⋰⋰⒰⋰⋰⒧⋰⋰⒜⋰⋰⒟⋰ ⋰⒣⋰⋰⒜⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒦⋰⋰⒜⋰⋰⒯⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒜⋰⋰⒰⋰⋰⒧⋰⋰⒜⋰⋰⒟⋰ ⋰⒣⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒟⋰ ⋰⒦⋰⋰⒤⋰⋰⒟⋰⋰⒟⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒮⋰⋰⒜⋰⋰⒯⋰⋰⒣⋰ ⋰⒮⋰⋰⒪⋰ ⋰⒥⋰⋰⒜⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒱⋰⋰⒪⋰⋰⒤⋰⋰⒞⋰⋰⒠⋰ ⋰⒣⋰⋰⒪⋰ ⋰⒥⋰⋰⒜⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒩⋰⋰⒜⋰⋰⒣⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒮⋰⋰⒜⋰⋰⒦⋰⋰⒯⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒧⋰⋰⒜⋰⋰⒰⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒤⋰⋰⒢⋰⋰⒩⋰⋰⒪⋰⋰⒭⋰⋰⒠⋰ ⋰⒦⋰⋰⒜⋰⋰⒤⋰⋰⒮⋰⋰⒠⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒦⋰⋰⒜⋰⋰⒯⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒰⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒤⋰⋰⒢⋰⋰⒩⋰⋰⒪⋰⋰⒭⋰⋰⒠⋰ ⋰⒦⋰⋰⒜⋰⋰⒤⋰⋰⒮⋰⋰⒠⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒭⋰⋰⒜⋰ ⋰⒣⋰⋰⒜⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒡⋰⋰⒜⋰⋰⒯⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒜⋰ ⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒜⋰⋰⒧⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒜⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒪⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒞⋰⋰⒫⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒦⋰⋰⒜⋰⋰⒧⋰⋰⒤⋰ ⋰⒥⋰⋰⒰⋰⋰⒝⋰⋰⒜⋰⋰⒩⋰ ⋰⒦⋰⋰⒜⋰⋰⒯⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒡⋰⋰⒠⋰⋰⒩⋰⋰⒦⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒩⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒨⋰⋰⒜⋰⋰⒤⋰ ⋰⒦⋰⋰⒜⋰⋰⒝⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰ ⋰⒦⋰⋰⒠⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒥⋰⋰⒤⋰⋰⒩⋰⋰⒟⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒡⋰⋰⒜⋰⋰⒯⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒠⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒜⋰⋰⒝⋰ ⋰⒯⋰⋰⒰⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒟⋰⋰⒜⋰⋰⒡⋰⋰⒜⋰⋰⒩⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰??⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒠⋰ ⋰⒧⋰⋰⒜⋰⋰⒰⋰⋰⒟⋰⋰⒠⋰ ⋰⒫⋰⋰⒠⋰⋰⒭⋰ ⋰⒢⋰⋰??⋰⋰⒰⋰⋰⒨⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒟⋰⋰⒠⋰ ⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒟⋰⋰⒠⋰ ⋰⒧⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒧⋰⋰⒠⋰⋰⒦⋰⋰⒤⋰⋰⒩⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒥⋰⋰⒣⋰⋰⒰⋰⋰⒦⋰⋰⒩⋰⋰⒠⋰ ⋰⒩⋰⋰⒜⋰⋰⒤⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰ ⋰⒝⋰⋰⒜⋰⋰⒩⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒜⋰ ⋰⒭⋰⋰⒠⋰⋰⒫⋰⋰⒧⋰⋰⒴⋰ ⋰⒣⋰⋰⒪⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰ ⋰⒥⋰⋰⒜⋰⋰⒴⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒩⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒧⋰⋰⒰⋰ ⋰⒦⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒯⋰⋰⒪⋰ ⋰⒞⋰⋰⒫⋰ ⋰⒝⋰⋰⒪⋰⋰⒧⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒰⋰⋰⒢⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒜⋰⋰⒯⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒥⋰⋰⒤⋰⋰⒩⋰⋰⒟⋰⋰⒜⋰ ⋰⒣⋰⋰⒪⋰⋰⒥⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒰⋰⋰⒯⋰⋰⒣⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒡⋰⋰⒠⋰⋰⒩⋰⋰⒦⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒥⋰⋰⒤⋰⋰⒩⋰⋰⒟⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒦⋰⋰⒪⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰ ⋰⒥⋰⋰⒜⋰⋰⒴⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒠⋰ ⋰⒧⋰⋰⒜⋰⋰⒰⋰⋰⒟⋰⋰⒠⋰ ⋰⒫⋰⋰⒠⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒤⋰⋰⒮⋰⋰⒠⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒟⋰⋰⒜⋰⋰⒡⋰⋰⒜⋰⋰⒩⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰⋰⒪⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒨⋰⋰⒠⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒮⋰⋰⒜⋰⋰⒯⋰⋰⒣⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒝⋰⋰⒣⋰⋰⒤⋰ ⋰⒟⋰⋰⒜⋰⋰⒡⋰⋰⒜⋰⋰⒩⋰ ⋰⒣⋰⋰⒪⋰ ⋰⒥⋰⋰⒜⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒜⋰ ⋰⒩⋰⋰⒜⋰⋰⒣⋰⋰⒤⋰ ⋰⒣⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰⋰⒟⋰⋰⒠⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒢⋰⋰⒜⋰⋰⒤⋰⋰⒭⋰⋰⒝⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒜⋰⋰⒰⋰⋰⒧⋰⋰⒜⋰⋰⒟⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒧⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒮⋰⋰⒫⋰⋰⒠⋰⋰⒠⋰⋰⒟⋰ ⋰⒨⋰⋰⒜⋰⋰⒯⋰⋰⒞⋰⋰⒣⋰ ⋰⒦⋰⋰⒭⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰ ⋰⒢⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰⋰⒝⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒞⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒯⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒡⋰⋰⒠⋰⋰⒦⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒠⋰⋰⒠⋰⋰⒥⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒩⋰⋰⒜⋰⋰⒣⋰⋰⒤⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰⋰⒟⋰⋰⒠⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒞⋰⋰⒫⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒩⋰⋰⒜⋰⋰⒣⋰⋰⒤⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒠⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒯⋰⋰⒜⋰⋰⒢⋰ ⋰⒦⋰⋰⒜⋰⋰⒤⋰⋰⒮⋰⋰⒠⋰ ⋰⒦⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒭⋰ ⋰⒧⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒥⋰⋰⒤⋰⋰⒩⋰⋰⒟⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒡⋰⋰⒜⋰⋰⒯⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒠⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒜⋰⋰⒝⋰ ⋰⒯⋰⋰⒰⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒟⋰⋰⒜⋰⋰⒡⋰⋰⒜⋰⋰⒩⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒠⋰ ⋰⒧⋰⋰⒜⋰⋰⒰⋰⋰⒟⋰⋰⒠⋰ ⋰⒫⋰⋰⒠⋰⋰⒭⋰ ⋰⒢⋰⋰⒣⋰⋰⒰⋰⋰⒨⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒟⋰⋰⒠⋰ ⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒟⋰⋰⒠⋰ ⋰⒧⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒧⋰⋰⒠⋰⋰⒦⋰⋰⒤⋰⋰⒩⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒥⋰⋰⒣⋰⋰⒰⋰⋰⒦⋰⋰⒩⋰⋰⒠⋰ ⋰⒩⋰⋰⒜⋰⋰⒤⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰ ⋰⒝⋰⋰⒜⋰⋰⒩⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒜⋰ ⋰⒭⋰⋰⒠⋰⋰⒫⋰⋰⒧⋰⋰⒴⋰ ⋰⒣⋰⋰⒪⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰ ⋰⒥⋰⋰⒜⋰⋰⒴⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒩⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒧⋰⋰⒰⋰ ⋰⒦⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒯⋰⋰⒪⋰ ⋰⒞⋰⋰⒫⋰ ⋰⒝⋰⋰⒪⋰⋰",
+        "⋰Ⓑ⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰Ⓑ⋰⋰⒣⋰⋰⒤⋰ ⋰Ⓑ⋰⋰⒩⋰⋰⒜⋰⋰⒧⋰⋰⒠⋰ ⋰⒨⋰⋰⒰⋰⋰⒥⋰⋰⒠⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒜⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒵⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒴⋰⋰⒜⋰⋰⒜⋰⋰⒟⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒯⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒰⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒜⋰ ⋰⒩⋰⋰⒜⋰ ⋰⒯⋰⋰⒴⋰⋰⒨⋰⋰⒫⋰⋰⒜⋰⋰⒮⋰⋰⒮⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰ ⋰⒰⋰⋰⒩⋰⋰⒡⋰⋰⒰⋰⋰⒩⋰⋰⒩⋰⋰⒴⋰ ⋰⒮⋰⋰⒲⋰⋰⒤⋰⋰⒫⋰⋰⒠⋰ ⋰⒨⋰⋰⒯⋰⋰⒯⋰ ⋰⒦⋰⋰⒭⋰",
+        "⋰⒪⋰⋰⒣⋰ ⋰⒣⋰⋰⒠⋰⋰⒧⋰⋰⒧⋰⋰⒪⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒜⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒪⋰⋰⒭⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒱⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒜⋰⋰⒜⋰⋰⒰⋰⋰⒦⋰⋰⒜⋰⋰⒯⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒭⋰⋰⒣⋰⋰⒜⋰ ⋰⒦⋰⋰⒭⋰.",
+        "⋰⒪⋰⋰⒴⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰⋰⒩⋰⋰⒩⋰⋰⒠⋰⋰⒭⋰ ⋰⒯⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰ ⋰⒢⋰⋰⒞⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒜⋰⋰⒜⋰⋰⒩⋰⋰⒠⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒫⋰⋰⒠⋰⋰⒭⋰⋰⒨⋰⋰⒤⋰⋰⒮⋰⋰⒮⋰⋰⒤⋰⋰⒪⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰⋰⒮⋰⋰⒩⋰⋰⒠⋰ ⋰⒟⋰⋰⒤⋰.",
+        "⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰⋰⒜⋰",
+        "⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰⋰⒜⋰ ⋰⒠⋰⋰⒦⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒭⋰.",
+        "⋰⒮⋰⋰⒰⋰⋰⒩⋰ ⋰⒮⋰⋰⒰⋰⋰⒩⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒜⋰.",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒞⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰.",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒯⋰⋰⒤⋰ ⋰⒥⋰⋰⒜⋰⋰⒯⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒯⋰⋰⒨⋰⋰⒭⋰.",
+        "⋰⒦⋰⋰⒴⋰? ⋰⒥⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒦⋰⋰⒤⋰⋰⒟⋰⋰⒟⋰⋰⒠⋰.",
+        "⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒞⋰⋰⒪⋰⋰⒨⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒢⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒯⋰⋰⒜⋰⋰⒢⋰ ⋰⒞⋰⋰⒭⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰",
+        "⋰⒨⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒯⋰⋰⒨⋰⋰⒦⋰⋰⒞⋰ ⋰⒝⋰⋰⒮⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒵⋰ ⋰⒫⋰⋰⒜⋰⋰⒫⋰⋰⒜⋰ ⋰⒝⋰⋰⒪⋰⋰⒧⋰",
+        "⋰⒮⋰⋰⒤⋰⋰⒟⋰⋰⒠⋰ ⋰⒣⋰⋰⒪⋰⋰⒥⋰⋰⒜⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒜⋰⋰⒝⋰",
+        "⋰⒣⋰⋰⒴⋰⋰⒠⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒝⋰⋰⒣⋰⋰⒢⋰ ⋰⒨⋰⋰⒜⋰⋰⒯⋰ ⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰",
+        "⋰⒝⋰⋰⒣⋰⋰⒢⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒜⋰⋰⒥⋰⋰⒥⋰",
+        "⋰⒣⋰⋰⒴⋰⋰⒠⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒨⋰⋰⒜⋰⋰⒯⋰",
+        "⋰⒣⋰⋰⒴⋰⋰⒠⋰ ⋰⒟⋰⋰⒰⋰⋰⒭⋰ ⋰⒣⋰⋰⒜⋰⋰⒯⋰⋰⒯⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒦⋰⋰⒪⋰⋰⒤⋰ ⋰⒝⋰⋰⒜⋰⋰⒯⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒠⋰⋰⒮⋰⋰⒧⋰⋰⒤⋰⋰⒴⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒡⋰ ⋰⒞⋰⋰⒭⋰ ⋰⒭⋰⋰⒣⋰⋰⒜⋰ ⋰⒣⋰⋰⒰⋰ ⋰⒯⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒦⋰⋰⒪⋰⋰⒤⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒯⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒨⋰⋰⒜⋰⋰⒡⋰⋰⒤⋰ ⋰⒟⋰⋰⒠⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒨⋰⋰⒜⋰⋰⒡⋰⋰⒤⋰ ⋰⒨⋰⋰⒤⋰⋰⒧⋰ ⋰⒥⋰⋰⒜⋰⋰⒴⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒯⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒰⋰⋰⒥⋰⋰⒠⋰ ⋰⒮⋰⋰⒲⋰⋰⒤⋰⋰⒫⋰⋰⒠⋰ ⋰⒞⋰⋰⒭⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒮⋰⋰⒲⋰⋰⒤⋰⋰⒫⋰⋰⒠⋰ ⋰⒞⋰⋰⒭⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒡⋰⋰⒭⋰ ⋰⒝⋰⋰⒪⋰⋰⒧⋰⋰⒩⋰⋰⒜⋰ ⋰⒩⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒧⋰⋰⒠⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒮⋰⋰⒲⋰⋰⒤⋰⋰⒫⋰⋰⒠⋰ ⋰⒞⋰⋰⒭⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒣⋰⋰⒰⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒫⋰⋰⒭⋰ ⋰⒦⋰⋰⒠⋰⋰⒮⋰⋰⒠⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰",
+        "⋰⒨⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰ ⋰⒫⋰⋰⒯⋰⋰⒜⋰ ⋰⒯⋰⋰⒣⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒨⋰⋰⒠⋰⋰⒴⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒩⋰⋰⒯⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰",
+        "⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒠⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒰⋰⋰⒯⋰⋰⒭⋰ ⋰⒨⋰⋰⒞⋰",
+        "⋰⒧⋰⋰⒰⋰⋰⒩⋰ ⋰⒨⋰⋰⒯⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒮⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒜⋰",
+        "⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒟⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒪⋰⋰⒴⋰⋰⒠⋰ ⋰⒢⋰⋰⒜⋰⋰⒮⋰⋰⒣⋰⋰⒯⋰⋰⒤⋰ ⋰⒦⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒨⋰⋰⒜⋰⋰⒦⋰⋰⒤⋰⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒨⋰⋰⒜⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒦⋰ ⋰⒣⋰⋰⒜⋰⋰⒯⋰⋰⒣⋰ ⋰⒯⋰⋰⒪⋰⋰⒟⋰⋰⒣⋰ ⋰⒦⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒦⋰ ⋰⒨⋰⋰⒰⋰⋰⒣⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒡⋰⋰⒜⋰⋰⒮⋰⋰⒜⋰⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒧⋰⋰⒠⋰⋰⒜⋰⋰⒱⋰⋰⒠⋰ ⋰⒧⋰⋰⒠⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒫⋰⋰⒜⋰⋰⒮⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒩⋰⋰⒜⋰⋰⒤⋰ ⋰⒜⋰⋰⒴⋰⋰⒜⋰ ⋰⒨⋰⋰⒠⋰⋰⒦⋰⋰⒪⋰",
+        "⋰⒧⋰⋰⒠⋰⋰⒜⋰⋰⒱⋰⋰⒠⋰ ⋰⒧⋰⋰⒠⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒤⋰⋰⒟⋰⋰⒠⋰⋰⒭⋰ ⋰⒮⋰⋰⒠⋰",
+        "⋰⒧⋰⋰⒠⋰⋰⒜⋰⋰⒱⋰⋰⒠⋰ ⋰⒧⋰⋰⒠⋰ ⋰⒥⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒲⋰⋰⒭⋰⋰⒩⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒧⋰⋰⒠⋰⋰⒜⋰⋰⒱⋰⋰⒠⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒧⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒮⋰⋰⒨⋰⋰⒥⋰⋰⒣⋰ ⋰⒝⋰⋰⒜⋰⋰⒯⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒧⋰⋰⒠⋰⋰⒜⋰⋰⒱⋰⋰⒠⋰ ⋰⒧⋰⋰⒠⋰",
+        "⋰⒡⋰⋰⒜⋰⋰⒮⋰⋰⒯⋰ ⋰⒧⋰⋰⒠⋰⋰⒜⋰⋰⒱⋰⋰⒠⋰ ⋰⒧⋰⋰⒠⋰ ⋰⒦⋰⋰⒜⋰⋰⒨⋰⋰⒥⋰⋰⒪⋰⋰⒭⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒰⋰⋰⒯⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰",
+        "⋰⒪⋰⋰⒴⋰ ⋰⒣⋰⋰⒤⋰⋰⒥⋰⋰⒟⋰⋰⒠⋰ ⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒩⋰⋰⒜⋰ ⋰⒦⋰⋰⒣⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒨⋰⋰⒵⋰⋰⒪⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒦⋰⋰⒪⋰ ⋰⒤⋰⋰⒧⋰⋰⒴⋰ ⋰⒭⋰⋰⒠⋰⋰⒴⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒯⋰⋰⒨⋰⋰⒦⋰⋰⒞⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰",
+        "⋰⒮⋰⋰⒣⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰",
+        "⋰⒡⋰⋰⒭⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰",
+        "⋰⒮⋰⋰⒣⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒲⋰⋰⒭⋰⋰⒩⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒴⋰⋰⒰⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰",
+        "⋰⒫⋰⋰⒭⋰⋰⒪⋰⋰⒪⋰⋰⒡⋰ ⋰⒞⋰⋰⒭⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒫⋰⋰⒭⋰⋰⒪⋰⋰⒪⋰⋰⒡⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒠⋰⋰⒴⋰",
+        "⋰⒫⋰⋰⒭⋰⋰⒪⋰⋰⒪⋰⋰⒡⋰ ⋰⒣⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒦⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒞⋰⋰⒣⋰⋰⒤⋰⋰⒧⋰⋰⒧⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰ ⋰⒝⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒪⋰⋰⒴⋰ ⋰⒣⋰⋰⒤⋰⋰⒥⋰⋰⒟⋰⋰⒠⋰ ⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒩⋰⋰⒜⋰ ⋰⒦⋰⋰⒣⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒨⋰⋰⒵⋰⋰⒪⋰⋰⒭⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰ ?",
+        "⋰⒜⋰⋰⒝⋰ ⋰⒯⋰⋰⒦⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒤⋰ ⋰⒣⋰⋰⒪⋰⋰⒢⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ?",
+        "⋰⒩⋰⋰⒴⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒦⋰⋰⒰⋰⋰⒞⋰⋰⒣⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒥⋰⋰⒜⋰⋰⒩⋰⋰⒯⋰⋰⒜⋰ ⋰⒝⋰⋰⒮⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒠⋰⋰⒴⋰",
+        "⋰⒮⋰⋰⒝⋰⋰⒮⋰⋰⒠⋰ ⋰⒫⋰⋰⒣⋰⋰⒠⋰⋰⒧⋰⋰⒠⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒝⋰⋰⒪⋰⋰⒧⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒩⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒨⋰ ⋰⒦⋰⋰⒭⋰⋰⒠⋰",
+        "⋰⒴⋰⋰⒜⋰⋰⒣⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒞⋰⋰⒠⋰ ⋰⒫⋰⋰⒤⋰⋰⒧⋰⋰⒧⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒨⋰⋰⒜⋰⋰⒦⋰⋰⒜⋰⋰⒝⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒯⋰⋰⒪⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒯⋰⋰⒪⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰",
+        "⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒟⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰ ⋰⒴⋰⋰⒣⋰⋰⒜⋰ ⋰⒮⋰⋰⒠⋰",
+        "⋰⒞⋰⋰⒪⋰⋰⒵⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒣⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒣⋰⋰⒠⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒯⋰⋰⒪⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒝⋰⋰⒪⋰⋰⒧⋰ ⋰⒨⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒩⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒣⋰⋰⒪⋰⋰⒢⋰⋰⒤⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰ ⋰⒥⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰⋰⒯⋰⋰⒤⋰ ⋰⒥⋰⋰⒪⋰⋰⒢⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒭⋰⋰⒴⋰ ⋰⒜⋰⋰⒨⋰⋰⒨⋰⋰⒤⋰ ⋰⒞⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒠⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒠⋰⋰⒨⋰⋰⒪⋰⋰⒥⋰⋰⒤⋰ ⋰⒟⋰⋰⒜⋰⋰⒧⋰ ⋰⒨⋰⋰⒞⋰",
+        "⋰⒞⋰⋰⒴⋰⋰⒜⋰ ? ⋰⒞⋰⋰⒣⋰⋰⒨⋰⋰⒭⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒜⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ?",
+        "⋰⒯⋰⋰⒨⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒭⋰⋰⒤⋰ ⋰⒣⋰⋰⒪⋰⋰⒢⋰⋰⒤⋰ ⋰⒡⋰⋰⒭⋰⋰⒭⋰⋰⒯⋰⋰⒪⋰",
+        "⋰⒞⋰⋰⒴⋰⋰⒜⋰ ? ⋰⒦⋰⋰⒝⋰ ? ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰⋰⒦⋰",
+        "⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒮⋰⋰⒞⋰⋰⒣⋰ ⋰⒨⋰⋰⒠⋰⋰⒴⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒧⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰⋰⒩⋰⋰⒠⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰",
+        "⋰⒤⋰⋰⒯⋰⋰⒩⋰⋰⒜⋰ ⋰⒮⋰⋰⒞⋰⋰⒣⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒝⋰⋰⒪⋰⋰⒧⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒮⋰⋰⒞⋰⋰⒣⋰ ⋰⒨⋰⋰⒠⋰⋰⒴⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒧⋰⋰⒤⋰⋰⒜⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒠⋰ ⋰⒮⋰⋰⒯⋰⋰⒣⋰",
+        "⋰⒨⋰⋰⒯⋰⋰⒧⋰⋰⒝⋰ ⋰⒯⋰⋰⒨⋰⋰⒭⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒯⋰⋰⒪⋰",
+        "⋰⒫⋰⋰⒰⋰⋰⒭⋰⋰⒜⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒨⋰⋰⒞⋰",
+        "⋰⒯⋰⋰⒨⋰⋰⒭⋰ ⋰⒡⋰⋰⒭⋰⋰⒭⋰⋰⒯⋰⋰⒪⋰",
+        "⋰⒪⋰⋰⒣⋰ ⋰⒪⋰⋰⒦⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒧⋰⋰⒠⋰ ⋰⒡⋰⋰⒤⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒟⋰⋰⒜⋰⋰⒨⋰⋰⒜⋰⋰⒟⋰",
+        "⋰⒞⋰⋰⒴⋰⋰⒜⋰ ? ⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰⋰⒠⋰ ⋰⒫⋰⋰⒠⋰⋰⒣⋰⋰⒧⋰⋰⒠⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒠⋰⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒯⋰⋰⒪⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒩⋰⋰⒠⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒱⋰⋰⒴⋰⋰⒜⋰⋰⒮⋰⋰⒯⋰ ⋰⒣⋰⋰⒰⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒯⋰⋰⒪⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒰⋰⋰⒞⋰⋰⒣⋰ ⋰⒝⋰⋰⒤⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰⋰⒠⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ? ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒜⋰ ?",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒨⋰⋰⒯⋰ ⋰⒣⋰⋰⒮⋰⋰⒮⋰",
+        "⋰⒴⋰⋰⒰⋰⋰⒭⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰ ⋰⒨⋰⋰⒪⋰⋰⒨⋰",
+        "⋰⒜⋰⋰⒭⋰⋰⒠⋰ ⋰⒮⋰⋰⒝⋰⋰⒦⋰⋰⒤⋰ ⋰⒨⋰⋰??⋰⋰⒜⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰ ⋰⒪⋰⋰⒭⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒝⋰⋰⒤⋰",
+        "⋰⒜⋰⋰⒭⋰⋰⒠⋰ ⋰⒤⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒧⋰⋰⒠⋰ ⋰⒠⋰⋰⒦⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒤⋰ ⋰⒯⋰⋰⒭⋰⋰⒣⋰",
+        "⋰⒠⋰⋰⒦⋰ ⋰⒧⋰⋰⒤⋰⋰⒩⋰⋰⒠⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒯⋰⋰⒨⋰⋰⒭⋰",
+        "⋰⒬⋰",
+        "⋰⒪⋰⋰⒞⋰⋰⒴⋰ ⋰⒜⋰⋰⒝⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒧⋰⋰⒠⋰",
+        "⋰⒫⋰⋰⒠⋰⋰⒣⋰⋰⒠⋰⋰⒧⋰⋰⒠⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒰⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒯⋰⋰⒪⋰",
+        "⋰⒬⋰ ?",
+        "⋰⒣⋰⋰⒴⋰⋰⒴⋰⋰⒴⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰ ⋰⒠⋰⋰⒦⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰⋰⒠⋰ ⋰⒮⋰⋰⒰⋰⋰⒩⋰ ⋰⒟⋰⋰⒪⋰⋰⒮⋰⋰⒯⋰ ⋰⒯⋰⋰⒨⋰⋰⒭⋰",
+        "⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒡⋰ ⋰⒞⋰⋰⒭⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰⋰⒠⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰ ⋰⒤⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰ ⋰⒜⋰⋰⒜⋰",
+        "⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒯⋰⋰⒨⋰⋰⒭⋰ ⋰⒡⋰⋰⒭⋰⋰⒭⋰⋰⒯⋰⋰⒪⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰⋰⒠⋰ ⋰⒤⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰ ⋰⒜⋰⋰⒜⋰⋰⒦⋰⋰⒠⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒧⋰⋰⒠⋰ ⋰⒞⋰⋰⒣⋰⋰⒨⋰⋰⒭⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒯⋰⋰⒪⋰ ⋰⒜⋰⋰⒠⋰⋰⒮⋰⋰⒠⋰ ⋰⒣⋰⋰⒤⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰⋰⒠⋰ ⋰⒣⋰⋰⒴⋰⋰⒴⋰ ⋰⒜⋰⋰⒤⋰⋰⒮⋰⋰⒠⋰ ⋰⒣⋰⋰⒤⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒧⋰⋰⒠⋰⋰⒩⋰⋰⒜⋰",
+        "⋰⒪⋰⋰⒭⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒧⋰⋰⒠⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰ ⋰⒪⋰⋰⒭⋰",
+        "⋰⒣⋰⋰⒴⋰⋰⒴⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒪⋰ ⋰⒩⋰⋰⒜⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒪⋰ ⋰⒨⋰⋰⒯⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰⋰⒪⋰",
+        "⋰⒝⋰⋰⒴⋰⋰⒴⋰⋰⒠⋰⋰⒠⋰ ⋰⒣⋰⋰⒴⋰⋰⒴⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ?",
+        "⋰⒬⋰⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒬⋰ ⋰⒭⋰⋰⒣⋰⋰⒠⋰ ⋰⒣⋰⋰⒪⋰ ?",
+        "⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒨⋰⋰⒞⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒨⋰⋰⒯⋰",
+        "⋰Ⓙ⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒠⋰⋰⒥⋰",
+        "⋰⒪⋰⋰⒭⋰ ⋰⒝⋰⋰⒟⋰⋰⒜⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰",
+        "⋰⒪⋰⋰⒭⋰ ⋰⒝⋰⋰⒟⋰⋰⒜⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰ ⋰⒦⋰⋰⒤⋰⋰⒟⋰⋰⒟⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒰⋰⋰⒭⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰ ⋰⒦⋰⋰⒠⋰⋰⒠⋰⋰⒟⋰⋰⒠⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒧⋰⋰⒜⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰",
+        "⋰Ⓙ⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒝⋰⋰⒠⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒰⋰",
+        "⋰⒨⋰⋰⒦⋰⋰⒧⋰ ⋰⒰⋰⋰⒯⋰⋰⒣⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒩⋰⋰⒜⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒥⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒞⋰⋰⒠⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒦⋰⋰⒠⋰ ⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒠⋰ ⋰⒨⋰⋰⒭⋰⋰⒠⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒴⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒟⋰⋰⒜⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒡⋰⋰⒰⋰⋰⒟⋰⋰⒟⋰⋰⒜⋰",
+        "⋰⒨⋰⋰⒦⋰⋰⒧⋰ ⋰⒰⋰⋰⒯⋰⋰⒣⋰ ⋰⒝⋰⋰⒠⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰⋰⒞⋰⋰⒪⋰⋰⒟⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒝⋰⋰⒰⋰⋰⒭⋰ ⋰⒟⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒡⋰⋰⒰⋰⋰⒟⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒱⋰⋰⒜⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒠⋰⋰⒯⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰ ⋰⒢⋰⋰⒜⋰⋰⒴⋰⋰⒜⋰",
+        "⋰Ⓙ⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒭⋰ ⋰⒮⋰⋰⒫⋰⋰⒜⋰⋰⒨⋰",
+        "⋰⒨⋰⋰⒞⋰ ⋰⒮⋰⋰⒫⋰⋰⒜⋰⋰⒨⋰ ⋰⒭⋰⋰⒪⋰⋰⒦⋰⋰⒠⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒮⋰⋰⒫⋰⋰⒜⋰⋰⒨⋰ ⋰⒦⋰⋰⒭⋰",
+        "⋰⒮⋰⋰⒫⋰⋰⒜⋰⋰⒨⋰ ⋰⒦⋰⋰⒭⋰.⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒦⋰⋰⒠⋰ ⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒠⋰",
+        "⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒠⋰ ⋰⒮⋰⋰⒫⋰⋰⒜⋰⋰⒨⋰ ⋰⒦⋰⋰⒭⋰",
+        "⋰⒮⋰⋰⒫⋰⋰⒜⋰⋰⒨⋰ ⋰⒦⋰⋰⒭⋰ ⋰⒦⋰⋰⒤⋰⋰⒟⋰",
+        "⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒰⋰",
+        "⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒠⋰⋰⒯⋰⋰⒠⋰",
+        "⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰ ⋰Ⓙ⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒲⋰⋰⒭⋰⋰⒩⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰",
+        "⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰",
+        "⋰⒰⋰⋰⒯⋰⋰⒣⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰",
+        "⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒣⋰⋰⒪⋰ ⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰",
+        "⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒝⋰⋰⒩⋰⋰⒥⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰",
+        "⋰⒨⋰⋰⒜⋰⋰⒦⋰⋰⒤⋰⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰",
+        "⋰⒣⋰⋰⒜⋰⋰⒧⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒣⋰⋰⒪⋰ ⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰",
+        "⋰⒨⋰⋰⒜⋰⋰⒦⋰⋰⒤⋰⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰",
+        "⋰⒨⋰⋰⒜⋰⋰⒦⋰⋰⒤⋰⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒱⋰⋰⒜⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒠⋰⋰⒯⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰ ⋰⒢⋰⋰⒜⋰⋰⒴⋰⋰⒜⋰",
+        "⋰Ⓓ⋰⋰⒪⋰⋰⒮⋰⋰⒯⋰",
+    ]
+            cr_texts = [
+                "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇦​ะ ะ🇧​ะะ🇴​ะะ🇸​ะะ🇪​ะะ🇼​ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะะ🇰​ะะ🇪​ะะ🇧​ะะ🇦​ะะ🇨​ะะ🇭​ะะ🇪​ะ, ะ🇹​ะะ🇺​ะ ะ🇧​ะะ🇭​ะะ🇮​ะ ะ🇰​ะะ🇮​ะะ🇸​ะะ🇸​ะะ🇦​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇦​ะะ🇦​ะะ🇯​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ, ะ🇹​ะะ🇺​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇭​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ, ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇧​ะะ🇭​ะะ🇪​ะะ🇳​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ, ะ🇹​ะะ🇺​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ",
+        "ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะ ะ🇯​ะะ🇦​ะ, ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇩​ะะ🇮​ะะ🇩​ะะ🇮​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇮​ะ",
+        "ะ🇸​ะะ🇱​ะะ🇴​ะะ🇼​ะ, ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇮​ะะ🇾​ะะ🇦​ะ ะ🇨​ะะ🇮​ะะ🇴​ะะ🇩​ะะ🇺​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ, ะ🇹​ะะ🇺​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇸​ะะ🇰​ะะ🇹​ะะ🇦​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇰​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ, ะ🇹​ะะ🇲​ะะ🇦​ะ ะ🇨​ะะ🇴​ะะ🇩​ะะ🇺​ะ",
+        "ะ🇸​ะะ🇱​ะะ🇴​ะะ🇼​ะ ะ🇫​ะะ🇮​ะะ🇷​ะะ🇸​ะะ🇪​ะ, ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ",
+        "ะ🇨​ะะ🇺​ะะ🇩​ะะ🇬​ะะ🇷​ะะ🇮​ะะ🇧​ะ, ะ🇹​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะ ะ🇩​ะะ🇴​ะะ🇺​ะ",
+        "ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇨​ะะ🇴​ะะ🇩​ะะ🇺​ะ, ะ🇳​ะะ🇪​ะะ🇹​ะ ะ🇴​ะะ🇳​ะ ะ🇴​ะะ🇫​ะะ🇫​ะ ะ🇼​ะะ🇦​ะะ🇱​ะะ??​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ??​ะ",
+        "ะ🇴​ะะ🇾​ะะ🇪​ะ ะ🇹​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะ ะ🇨​ะะ🇴​ะะ🇩​ะะ🇺​ะ, ะ🇮​ะะ🇩​ะะ🇭​ะะ🇦​ะะ🇷​ะ ะ🇦​ะะ🇦​ะะ🇰​ะะ🇪​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇷​ะะ🇩​ะะ🇺​ะ, ะ🇴​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇰​ะะ🇪​ะ ะ🇱​ะะ🇴​ะะ🇩​ะะ🇪​ะะ🇪​ะ",
+        "ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇪​ะะ🇯​ะ, ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะะ🇺​ะ",
+        "ะ🇸​ะะ🇺​ะะ🇦​ะะ🇷​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇪​ะะ🇯​ะ, ะ🇳​ะะ🇪​ะะ🇹​ะ ะ🇴​ะะ🇫​ะะ🇫​ะ ะ🇴​ะะ🇳​ะ ะ🇰​ะะ🇷​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ ะ🇱​ะะ🇦​ะะ🇩​ะะ🇰​ะะ🇪​ะ",
+        "ะ🇹​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะะ🇸​ะะ🇪​ะ, ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะ ะ🇸​ะะ🇱​ะะ🇴​ะะ🇼​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇭​ะะ🇦​ะะ🇷​ะะ🇨​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇨​ะะ🇴​ะะ🇩​ะะ🇺​ะ ะ🇰​ะะ🇷​ะ ะ🇲​ะะ🇸​ะะ🇬​ะ ะ🇩​ะะ🇪​ะะ🇱​ะะ🇪​ะะ🇹​ะะ🇪​ะ, ะ🇴​ะะ🇮​ะ ะ🇸​ะะ🇺​ะะ🇦​ะะ🇷​ะ ะ🇰​ะะ🇪​ะ ะ🇱​ะะ🇦​ะะ🇩​ะะ🇰​ะะ🇪​ะ",
+        "ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇫​ะะ🇺​ะะ🇫​ะะ🇮​ะ, ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇩​ะะ🇮​ะะ🇩​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇩​ะะ🇮​ะะ🇰​ะะ🇭​ะะ🇦​ะ, ะ🇨​ะะ🇺​ะะ🇩​ะ ะ🇦​ะะ🇧​ะ",
+        "ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ, ะ🇧​ะะ🇭​ะะ🇦​ะะ🇰​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ",
+        "ะ🇨​ะะ🇺​ะะ🇩​ะะ🇱​ะะ🇪​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇷​ะะ🇺​ะ, ะ🇹​ะะ🇲​ะะ🇰​ะะ🇱​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇱​ะะ🇪​ะ ะ🇬​ะะ🇷​ะะ🇮​ะะ🇧​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇧​ะะ🇪​ะะ🇭​ะะ🇪​ะะ🇳​ะ ะ🇻​ะะ🇪​ะะ🇸​ะะ🇮​ะะ🇾​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇮​ะ, ะ🇮​ะะ🇹​ะะ🇳​ะะ🇦​ะ ะ🇬​ะะ🇳​ะะ🇩​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะะ🇦​ะ ะ🇹​ะะ🇺​ะ ะ🇫​ะะ🇮​ะะ🇷​ะะ🇸​ะะ🇪​ะ ะ🇳​ะะ🇪​ะะ🇹​ะ ะ🇴​ะะ🇳​ะ ะ🇴​ะะ🇫​ะะ🇫​ะ",
+        "ะ🇬​ะะ🇷​ะะ🇮​ะะ🇧​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇹​ะะ🇪​ะ, ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇯​ะะ🇦​ะ ะ🇱​ะะ🇴​ะะ🇩​ะะ🇪​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇦​ะะ🇷​ะะ🇺​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇷​ะะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะะ🇦​ะ, ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ, ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇪​ะะ🇾​ะ ะ🇨​ะะ🇵​ะ",
+        "ะ🇨​ะะ🇵​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇪​ะะ🇭​ะะ🇭​ะ, ะ🇨​ะะ🇵​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇱​ะ ะ🇲​ะะ🇪​ะะ🇭​ะ",
+        "ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ, ะ🇦​ะะ🇧​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ",
+        "ะ🇩​ะะ🇴​ะะ🇺​ะะ🇧​ะะ🇱​ะะ🇪​ะ ะ🇸​ะะ🇪​ะะ🇳​ะะ🇩​ะ ะ🇰​ะะ🇴​ะ ะ🇨​ะะ🇵​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇨​ะะ🇴​ะะ🇩​ะะ🇺​ะ, ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇨​ะะ🇴​ะะ🇩​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇦​ะะ🇦​ะะ🇯​ะ ะ🇲​ะะ🇪​ะะ🇭​ะะ🇭​ะ",
+        "ะ🇭​ะะ🇹​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇩​ะะ🇦​ะะ🇱​ะะ🇦​ะะ🇱​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇹​ะะ🇪​ะ., ะ🇷​ะะ🇳​ะะ🇩​ะะ🇾​ะ ะ🇯​ะะ🇱​ะะ🇩​ะะ🇮​ะ ะ🇯​ะะ🇱​ะะ🇩​ะะ🇮​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇶​ะ ะ🇹​ะะ🇷​ะะ🇾​ะะ🇲​ะะ🇦​ะ",
+        "ะ🇵​ะะ🇦​ะะ🇷​ะะ🇦​ะ ะ🇱​ะะ🇮​ะะ🇰​ะะ🇭​ะะ🇪​ะะ🇬​ะะ🇦​ะ.., ะ🇹​ะะ🇷​ะะ🇦​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇭​ะะ🇧​ะะ🇭​ะะ🇦​ะะ🇰​ะ",
+        "ะ🇱​ะะ🇦​ะะ🇬​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะ ะ🇱​ะะ🇦​ะะ🇩​ะะ🇨​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ, ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇱​ะะ🇦​ะะ🇬​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇹​ะะ🇪​ะ..",
+        "ะ🇨​ะะ🇺​ะะ🇩​ะะ🇰​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ, ะ🇧​ะะ🇭​ะะ🇮​ะะ🇰​ะะ🇦​ะะ🇷​ะะ🇮​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ??​ะ ะ🇲​ะะ🇪​ะะ🇷​ะะ🇦​ะ.",
+        "ะ🇱​ะะ🇴​ะะ🇼​ะ ะ🇱​ะะ🇪​ะะ🇻​ะะ🇪​ะะ🇱​ะ ะ🇨​ะะ🇵​ะ ะ🇨​ะะ🇷​ะ, ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇱​ะะ🇴​ะะ🇼​ะ ะ🇱​ะะ🇪​ะะ🇻​ะะ🇪​ะะ🇱​ะ ะ🇼​ะะ🇪​ะะ🇦​ะะ🇰​ะ",
+        "ะ🇲​ะะ🇪​ะะ🇷​ะะ🇪​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ ะ🇵​ะะ🇪​ะ ะ🇪​ะะ🇾​ะ ะ🇹​ะะ🇺​ะ ะ🇭​ะะ🇮​ะะ🇯​ะะ🇩​ะะ🇪​ะ, ะ🇫​ะะ🇷​ะะ🇪​ะะ🇪​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇼​ะะ🇦​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇴​ะ",
+        "ะ🇫​ะะ🇷​ะะ🇪​ะะ🇪​ะ ะ🇲​ะะ🇪​ะะ🇾​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ ะ🇹​ะะ🇺​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ, ะ🇹​ะะ🇺​ะ ะ🇧​ะะ🇭​ะะ🇮​ะ ะ🇰​ะะ🇮​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇭​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇨​ะะ🇱​ะะ🇦​ะะ🇮​ะะ🇲​ะ ะ🇨​ะะ🇷​ะะ🇼​ะะ🇦​ะ, ะ🇹​ะะ🇺​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇮​ะ ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇸​ะะ🇰​ะะ🇹​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇧​ะะ🇭​ะะ🇪​ะะ🇳​ะ ะ🇻​ะะ🇪​ะะ🇸​ะะ🇮​ะะ🇾​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇮​ะ, ะ??​ะะ🇺​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇨​ะะ??​ะะ🇺​ะะ🇩​ะ ะ🇯​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇩​ะะ🇮​ะะ🇩​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะะ🇮​ะ, ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇩​ะะ🇮​ะะ🇰​ะะ🇭​ะะ🇦​ะ",
+        "ะ🇨​ะะ🇺​ะะ🇩​ะ ะ🇦​ะะ🇧​ะ, ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇰​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ, ะ🇨​ะะ🇺​ะะ🇩​ะะ🇱​ะะ🇪​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇷​ะะ🇺​ะ",
+        "ะ🇹​ะะ🇲​ะะ🇰​ะะ🇱​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇱​ะะ🇪​ะ ะ🇬​ะะ🇷​ะะ🇮​ะะ🇧​ะ, ะ🇹​ะะ🇪​ะะ??​ะะ🇾​ะ ะ🇧​ะะ🇪​ะะ🇭​ะะ🇪​ะะ🇳​ะ ะ🇻​ะะ🇪​ะะ🇸​ะะ🇮​ะะ🇾​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇮​ะ",
+        "ะ🇮​ะะ🇹​ะะ🇳​ะะ🇦​ะ ะ🇬​ะะ🇳​ะะ🇩​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะะ🇦​ะ ะ🇹​ะะ🇺​ะ ะ🇫​ะะ🇮​ะะ🇷​ะะ🇸​ะะ🇪​ะ ะ🇳​ะะ🇪​ะะ🇹​ะ ะ🇴​ะะ🇳​ะ ะ🇴​ะะ🇫​ะะ🇫​ะ, ะ🇬​ะะ🇷​ะะ🇮​ะะ🇧​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇹​ะะ🇪​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇯​ะะ🇦​ะ ะ🇱​ะะ🇴​ะะ🇩​ะะ🇪​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇦​ะะ🇷​ะะ🇺​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ, ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇷​ะะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ, ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ",
+        "ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇪​ะะ🇾​ะ ะ🇨​ะะ🇵​ะ, ะ🇨​ะะ🇵​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇪​ะะ🇭​ะะ🇭​ะ",
+        "ะ🇨​ะะ🇵​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇱​ะ ะ🇲​ะะ🇪​ะะ🇭​ะ, ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ",
+        "ะ??​ะะ🇧​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ, ะ🇩​ะะ🇴​ะะ🇺​ะะ🇧​ะะ🇱​ะะ🇪​ะ ะ🇸​ะะ🇪​ะะ🇳​ะะ🇩​ะ ะ🇰​ะะ🇴​ะ ะ🇨​ะะ🇵​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇨​ะะ🇴​ะะ🇩​ะะ🇺​ะ",
+        "ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇨​ะะ🇴​ะะ🇩​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇦​ะะ🇦​ะะ🇯​ะ ะ🇲​ะะ🇪​ะะ🇭​ะะ🇭​ะ, ะ🇭​ะะ🇹​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇩​ะะ🇦​ะะ🇱​ะะ🇦​ะะ🇱​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇹​ะะ🇪​ะ.",
+        "ะ🇷​ะะ🇳​ะะ🇩​ะะ🇾​ะ ะ🇯​ะะ🇱​ะะ🇩​ะะ🇮​ะ ะ🇯​ะะ🇱​ะะ🇩​ะะ🇮​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇶​ะ ะ🇹​ะะ🇷​ะะ🇾​ะะ🇲​ะะ🇦​ะ, ะ🇵​ะะ🇦​ะะ🇷​ะะ🇦​ะ ะ🇱​ะะ🇮​ะะ🇰​ะะ🇭​ะะ🇪​ะะ🇬​ะะ🇦​ะ..",
+        "ะ🇹​ะะ🇷​ะะ🇦​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇭​ะะ🇧​ะะ🇭​ะะ🇦​ะะ🇰​ะ, ะ🇱​ะะ🇦​ะะ🇬​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะ ะ🇱​ะะ🇦​ะะ🇩​ะะ🇨​ะะ🇪​ะ ะ??​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ",
+        "ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇱​ะะ🇦​ะะ🇬​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇹​ะะ🇪​ะ.., ะ🇨​ะะ🇺​ะะ🇩​ะะ🇰​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇮​ะะ🇰​ะะ🇦​ะะ🇷​ะะ🇮​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇸​ะ ะ🇲​ะะ🇪​ะะ🇷​ะะ🇦​ะ., ะ🇱​ะะ🇴​ะะ🇼​ะ ะ🇱​ะะ🇪​ะะ🇻​ะะ🇪​ะะ🇱​ะ ะ🇨​ะะ🇵​ะ ะ🇨​ะะ🇷​ะ",
+        "ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇱​ะะ🇴​ะะ🇼​ะ ะ🇱​ะะ🇪​ะะ🇻​ะะ🇪​ะะ🇱​ะ ะ🇼​ะะ🇪​ะะ🇦​ะะ🇰​ะ, ะ🇲​ะะ🇪​ะะ🇷​ะะ🇪​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ ะ🇵​ะะ🇪​ะ ะ🇪​ะะ🇾​ะ ะ🇹​ะะ🇺​ะ ะ🇭​ะะ🇮​ะะ🇯​ะะ🇩​ะะ🇪​ะ",
+        "ะ🇫​ะะ🇷​ะะ🇪​ะะ🇪​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇼​ะะ🇦​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇴​ะ, ะ🇫​ะะ🇷​ะะ🇪​ะะ🇪​ะ ะ🇲​ะะ🇪​ะะ🇾​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ ะ🇹​ะะ🇺​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇨​ะะ🇱​ะะ🇦​ะะ🇮​ะะ🇲​ะ ะ🇨​ะะ🇷​ะะ🇼​ะะ🇦​ะ, ะ🇹​ะะ🇺​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇮​ะ ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇸​ะะ🇰​ะะ🇹​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇧​ะะ🇭​ะะ🇪​ะะ🇳​ะ ะ🇻​ะะ🇪​ะะ🇸​ะะ🇮​ะะ🇾​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇮​ะ, ะ🇹​ะะ🇺​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะ ะ🇯​ะะ🇦​ะ"
+        "ะ🇯ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇱ะะ🇮ะะ🇰ะะ🇭ะ ะ🇷ะะ🇳ะะ🇩ะะ🇾ะะ🇰ะะ🇪ะ ะ🇧ะะ🇪ะะ🇯ะ",
+        "ะ🇴ะะ🇷ะ ะ🇧ะะ🇩ะะ🇦ะ ะ🇱ะะ🇮ะะ🇰ะะ🇭ะ",
+        "ะ🇴ะะ🇷ะ ะ🇧ะะ🇩ะะ🇦ะ",
+        "ะ🇴ะะ🇷ะ ะ🇧ะะ🇩ะะ🇦ะ ะ🇴ะะ🇾ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇰ะะ🇦ะ ะ🇧ะะ🇺ะะ🇷ะ",
+        "ะ🇴ะะ🇾ะะ🇪ะ ะ🇰ะะ🇪ะะ🇩ะะ🇪ะ",
+        "ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇦ะะ🇩ะะ🇰ะะ🇪ะ",
+        "ะ🇯ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇱ะะ🇮ะะ🇰ะะ🇭ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะะ🇳ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ",
+        "ะ🇲ะะ🇰ะะ🇱ะ ะ??ะะ🇹ะะ🇭ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇨ะะ🇨ะะ🇭ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇳ะะ🇦ะะ🇳ะะ🇮ะ ะ🇲ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇱ะ",
+        "ะ🇹ะะ🇪ะะ🇯ะ ะ🇱ะะ🇮ะะ🇰ะะ🇭ะ ะ🇷ะะ🇳ะะ🇩ะะ🇨ะะ🇪ะ",
+        "ะ🇴ะะ🇾ะะ🇪ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇪ะ ะ🇱ะะ🇴ะะ🇩ะะ🇪ะ ะ🇲ะะ🇷ะะ🇪ะะ🇳ะะ🇬ะะ🇦ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇾ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇮ะะ🇾ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇬ะะ🇦ะะ🇳ะะ🇩ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇩ะะ🇦ะะ🇩ะะ🇮ะ ะ🇰ะะ🇦ะ ะ🇫ะะ🇺ะะ🇩ะะ🇩ะะ🇦ะ",
+        "ะ🇲ะะ🇰ะะ🇱ะ ะ🇺ะะ🇹ะะ🇭ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะะ🇳ะะ🇨ะะ🇴ะะ🇩ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ??ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇧ะะ🇺ะะ🇷ะ ะ🇩ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇰ะะ🇦ะ ะ🇫ะะ🇺ะะ🇩ะะ🇩ะะ🇦ะ ะ🇲ะะ🇪ะ ะ🇱ะะ🇦ะะ🇺ะะ🇩ะะ🇦ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇨ะะ🇭ะะ🇺ะะ🇩ะะ🇻ะะ🇦ะ",
+        "ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇪ะะ🇹ะะ🇪ะ ะ🇲ะะ🇦ะะ🇷ะ ะ🇬ะะ🇦ะะ🇾ะะ🇦ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ ะ🇲ะะ🇷ะะ🇺ะ",
+        "ะ🇯ะะ🇦ะะ🇱ะะ🇮ะะ🇩ะ ะ🇰ะะ🇷ะ ะ🇸ะะ🇵ะะ🇦ะะ🇲ะ",
+        "ะ🇲ะะ🇨ะ ะ🇸ะะ🇵ะะ🇦ะะ🇲ะ ะ🇷ะะ🇴ะะ🇰ะะ🇪ะะ🇳ะะ🇬ะะ🇦ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ ะ🇸ะะ🇵ะะ🇦ะะ🇲ะ ะ🇰ะะ🇷ะ",
+        "ะ🇸ะะ🇵ะะ🇦ะะ🇲ะ ะ🇰ะะ🇷ะ.ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇪ะ ะ🇱ะะ🇴ะะ🇩ะะ🇪ะ",
+        "ะ🇷ะะ🇳ะะ🇮ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇪ะ ะ🇸ะะ🇵ะะ🇦ะะ🇲ะ ะ🇰ะะ🇷ะ",
+        "ะ🇸ะะ🇵ะะ🇦ะะ🇲ะ ะ🇰ะะ🇷ะ ะ🇰ะะ🇮ะะ🇩ะ",
+        "ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ",
+        "ะ🇷ะะ🇳ะะ🇩ะะ🇮ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇪ะะ🇹ะะ🇪ะ",
+        "ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ ะ??ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇱ะะ🇮ะะ🇰ะะ🇭ะ ะ🇼ะะ🇷ะะ🇳ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะ",
+        "ะ🇨ะะ🇺ะะ🇩ะ ะ🇬ะะ🇦ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ",
+        "ะ🇺ะะ🇹ะะ🇭ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇾ะะ🇰ะะ🇪ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ",
+        "ะ🇨ะะ🇭ะะ🇱ะ ะ🇨ะะ🇺ะะ🇩ะะ🇰ะะ🇪ะ ะ🇩ะะ🇮ะะ🇰ะะ🇭ะะ🇦ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ",
+        "ะ🇯ะะ🇱ะะ🇩ะะ🇮ะ ะ🇹ะะ🇾ะะ🇵ะ ะ🇨ะะ🇷ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ ะ🇭ะะ🇦ะะ🇱ะะ🇰ะะ🇪ะ",
+        "ะ🇨ะะ🇺ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇬ะะ🇱ะ ะ🇳ะะ🇾ะ ะ🇭ะะ🇴ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ",
+        "ะ🇨ะะ🇺ะะ🇩ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะ ะ🇧ะะ🇳ะะ🇯ะะ🇦ะ ะ🇹ะะ🇺ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ",
+        "ะ🇲ะะ🇦ะะ🇰ะะ🇮ะะ🇨ะะ🇭ะะ🇺ะะ🇹ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ",
+        "ะ🇬ะะ🇦ะะ🇳ะะ🇩ะะ🇦ะ ะ🇨ะะ🇾ะะ🇺ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇷ะะ🇭ะะ🇦ะ ะ🇹ะะ🇺ะ ?",
+        "ะ🇮ะะ🇹ะะ🇳ะะ🇦ะ ะ🇬ะะ🇳ะะ🇩ะะ🇦ะ ะ🇳ะะ🇾ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇦ะะ🇨ะะ🇭ะะ🇪ะ ะ🇸ะะ🇪ะ ะ🇨ะะ🇺ะะ🇩ะ",
+        "ะ🇲ะะ🇦ะะ🇦ะ⍟ ะ🇱ะะ🇪ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇬ะะ🇾ะะ🇦ะ ะ🇹ะะ🇺ะ ะ🇸ะะ🇺ะ⍟ ะ🇧ะะ🇦ะะ🇹ะ ะ🇦ะะ🇧",
+        "ะ🇲ะะ🇦ะะ🇰ะะ🇦ะะ🇫ะะ🇺ะะ🇩ะะ🇩ะะ🇦ะ ะ🇫ะะ🇦ะะ🇹ะ ะ🇬ะะ🇾ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇷ะะ🇺ะะ🇰ะ",
+        "ะ🇸ะะ🇭ะะ🇦ะะ🇳ะะ🇹ะ ะ🇧ะะ🇪ะะ🇹ะะ🇭ะ ะ🇲ะะ🇦ะะ🇩ะะ🇷ะะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇼ะะ🇷ะะ🇳ะะ🇦ะ ะ🇲ะะ🇦ะะ🇰ะะ🇦ะะ🇧ะะ🇴ะะ🇸ะะ🇩ะะ🇦ะ ะ🇹ะะ🇪ะะ🇪ะะ🇾ะ.",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ..",
+        "ะ🇱ะะ🇼ะะ🇩ะะ🇪ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇦ะะ🇱ะะ🇱ะะ🇱ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇨ะะ🇺ะะ🇩ะะ🇰ะะ🇪ะ ะ🇵ะะ🇬ะะ🇱ะ ะ🇩ะะ🇪ะะ🇰ะะ🇭ะ.",
+        "ะ🇲ะะ🇦ะะ🇨ะะ🇭ะะ🇦ะะ🇷ะ ะ🇰ะะ🇮ะ ะ🇯ะะ🇭ะะ🇦ะะ🇦ะะ🇹ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇱ะะ🇱ะะ🇱ะะ🇱ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇦ะะ🇨ะะ🇭ะะ🇪ะ ะ🇸ะะ🇪ะ ะ🇾ะะ🇭ะะ🇦ะะ🇵ะะ🇪ะ ะ🇹ะะ🇺ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ ะ🇲ะ ะ🇩ะะ🇺ะ ะ🇹ะะ🇦ะะ🇵ะะ🇦ะ ะ🇹ะะ🇦ะะ🇵ะ?",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇦ะ ะ🇧ะะ🇭ะะ🇴ะꜱะะ🇩ะะ🇦ะะ??ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇭ะะ🇳ะ ꜱะ🇧ะꜱะ🇧ะะ🇪ะ ะ🇧ะะ🇩ะะ🇮ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ.",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇴ะꜱะꜱะะ🇪ะ ะ🇧ะะ🇦ะะ🇩ะะ🇮ะ ะ??ะะ🇦ะะ🇳ะะ🇩ะะ🇩ะะ🇩ะะ🇩ะะ🇩ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇦ะ ะ🇧ะะ🇦ะะ🇦ะะ🇵ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇧ะะ🇦ะะ🇦ะะ🇿ะ ะ🇪ะะ🇾ะ ะ🇩ะะ🇪ะะ🇰ะะ🇭ะ",
+        "ะ🇰ะะ🇮ะะ🇹ะะ🇳ะะ🇮ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇦ะะ🇧ะ ะ🇴ะะ🇷..",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇮ะ ะ🇭ะะ🇲ะ ะ🇳ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇪ะ ꜱะ🇹ะะ🇭ะ ะ🇷ะะ🇪ะะ🇪ะะ🇱ะꜱะ ะ🇧ะะ🇳ะะ🇪ะะ🇬ะะ🇦ะ ะ🇷ะะ🇴ะะ🇦ะะ🇩ะ ะ🇵ะะ🇪ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ ะ🇪ะะ🇰ะ ะ🇩ะะ🇦ะะ🇲ะ ะ🇹ะะ🇴ะะ🇵ะ ꜱะ🇪ะxะ🇾ะ",
+        "ะ🇲ะะ🇦ะะ🇱ะะ🇺ะ🇲ะ ะ🇳ะะ🇦ะ ะ🇵ะะ🇭ะ🇷ะ ะ🇰ะะ🇪ꜱะะ🇪ะ ะ🇱ะะ🇪ะะ🇹ะะ🇦ะ ะ🇭ะะ🇺ะ ะ🇲ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ ะ🇹ะะ🇦ะะ🇵ะะ🇦ะ ะ🇹ะะ🇦ะะ🇵ะะ🇵ะะ🇵ะะ🇵ะะ🇵ะ",
+        "ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇪ะ ะ🇹ะะ🇺ะ ะ🇰ะะ🇪ะะ🇷ะะ🇪ะะ🇬ะะ🇦ะ ะ🇹ะะ🇾ะะ🇵ะะ🇮ะะ🇳ะะ🇬ะ ะ🇰ะะ🇷ะะ🇪ะะ🇬ะะ🇦ะ ะ🇹ะะ🇲ะะ🇰ะะ🇨ะ",
+        "ꜱะ🇵ะะ🇪ะะ🇪ะะ🇩ะ ะ🇵ะะ🇰ะะ🇩ะ ะ🇱ะะ🇼ะะ🇩ะะ🇪ะะ🇪ะะ🇪ะะ🇪ะ ะ🇼ะะ🇷ะะ🇳ะะ🇦ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇵ะะ🇰ะะ🇩ะ",
+        "ะ🇧ะะ🇦ะะ🇦ะะ🇵ะ ะ🇰ะะ🇮ะ ꜱะ🇵ะะ🇪ะะ🇪ะะ🇩ะ ะ🇲ะะ🇹ะะ🇨ะะ🇭ะ ะ🇰ะะ🇷ะะ🇷ะะ🇷ะ",
+        "ะ🇱ะะ🇼ะะ🇩ะะ🇦ะ ะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇯ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇸ะะ🇪ะ ะ🇹ะะ🇺ะ",
+        "ะ🇵ะะ🇦ะะ🇵ะะ🇦ะ ะ🇰ะะ🇮ะ ꜱะ🇵ะะ🇪ะะ🇪ะะ🇩ะ ะ🇲ะะ🇹ะะ🇨ะะ🇭ะ ะ🇳ะะ🇭ะะ🇮ะ ะ🇭ะะ🇴ะ ะ🇷ะะ🇭ะะ🇮ะ ะ🇰ะะ🇾ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇪ะะ🇸ะะ🇪ะ",
+        "ะ🇦ะะ🇱ะะ🇪ะ ะ🇦ะะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะะ🇱ะะ🇦ะ ะ🇧ะะ🇨ะะ🇭ะะ🇦ะะ🇦ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะะ🇰ะะ🇦ะ ะ🇧ะะ🇴ะะ🇸ะะ🇩ะะ🇦ะ ะ🇸ะะ🇺ะะ🇳ะ",
+        "ะ🇨ะะ🇭ะะ🇺ะะ🇩ะ ะ🇬ะะ🇾ะะ🇦ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇧ะะ🇦ะะ🇦ะะ🇿ะ ะ🇵ะะ🇦ะะ🇵ะะ🇦ะ ꜱะ🇪ะะ🇪ะะ🇪ะ ะ🇹ะะ🇺ะ",
+        "ะ🇲ะะ🇪ะะ🇳ะะ🇺ะ ะ🇰ะะ🇮ะ ะ🇵ะะ🇹ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇬ะะ🇦ะะ🇮ะ",
+        "ะ🇰ะะ🇴ะะ🇮ะ ะ🇧ะะ🇦ะะ🇦ะะ🇹ะ ะ🇳ะะ🇾ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇾ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ",
+        "ะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะ ะ🇲ะะ🇦ะะ🇰ะะ🇦ะะ🇧ะะ🇴ะะ🇸ะะ🇩ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ",
+        "ะ🇽ะะ🇭ะะ🇺ะะ🇩ะ ะ🇬ะะ🇦ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇰ะะ🇮ะะ🇩ะꜱะꜱะꜱะꜱะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇨ะะ🇭ะะ🇺ะะ🇩ะ ะ🇬ะะ🇾ะะ🇮ะ ะ🇦ะะ🇧ะ ꜰะ🇷ะะ🇦ะ🇷ะ ะ🇲ะะ🇹ะ ะ🇭ะะ🇴ะะ🇳ะะ🇦ะ",
+        "ะ🇾ะะ🇪ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇨ะะ🇭ะะ🇱ะ ะ🇯ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇸ะะ🇪ะ",
+        "ะ🇰ะะ🇮ะะ🇩ะꜱะꜱะꜱะ ꜰะ🇷ะะ🇦ะ🇷ะ ะ🇳ะะ🇦ะ ะ🇭ะะ🇴ะ ะ🇹ะะ🇺ะ ะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇭ะ",
+        "ะ🇧ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇼ะะ🇩ะะ🇪ะ ꜱะ🇭ะ🇷ะ🇲ะ ะ🇰ะะ🇷ะ",
+        "ะ🇰ะะ🇮ะะ🇹ะะ🇳ะะ🇮ะ ะ🇬ะะ🇱ะะ🇮ะะ🇾ะะ🇦ะ ะ🇵ะะ🇩ะะ🇼ะะ🇪ะะ🇬ะะ🇦ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇴ะ",
+        "ะ🇨ะะ🇭ะะ🇺ะะ🇵ะ ะ🇳ะะ🇦ะะ🇱ะะ🇱ะะ🇮ะะ🇮ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇾ะะ🇰ะะ🇪ะ ะ🇱ะะ🇦ะะ🇩ะะ🇰ะะ🇪ะ",
+        "ꜱะ🇺ะะ🇦ะ🇷ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ꜱะ🇦ะะ🇩ะะ🇦ะ🇰ะ ะ🇵ะ🇷ะ ะ🇱ะะ🇮ะะ🇹ะะ🇦ะะ🇰ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ 😂😆🤤",
+        "ะ🇦ะะ🇧ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇦ะ ะ🇧ะะ🇭ะะ🇴ꜱะะ🇩ะะ🇦ะ ะ🇲ะะ🇦ะะ🇩ะะ🇪ะ🇷ะะ🇨ะะ🇭ะะ🇴ะะ🇴ะะ🇩ะ ะ🇰ะ🇷ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ ะ🇵ะะ🇦ะะ🇵ะะ🇦ะ ꜱะ🇪ะ ะ🇱ะะ🇦ะะ🇩ะะ🇪ะะ🇬ะะ🇦ะ ะ🇹ะะ🇺ะ 😼😂🤤",
+        "ะ🇬ะะ🇦ะะ🇱ะะ🇮ะ ะ🇬ะะ🇦ะะ🇱ะะ🇮ะ ะ🇳ะะ🇪ะ ꜱะ🇭ะ🇴ะ🇷ะ ะ🇭ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇨ะะ🇭ะะ🇴ะ🇷ะ ะ🇭ะะ🇪ะ 💋💋💦",
+        "ะ🇦ะะ🇧ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ ะ🇰ะะ🇺ะะ🇹ะะ🇹ะะ🇪ะ ะ🇰ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇪ะ 😂👻🔥",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇦ะะ🇮ꜱะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇦ะ ะ🇦ะะ🇮ꜱะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇦ะ ะ🇧ะะ🇪ะะ🇩ะ ะ🇵ะะ🇪ะะ🇭ะะ🇮ะ ะ🇲ะะ🇺ะะ🇹ะะ🇭ะ ะ🇩ะะ🇮ะะ🇦ะ 💦💦💦💦",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇭ะะ🇴ꜱะะ🇩ะะ🇪ะ ะ🇲ะะ🇪ะ ะ🇦ะะ🇦ะะ🇦ะ🇬ะ ะ🇱ะะ🇦ะะ🇬ะะ🇦ะะ🇩ะะ🇮ะะ🇦ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇲ะะ🇴ะะ🇹ะะ🇦ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇩ะะ🇦ะะ🇱ะะ🇰ะะ🇪ะ 🔥🔥💦😆😆",
+        "ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇨ะะ🇭ะะ🇭ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ ะ🇨ะะ🇭ะะ🇦ะะ🇱ะ ะ🇳ะะ🇮ะะ🇰ะะ🇦ะะ🇱ะ",
+        "ะ🇰ะะ🇮ะะ🇹ะะ🇳ะะ🇦ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇦ะะ🇧ะะ🇧ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะ ะ🇧ะะ🇭ะะ🇪ะะ🇯ะ 😆👻🤤",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะะ🇹ะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇰ะะ🇪ะ ะ🇵ะะ🇺ะะ🇷ะะ🇦ะ ꜰะ🇦ะะ🇦ะะ🇩ะ ะ🇩ะะ🇮ะะ🇦ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇦ะะ🇧ะะ🇧ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇬ะꜰะ ะ🇰ะะ🇴ะ ะ🇧ะะ🇭ะะ🇪ะะ🇯ะ 😆💦🤤",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇬ะꜰะ ะ🇰ะะ🇴ะ ะ🇪ะะ🇹ะะ🇳ะะ🇦ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇦ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇴ะะ🇩ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇬ะꜰะ ะ🇹ะะ🇴ะ ะ🇲ะะ🇪ะะ🇷ะะ🇮ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇧ะะ🇦ะะ🇳ะะ🇬ะะ🇦ะะ🇾ะะ🇮ะ ะ🇦ะะ🇧ะะ🇧ะ ะ🇨ะะ🇭ะะ🇦ะะ🇱ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇹ะะ🇦ะ ꜰะ🇮ะ🇷ꜱะะ🇪ะ ♥️💦😆😆😆😆",
+        "ะ🇭ะะ🇦ะะ🇷ะะ🇮ะ ะ🇭ะะ🇦ะะ🇷ะะ🇮ะ ะ🇬ะะ🇭ะะ🇦ะะ🇦ꜱะ ะ🇲ะะ🇪ะ ะ🇯ะะ🇭ะะ🇴ะะ🇵ะะ🇩ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇦ะ ะ🇧ะะ🇭ะะ🇴ꜱะะ🇩ะะ🇦ะ 🤣🤣💋💦",
+        "ะ🇨ะะ🇭ะะ🇦ะะ🇱ะ ะ🇹ะะ🇪ะะ🇷ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇵ะ ะ🇰ะะ🇴ะ ะ🇧ะะ🇭ะะ🇪ะะ🇯ะ ะ🇹ะะ🇪ะะ🇷ะะ🇦ะ ะ🇧ะะ🇦ꜱะะ🇰ะะ🇦ะ ะ🇳ะะ🇭ะะ🇮ะ ะ🇭ะะ🇪ะ ะ🇵ะะ🇦ะะ🇵ะะ🇦ะ ꜱะ🇪ะ ะ🇱ะะ🇦ะะ🇩ะะ🇪ะะ🇬ะะ🇦ะ ะ🇹ะะ🇺ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇲ะะ🇪ะ ะ🇧ะะ🇴ะะ🇲ะ🇧ะ ะ🇩ะะ🇦ะะ🇱ะะ🇰ะะ🇪ะ ะ🇺ะะ🇩ะะ🇦ะ ะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇪ะ ะ🇱ะะ🇦ะะ🇼ะะ🇩ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇹ะะ🇷ะะ🇦ะะ🇮ะ🇳ะ ะ🇲ะะ🇪ะ ะ🇱ะะ🇪ะะ🇯ะะ🇦ะะ🇰ะะ🇪ะ ะ🇹ะะ🇴ะะ🇵ะ ะ🇧ะะ🇪ะะ🇩ะ ะ🇵ะะ🇪ะ ะ🇱ะะ🇮ะะ🇹ะะ🇦ะะ🇰ะะ🇪ะ ะ🇨ะะ??ะะ🇴ะะ🇩ะ ะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ꜱะ🇺ะะ🇦ะ🇷ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ 🤣🤣💋💋",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇪ะ ะ🇳ะะ🇺ะะ🇩ะะ🇪ꜱะ ะ🇬ะะ🇴ะะ🇴ะ🇬ะ🇱ะะ🇪ะ ะ🇵ะะ🇪ะ ะ🇺ะะ🇵ะะ🇱ะะ🇴ะะ🇦ะ🇩ะ ะ🇰ะะ🇦ะ🇷ะะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇦ะะ🇪ะะ🇼ะะ🇩ะะ🇪ะ 👻🔥",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇪ะ ะ🇳ะะ🇺ะะ🇩ะะ🇪ꜱะ ะ🇬ะะ🇴ะะ🇴ะ🇬ะ🇱ะะ🇪ะ ะ🇵ะะ🇪ะ ะ🇺ะะ🇵ะะ🇱ะะ🇴ะะ🇦ะ🇩ะ ะ🇰ะะ🇦ะ🇷ะะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇦ะะ🇪ะะ🇼ะะ🇩ะะ🇪ะ 👻🔥",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇰ะะ🇪ะ ะ🇻ะะ🇮ะะ🇩ะะ🇪ะ🇴ะ ะ🇧ะะ🇦ะะ🇳ะะ🇦ะะ🇰ะะ🇪ะ ะ🇽ะ🇳🇽🇽.🇨🇴🇲 ะ🇵ะะ🇪ะ ะ🇳ะะ🇪ะะ🇪ะะ🇱ะะ🇦ะ🇲ะ ะ🇰ะะ🇦ะ🇷ะะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇰ะะ🇺ะะ🇹ะะ🇹ะะ🇪ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ 💦💋",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇩ะะ🇦ะะ🇮ะ ะ🇰ะะ🇴ะ ะ🇵ะ🇴🇷🇳🇭🇺🇧.🇨🇴🇲 ะ🇵ะะ🇪ะ ะ🇺ะะ🇵ะะ🇱ะะ🇴ะะ🇦ะ🇩ะ ะ🇰ะะ🇦ะ🇷ะะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ꜱะ🇺ะะ🇦ะ🇷ะ ะ🇰ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇪ะ 🤣💋💦",
+        "ะ🇦ะะ🇧ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇨ะะ🇭ะะ🇭ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇪ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇦ะะ🇰ะะ🇰ะ🇴ะ ꜱะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇼ะะ🇦ะะ🇻ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇨ะะ🇭ะะ🇭ะะ🇪ะ 🤣🤣",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ꜰะะ🇦ะะ🇦ะะ🇩ะะ🇰ะะ🇪ะ ะ🇷ะะ🇦ะะ🇰ะะ🇩ะะ🇮ะะ🇦ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇪ะ ะ🇱ะะ🇴ะะ🇩ะะ🇪ะ ะ🇯ะะ🇦ะะ🇦ะ ะ🇦ะะ🇧ะะ🇧ะ ꜱะะ🇮ะะ🇱ะะ🇼ะะ🇦ะะ🇱ะะ🇪ะ 👄👄",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇲ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇰ะะ🇦ะะ🇦ะะ🇱ะะ🇦ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇱ะะ🇪ะะ🇹ะะ🇮ะ ะ🇲ะะ🇪ะะ🇷ะะ🇮ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇧ะะ🇦ะะ🇩ะะ🇪ะ ะ🇲ะะ🇦ꜱะะ🇹ะะ🇮ะ ꜱะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะ ะ🇲ะะ🇪ะะ🇳ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇦ะะ🇱ะะ🇦ะ ะ🇧ะะ🇴ะะ🇭ะะ🇴ะะ🇹ะ ꜱะะ🇦ꜱะะ🇹ะะ🇪ะ ꜱะะ🇪ะ",
+        "ะ🇧ะะ🇪ะะ🇹ะะ🇪ะ ะ🇹ะะ🇺ะ ะ🇧ะะ🇦ะะ🇦ะะ🇵ะ ꜱะะ🇪ะ ะ🇱ะะ🇪ะะ🇬ะะ🇦ะ ะ🇵ะะ🇦ะะ🇳ะะ🇬ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇦ะ ะ🇰ะะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇰ะะ🇦ะ🇷ะะ🇰ะะ🇪ะ ะ🇳ะะ🇦ะะ🇳ะะ🇬ะะ🇦ะ 💦💋",
+        "ะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะ ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ ะ🇧ะะ🇪ะะ🇹ะะ🇪ะ ะ🇦ะะ🇬ะะ🇱ะะ🇮ะ ะ🇧ะะ🇦ะะ🇦ะ🇷ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇱ะะ🇪ะะ🇰ะะ🇪ะ ะ🇦ะะ🇦ะะ🇾ะะ🇦ะ ะ🇲ะะ🇦ะะ🇹ะะ🇭ะ ะ🇰ะะ🇦ะะ🇹ะ ะ🇴ะ🇷ะ ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ ะ🇲ะะ🇴ะะ🇹ะะ🇪ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ꜱะะ🇪ะ ะ🇨ะะ🇭ะะ🇺ะะ🇩ะะ🇼ะะ🇦ะะ🇾ะะ🇦ะ ะ🇲ะะ🇦ะะ🇹ะะ🇭ะ ะ🇰ะะ🇦ะ🇷ะ",
+        "ะ🇨ะะ🇭ะะ🇦ะะ🇱ะ ะ🇧ะะ🇪ะะ🇹ะะ🇦ะ ะ🇹ะะ🇺ะะ🇯ะะ🇭ะะ🇪ะ ะ🇲ะะ🇦ะะ🇦ꜱะ🇫ะ ะ🇰ะะ🇮ะะ🇦ะ 🤣ะ🇹ะะ🇺ะ ะ🇦ะะ🇧ะะ🇧ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะะ🇰ะ🇴ะ ะ🇧ะะ🇭ะะ🇪ะะ🇯ะ",
+        "ꜱะ🇭ะะ🇦ะะ🇷ะะ🇦ะ🇲ะ ะ🇰ะะ🇦ะ🇷ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇦ะ ะ🇧ะะ🇭ะะ🇴ꜱะะ🇩ะะ🇦ะ ะ🇰ะะ🇮ะะ🇹ะะ🇳ะะ🇦ะ ะ🇬ะะ🇦ะะ🇦ะะ🇱ะะ🇮ะะ🇦ะ ꜱะ🇺ะะ🇳ะะ🇼ะะ🇦ะะ🇾ะะ🇪ะะ🇬ะะ🇦ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇦ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇺ะะ🇵ะะ🇪ะ🇷ะ",
+        "ะ🇦ะะ🇧ะะ🇪ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇨ะะ🇭ะะ🇭ะะ🇪ะ ะ🇦ะะ🇺ะะ🇰ะะ🇦ะะ🇹ะ ะ🇳ะะ🇭ะะ🇮ะ ะ🇭ะะ🇪ะะ🇹ะ🇴ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇱ะะ🇪ะะ🇰ะะ🇪ะ ะ🇦ะะ🇦ะะ🇾ะะ🇦ะ ะ🇲ะะ🇦ะะ🇹ะะ🇭ะ ะ🇰ะะ🇦ะ??ะ ะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะ",
+        "ะ🇰ะะ🇮ะะ🇩ะ🇿ะ ะ🇲ะะ🇦ะะ🇩ะะ🇦ะ🇷ะะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇰ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะ🇷ะ ะ🇱ะะ🇮ะะ🇾ะะ🇪ะ ะ🇧ะะ🇭ะะ🇦ะะ🇮ะ ะ🇩ะะ🇪ะะ🇩ะะ🇮ะะ🇾ะะ🇦ะ",
+        "ะ🇯ะะ🇺ะะ🇳ะะ🇬ะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะ ะ🇳ะะ🇦ะะ🇨ะะ🇭ะะ🇹ะะ🇦ะ ะ🇭ะะ🇪ะ ะ🇲ะะ🇴ะ🇷ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇩ะะ🇦ะะ🇮ะ ะ🇩ะะ🇪ะะ🇰ะะ🇰ะะ🇪ะ ꜱะ🇦ะ🇧ะ ะ🇧ะะ🇴ะะ🇱ะะ🇹ะะ🇪ะ ะ🇴ะะ🇳ะ🇨ะะ🇪ะ ะ🇲ะะ🇴ะ🇷ะะ🇪ะ ะ🇴ะะ🇳ะ🇨ะะ🇪ะ ะ🇲ะะ🇴ะ🇷ะะ🇪ะ 🤣🤣💦💋",
+        "ะ🇬ะะ🇦ะะ🇱ะะ🇮ะ ะ🇬ะะ🇦ะะ🇱ะะ🇮ะ ะ🇲ะะ🇪ะ ะ🇷ะะ🇪ะะ🇭ะะ🇹ะะ🇦ะ ะ🇭ะะ🇪ะ ꜱะ🇦ะะ🇳ะะ🇩ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇦ะะ🇱ะะ🇦ะ ะ🇴ะ🇷ะ ะ🇧ะะ🇦ะะ🇳ะะ🇦ะ ะ🇩ะะ🇮ะะ🇦ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะ 🤤🤣",
+        "ꜱะ🇦ะ🇧ะ ะ🇧ะะ🇴ะะ🇱ะะ🇹ะะ🇪ะ ะ🇲ะะ🇺ะะ🇯ะะ🇭ะะ🇰ะ🇴ะ ะ🇵ะะ🇦ะะ🇵ะะ🇦ะ ะ🇨ะะ🇾ะะ🇺ะะ🇰ะะ🇮ะ ะ🇲ะะ🇪ะะ🇳ะะ🇪ะ ะ🇰ะ🇷ะะ??ะะ🇮ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇵ะ🇷ะะ🇪ะะ🇬ะะ🇳ะะ🇪ะะ🇳ะะ🇹ะ 🤣🤣",
+        "ꜱะ🇺ะะ🇦ะ🇷ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇲ะะ🇪ะ ꜱะ🇺ะะ🇦ะ🇷ะ ะ🇰ะะ🇦ะ ะ🇱ะะ🇴ะะ🇺ะะ🇩ะะ🇦ะ ะ🇴ะ🇷ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇲ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇱ะะ🇴ะะ🇩ะะ🇦ะ",
+        "ะ🇨ะะ🇭ะะ🇦ะะ🇱ะ ะ🇨ะะ🇭ะะ🇦ะะ🇱ะ ะ🇹ะะ🇺ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇨ะะ🇭ะะ🇮ะะ🇾ะะ🇦ะ ะ🇩ะะ🇮ะะ🇰ะะ🇦ะ",
+        "ะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะ ะ🇧ะะ🇦ะะ🇨ะะ🇭ะะ🇭ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇮ะะ🇦ะ ะ🇳ะะ🇦ะะ🇳ะะ🇬ะะ🇦ะ ะ🇰ะะ🇦ะ🇷ะะ🇰ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇬ะꜰะ ะ🇭ะะ🇪ะ ะ🇧ะะ🇦ะะ🇩ะะ🇮ะ ꜱะ🇪xะ🇾ะ ะ🇺ꜱะะ🇰ะ??ะ ะ🇵ะะ🇮ะะ🇱ะะ🇦ะะ🇰ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇴ะะ🇩ะะ🇪ะะ🇳ะะ🇬ะะ🇪ะ ะ🇵ะะ🇪ะะ🇵ꜱะะ🇮ะ",
+        "2 ะ🇷ะะ🇺ะะ🇵ะะ🇦ะ🇾ะ ะ🇰ะะ🇮ะ ะ🇵ะะ🇪ะะ🇵ꜱะะ🇮ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇺ะะ🇲ะะ🇲ะะ🇾ะ ꜱะ🇦ะ🇧ꜱะะ🇪ะ ꜱะ🇪xะ🇾ะ 💋💦",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇪ะะ🇪ะ🇲ꜱะ ꜱะะ🇪ะ ะ🇨ะะ🇭ะะ🇺ะะ🇩ะะ🇼ะะ🇦ะะ🇻ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇲ะะ🇦ะะ🇩ะะ🇪ะ🇷ะะ🇨ะะ🇭ะะ🇴ะะ🇴ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ 💦🤣",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇲ะะ🇪ะ ะ🇲ะะ🇺ะะ🇹ะะ🇭ะะ🇰ะะ🇪ะ ꜰะะ🇦ะ🇷ะะ🇦ะ🇷ะ ะ🇭ะะ🇴ะะ🇯ะะ🇦ะะ🇻ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇭ะะ🇺ะะ🇮ะ ะ🇭ะะ🇺ะะ🇮ะ ะ🇭ะะ🇺ะะ🇮ะ",
+        "ꜱะ🇵ะะ🇪ะะ🇪ะะ🇩ะ ะ🇱ะะ🇦ะะ🇦ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ 💋💦🤣",
+        "ะ🇦ะะ🇷ะะ🇪ะ ะ🇷ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ ะ🇧ะะ🇪ะะ🇹ะะ🇪ะ ะ🇨ะะ🇾ะะ🇺ะ ꜱะ🇵ะะ🇪ะะ🇪ะะ🇩ะ ะ🇵ะะ🇦ะะ🇰ะะ🇦ะะ🇩ะ ะ🇳ะะ🇦ะ ะ🇵ะะ🇦ะะ🇦ะะ🇦ะ ะ🇷ะะ🇦ะะ🇭ะะ🇦ะ ะ🇦ะะ🇵ะะ🇳ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇵ะ ะ🇰ะะ🇦ะ ะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇬ะะ🇦ะะ🇮ะ🤣🤣",
+        "ꜱะ🇺ะะ🇳ะ ꜱะ🇺ะะ🇳ะ ꜱะ🇺ะะ🇦ะ🇷ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ ะ🇯ะะ🇭ะะ🇦ะะ🇳ะะ🇹ะ🇴ะ ะ🇰ะะ🇪ะ ꜱะ🇴ะะ🇺ะะ🇩ะะ🇦ะะ🇬ะะ🇦ะ🇷ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇺ะะ🇲ะะ🇲ะะ🇾ะ ะ🇰ะะ🇮ะ ะ🇳ะะ🇺ะะ🇩ะะ🇪ꜱะ ะ🇧ะะ🇭ะะ🇪ะะ🇯ะ",
+        "ะ🇦ะะ🇧ะะ🇪ะ ꜱะ🇺ะะ🇳ะ ะ🇱ะะ🇴ะะ🇩ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇦ะ ะ🇧ะะ🇭ะะ🇴ꜱะะ🇩ะะ🇦ะ ꜰะะ🇦ะะ🇦ะะ🇩ะ ะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇰ะะ🇭ะะ🇺ะะ🇱ะะ🇪ะ ะ🇧ะะ🇦ะะ🇯ะะ🇦ะ🇷ะ ะ🇲ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇦ะะ🇱ะะ🇦ะ 🤣🤣💋",
+        "ꜱะ🇭ะ🇷ะ🇲ะ ะ🇰ะ🇷ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇬ะะ🇦ะะ🇮ะ ะ🇾ะะ🇭ะะ🇦ะ",
+        "ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะะ🇱ะะ🇱ะะ🇱ะะ🇱ะะ🇱ะ ะ🇵ะะ🇰ะะ🇩ะ ะ🇯ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇸ะะ🇪ะ",
+        "ะ🇹ะะ🇺ะ ะ🇪ะะ🇰ะ ะ🇰ะะ🇦ะะ🇦ะ🇲ะ ะ🇰ะ🇷ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇧ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะ ะ🇨ะะ🇺ะะ🇩ะะ🇼ะะ🇦ะ ะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ ะ🇸ะะ🇹ะะ🇭ะ",
+        "ะ🇷ะะ🇳ะะ🇩ะะ🇮ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇩ะะ🇰ะะ🇪ะะ🇪ะะ🇪ะะ🇪ะะ🇪ะะ🇪ะะ🇪ะะ🇪ะ ะ🇨ะะ🇭ะะ🇺ะะ🇵ะ ะ🇴ะ🇷ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇾ะะ🇭ะะ🇦ะ",
+        "ะ🇨ะะ🇭ะะ🇺ะะ🇵ะ ะ🇹ะะ🇲ะะ🇰ะะ🇨ะ ะ🇰ะะ🇮ะะ🇩ꜱะꜱะꜱะꜱะꜱะꜱะꜱะꜱะꜱะꜱะꜱะꜱะ",
+        "ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇬ะะ🇦ะะ🇦ะะ🇳ะะ🇩ะ ะ🇲ะะ🇪ะะ??ะ🇳ะ ะ🇲ะะ🇺ะะ🇹ะะ🇭ะะ🇮ะ ะ🇩ะะ🇦ะะ🇦ะะ🇱ะ",
+        "ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇨ะะ🇭ะะ🇴ะะ🇴ꜱะ ะ🇯ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇸ะะ🇪ะ",
+        "ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇴ะ ะ🇨ะะ🇺ꜱะะ🇼ะะ🇦ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ",
+        "ะ🇧ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇦ะะ🇺ะะ🇩ะะ🇪ะ ะ🇹ะะ🇲ะะ🇨ะ",
+        "ะ🇧ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇹ะะ🇦ะะ🇰ะะ🇰ะะ🇪ะ ะ🇹ะะ🇲ะะ🇱ะ",
+        "ะ🇦ะะ🇧ะะ🇱ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇦ะ ะ🇰ะะ🇭ะะ🇦ะ🇳ะ ะ🇩ะะ🇦ะ🇳ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇳ะะ🇪ะ ะ🇰ะะ🇮ะ ะ🇧ะะ🇦ะ🇷ะะ🇮ะะ🇮ะ",
+        "ะ🇧ะะ🇪ะะ🇹ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ꜱะ🇧ꜱะะ🇪ะ ะ🇧ะะ🇩ะะ🇮ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะ",
+        "ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇦ะะ🇱ะ ะ🇯ะะ🇭ะะ🇦ะะ🇹ะ ะ??ะะ🇪ะ ะ🇵ะะ🇮ꜱะꜱะꜱะ🇺ะะ🇺ะะ🇺ะะ🇺ะะ🇺ะะ🇺ะะ🇺ะ ะ🇹ะะ🇲ะะ🇰ะะ🇨ะ",
+        "ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇵ะะ🇪ะ ะ🇱ะะ🇹ะะ🇰ะะ🇮ะะ🇹ะ ะ🇲ะะ🇦ะะ🇦ะะ🇦ะะ🇱ะะ🇱ะะ🇱ะะ🇱ะ ะ🇰ะะ🇮ะ ะ🇧ะะ🇴ะะ🇳ะะ🇩ะ ะ🇭ะ ะ🇹ะะ🇺ะะ🇺ะะ🇺ะ",
+        "ะ🇰ะะ🇦ꜱะะ🇭ะ ะ🇴ꜱะ ะ🇩ะะ🇮ะ🇳ะ ะ🇲ะะ🇺ะะ🇹ะะ🇭ะ ะ🇲ะ🇷ะะ🇰ะะ🇪ะ ꜱะ🇴ะะ🇯ะะ🇹ะะ🇦ะ ะ🇲ะ ะ🇹ะะ🇺ะ ะ🇵ะะ🇦ะะ🇮ะะ🇩ะะ🇦ะ ะ🇳ะะ🇦ะ ะ🇭ะะ🇴ะะ🇹ะะ🇦ะะ🇦ะ",
+        "ะ🇬ะะ🇱ะะ🇹ะะ🇮ะ ะ🇰ะ🇷ะะ🇩ะะ🇮ะ ะ🇹ะะ🇺ะะ🇯ะะ🇼ะ ะ🇵ะะ🇦ะะ🇮ะะ🇩ะะ🇦ะ ะ🇰ะ🇷ะะ🇰ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะ ะ🇳ะะ🇪ะ ะ🇦ะะ🇧ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇹ะะ🇺ะ ะ🇾ะะ🇭ะะ🇦ะ",
+        "ꜱะ🇵ะะ🇪ะะ🇪ะะ🇩ะ ะ🇵ะะ🇰ะะ🇩ะะ🇩ะะ??ะ",
+        "ะ🇬ะะ🇦ะะ🇦ะะ🇳ะะ🇩ะ ะ🇲ะะ🇦ะะ🇮ะ🇳ะ ะ🇱ะะ🇼ะะ🇩ะะ🇦ะ ะ🇩ะะ🇦ะะ🇱ะ ะ🇱ะะ🇪ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะะ🇦ะะ🇦ะ",
+        "ะ🇬ะะ🇦ะะ🇦ะะ🇳ะะ🇩ะ ะ🇲ะะ🇪ะะ🇮ะ🇳ะ ะ🇧ะะ🇦ะะ🇲ะะ🇧ะ🇺ะ ะ🇩ะะ🇪ะะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะ",
+        "ะ🇬ะะ🇦ะะ🇳ะะ🇩ะ ꜰะะ🇹ะะ🇮ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇱ะะ🇰ะะ🇰ะะ🇰ะ ะ🇹ะะ🇺ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇾ะะ🇭ะะ🇦ะ",
+        "ะ🇬ะะ🇴ะะ🇹ะะ🇪ะ ะ🇰ะะ🇮ะะ🇹ะะ🇳ะะ🇪ะ ะ🇧ะะ🇭ะะ🇮ะ ะ🇧ะะ🇦ะะ🇩ะะ🇪ะ ะ🇭ะะ🇴ะ, ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇳ะะ🇮ะะ🇨ะะ🇭ะะ🇪ะ ะ🇭ะะ🇮ะ ะ🇷ะะ🇪ะะ🇭ะะ🇹ะะ🇪ะ ะ🇭ะะ🇦ะ",
+        "ะ🇭ะะ🇦ะะ🇿ะะ🇦ะะ🇦ะ🇷ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇬ะะ🇦ะะ🇦ะะ🇳ะะ🇩ะ ะ🇲ะะ🇦ะะ🇮ะ🇳ะ",
+        "ะ🇯ะะ🇭ะะ🇦ะะ🇦ะะ🇳ะะ🇹ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ꜱะꜱะ🇺ะ ะ🇹ะะ🇲ะะ🇰ะะ🇨ะ ะ🇸ะะ🇺ะะ🇳ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇰ะะ🇦ะะ🇱ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ",
+        "ะ🇰ะะ🇭ะะ🇴ะะ🇹ะะ🇪ะ🇾ะ ะ🇰ะะ🇮ะ ะ🇦ะะ🇺ะะ🇱ะะ🇩ะะ🇦ะ ะ🇪ะะ🇾ะ ะ🇹ะะ🇺ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇾ะะ🇰ะะ🇪ะ",
+        "ะ🇰ะะ🇺ะะ🇹ะะ🇹ะะ🇪ะ ะ🇰ะะ🇦ะ ะ🇦ะะ🇼ะะ🇱ะะ🇦ะะ🇹ะ ะ🇯ะะ🇦ะะ🇮ะꜱะะ🇦ะ ะ🇱ะะ🇬ะ ะ🇷ะะ🇭ะะ🇦ะ ะ🇹ะะ🇺ะ",
+        "ะ🇰ะะ🇺ะะ🇹ะะ🇹ะะ🇪ะ ะ🇰ะะ🇮ะ ะ🇯ะะ🇦ะะ🇹ะ ะ🇯ะะ🇦ะะ🇮ꜱะะ🇦ะ ะ🇪ะะ🇾ะ ะ🇹ะะ🇺ะ ",
+        "ะ🇰ะะ🇺ะะ🇹ะะ🇹ะะ🇪ะ ะ🇰ะะ🇪ะ ะ🇹ะะ🇦ะะ🇹ะะ🇹ะะ🇦ะ ะ🇪ะะ🇾ะ ะ🇹ะะ🇺ะ",
+        "ะ🇹ะะ🇪ะะ🇹ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇮ะ.ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ , ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇷ะะ🇳ะะ🇩ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะ",
+        "ะ🇱ะะ🇦ะะ🇻ะะ🇩ะะ🇪ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇱ะ ะ🇵ะะ🇰ะะ🇩ะ ะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ",
+        "ะ🇲ะะ🇺ะะ🇭ะ ะ🇲ะะ🇪ะะ🇮ะ ะ🇱ะะ🇪ะะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ",
+        "ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇦ꜱะะ🇮ะะ🇳ะะ🇪ะ ะ🇨ะะ🇭ะะ🇺ะะ🇵ะ ะ🇧ะะ🇪ะะ🇹ะะ🇭ะ ะ🇴ะ🇷ะ ะ🇨ะะ🇺ะะ🇩ะ",
+        "ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ ะ🇱ะะ🇼ะะ🇩ะะ🇪ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะะ🇱ะะ🇱ะะ🇱ะ",
+        "ะ🇭​ะะ🇦​ะะ🇭​ะะ🇦​ะะ🇭​ะะ🇦​ะะ🇦​ะะ🇦​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ ะ🇬​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇺​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะ ะ🇬​ะะ🇾​ะะ🇦​ะะ🇦​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇭​ะะ🇦​ะะ🇳​ะะ🇪​ะ ะ🇰​ะะ🇮​ะ ะ🇺​ะะ🇱​ะะ🇦​ะะ🇩​ะะ🇩​ะะ🇩​ะ",
+        "ꜱ​ะ🇦​ะะ🇩​ะะ🇮​ะ ะ🇭​ะะ🇺​ะะ🇮​ะ ะ🇬​ะะ🇦​ะะ🇦​ะะ🇳​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇬​ะะ🇦​ะะ🇦​ะะ🇳​ะะ🇩​ะ ะ🇲​ะะ🇦​ะะ🇮​ะ🇳​ะ ะ🇰​ะะ🇺​ะะ🇹​ะะ🇪​ะ ะ🇰​ะะ🇦​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇴​ꜱ​ะะ🇩​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇪​ะ ะ🇬​ะะ🇦​ะะ🇦​ะะ🇳​ะะ🇩​ะ ะ🇲​ะะ🇪​ะะ🇮​ะ🇳​ะ ะ🇰​ะะ🇪​ะะ🇪​ะะ🇩​ะะ🇪​ะ ะ🇵​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇾​ะ",
+        "ะ🇳​ะะ🇾​ะ ะ🇳​ะะ🇾​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ",
+        "ꜱ​ะ🇺​ะะ🇳​ะะ🇳​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇪​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ ะ🇹​ะะ🇲​ะะ🇱​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇴​ꜱ​ะะ🇩​ะะ🇦​ะ",
+        "ะ🇧​ะะ🇪​ะะ🇭​ะะ🇪​ะ🇳​ะ ะ🇰​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะะ🇨​ะะ🇭​ะะ🇦​ะะ🇵​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ ะ🇾​ะะ🇭​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇹​ะะ🇳​ะะ🇮​ะะ🇮​ะะ🇮​ะ",
+        "ะ🇲​ะะ🇪​ะะ🇷​ะะ🇦​ะ ะ🇱​ะะ🇦​ะะ🇼​ะะ🇩​ะะ🇦​ะ ะ🇱​ะะ🇪​ะะ🇱​ะะ🇪​ะ ะ🇹​ะะ🇺​ะ ะ🇦​ะะ🇬​ะะ🇦​ะ🇷​ะ ะ🇨​ะะ🇭​ะะ🇦​ะะ🇮​ะะ🇾​ะะ🇪​ะ ะ🇹​ะะ🇴​ะะ🇭​ะ",
+        "ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะ ะ🇬​ะะ🇦​ะะ🇦​ะะ🇳​ะะ🇩​ะ🇺​ะ",
+        "ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะะ🇮​ะะ🇾​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇵​ะะ🇪​ะ ะ🇯​ะ🇨​ะ🇧​ะ ะ🇨​ะะ🇭​ะะ🇦​ะะ🇩​ะะ🇭​ะะ🇦​ะะ🇦​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ꜱ​ะ🇦​ะะ🇲​ะะ🇯​ะะ🇭​ะะ🇦​ะะ🇦​ะ ะ🇱​ะะ🇦​ะะ🇼​ะะ🇩​ะะ🇪​ะ",
+        "ะ🇾​ะะ🇦​ะ ะ🇩​ะะ🇺​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇬​ะะ🇦​ะะ🇦​ะะ🇳​ะะ🇩​ะ ะ🇲​ะะ🇪​ะ ะ🇹​ะะ🇦​ะะ🇵​ะะ🇦​ะะ🇦​ะ ะ🇹​ะะ🇦​ะะ🇵​",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇧​ะะ🇪​ะะ🇭​ะะ🇪​ะ🇳​ะ ะ🇲​ะะ🇪​ะะ🇷​ะะ🇦​ะ ะ🇷​ะะ🇴​ะะ🇿​ะ ะ🇱​ะะ🇪​ะะ🇹​ะะ🇮​ะ ะ🇭​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇪​ะ ꜱ​ะะ🇦​ะะ🇦​ะะ🇹​ะะ🇭​ะ ะ🇲​ะ🇲​ꜱ​ะ ะ🇧​ะะ🇦​ะะ🇳​ะะ🇦​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇰​ะะ🇦​ะ ะ🇭​ะะ🇺​",
+        "ะ🇹​ะะ🇺​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะะ🇮​ะะ🇾​ะะ🇦​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇦​ะ ะ🇰​ะะ🇭​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇦​ะะ🇦​ะ🇳​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะะ🇮​ะะ🇾​ะะ🇦​ะ",
+        "ะ🇦​ะะ🇺​ะ🇷​ะ ะ🇰​ะะ🇮​ะะ🇹​ะะ🇳​ะะ🇦​ะ ะ🇧​ะะ🇴​ะะ🇱​ะะ🇺​ะ ะ🇧​ะะ🇪​ะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇳​ะะ🇳​ะ ะ🇧​ะะ🇭​ะะ🇦​ะ🇷​ะ ะ🇬​ะะ🇦​ะะ🇾​ะะ🇦​ะ ะ🇲​ะะ🇪​ะะ🇷​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇮​ะะ🇮​ะะ🇮​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะะ🇹​ะะ🇹​ะ ะ🇲​ะะ🇪​ะ ะ🇦​ะะ🇧​ะ🇨​ะ🇩​ะ ะ🇱​ะะ🇮​ะะ🇰​ะะ🇭​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇪​ะ ะ🇱​ะะ🇴​ะะ🇩​ะะ🇪​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ะ ะ🇱​ะะ🇪​ะะ🇰​ะะ🇦​ะ🇷​ะ ะ🇲​ะะ🇦​ะะ🇮​ะ ꜰ​ะะ🇦​ะ🇷​ะะ🇦​ะ🇷​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇮​ะะ🇩​ะะ🇮​ะะ🇮​ะ",
+        "ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะ ะ🇧​ะะ🇦​ะะ🇨​ะะ🇭​ะะ🇪​ะะ🇪​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ??​ะ🇴​ะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะะ🇺​ะ",
+        "ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ",
+        "ะ🇹​ะะ🇺​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะ ะ🇵​ะะ🇮​ะะ🇱​ะะ🇱​ะะ🇦​ะ ะ🇪​ะะ🇾​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇮​ะะ🇮​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ะ ะ🇧​ะะ🇭​ะะ🇪​ะะ🇯​ะะ🇯​ะะ🇯​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇦​ะะ🇦​ะ ะ🇧​ะะ🇦​ะะ🇦​ะะ🇦​ะะ🇵​ะ ะ🇭​ะะ🇺​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇲​ะะ🇪​ะ ะ🇭​ะะ🇦​ะะ🇦​ะะ🇹​ะ ะ🇩​ะะ🇦​ะะ🇦​ะะ🇱​ะะ🇱​ะะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇭​ะะ🇦​ะะ🇦​ะ🇬​ะ ะ🇯​ะะ🇦​ะะ🇦​ะะ🇳​ะะ🇺​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ะ ꜱ​ะะ🇦​ะ🇷​ะะ🇦​ะะ🇰​ะ ะ🇵​ะะ🇪​ะ ะ🇱​ะะ🇪​ะะ🇹​ะะ🇦​ะะ🇦​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ ะ🇬​ะ🇧​ะ ะ🇷​ะ🇴​ะ🇦​ะ🇩​ะ ะ🇵​ะะ🇪​ะ ะ🇱​ะะ🇪​ะะ🇯​ะะ🇦​ะะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะ🇨​ะ🇭​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇲​É​ะ ะ🇰​ะะ🇦​ะะ🇦​ะะ🇱​ะะ🇮​ะ ะ🇲​ะะ🇮​ะะ🇹​ะ🇨​ะ🇭​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ꜱ​ะะ🇦​ꜱ​ะะ🇹​ะะ🇮​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇭​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇲​ะะ🇪​ะ ะ🇰​ะะ🇦​ะะ🇧​ะะ🇺​ะะ🇹​ะะ🇦​ะ🇷​ะ ะ??​ะะ🇦​ะะ🇦​ะะ🇱​ะ ะ🇰​ะะ🇪​ะ ꜱ​ะ🇴​ะะ🇺​ะะ🇵​ะ ะ🇧​ะะ🇦​ะะ🇳​ะะ🇦​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇭​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇲​ะะ🇪​ะ ะ🇩​ะะ🇪​ะะ🇹​ะ🇴​ะ🇱​ะ ะ🇩​ะะ??​ะะ🇦​ะะ🇱​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇴​ꜱ​ะะ🇩​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇲​ะะ🇪​ะ ะ🇱​ะะ🇦​ะะ🇵​ะะ🇹​ะ🇴​ะ🇵​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇭​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ ะ🇧​ะะ🇮​ꜱ​ะะ🇹​ะะ🇦​ะ🇷​ะ ะ🇵​ะะ🇪​ะ ะ🇱​ะะ🇪​ะะ🇹​ะะ🇦​ะะ🇦​ะะ🇰​ะะ🇪​ะ ะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ??​ะะ🇴​ ะ🇦​ะะ🇲​ะะ🇪​ะ🇷​ะะ🇮​ะ🇨​ะะ🇦​ะ ะ🇬​ะะ🇭​ะะ🇺​ะะ🇲​ะะ🇦​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇲​ะะ🇪​ะ ะ🇳​ะะ🇦​ะะ🇦​ะ🇷​ะะ🇮​ะะ🇾​ะะ🇦​ะ🇱​ะ ะ🇵​ะะ🇭​ะ🇴​ะ🇷​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇪​ะ ะ🇬​ะะ🇦​ะะ🇳​ะะ🇩​ะ ะ🇲​ะะ🇪​ะ ะ🇩​ะะ🇪​ะะ🇹​ะ🇴​ะ🇱​ะ ะ🇩​ะะ🇦​ะะ🇦​ะะ🇱​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ ะ🇭​ะ🇴​🇷​🇱​🇮​🇨​🇰​ꜱ​ะ ะ🇵​ะะ🇮​ะะ🇱​ะะ🇦​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ ꜱ​ะะ🇦​ะ🇷​ะะ🇦​ะะ🇰​ะ ะ🇵​ะะ🇪​ะ ะ🇱​ะะ🇪​ะะ🇹​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇴​ꜱ​ะะ🇩​ะะ🇦​ะ",
+        "ะ🇲​ะะ🇪​ะะ🇷​ะะ🇦​ะะ🇦​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ ะ🇵​ะะ🇦​ะะ🇰​ะะ🇦​ะะ🇩​ะ ะ🇱​ะะ🇪​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇦​ะะ🇰​ะะ🇦​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇴​ꜱ​ะะ🇩​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ꜱ​ะ ะ🇬​ะะ🇪​ะะ🇾​ะะ🇮​ะ ะ🇰​ะะ🇾​ะะ🇦​ะะ🇦​ะ ะ🇱​ะะ🇦​ะะ🇼​ะะ🇩​ะะ🇪​ะะ🇪​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะะ🇦​ะ ะ🇧​ะะ🇯​ꜱ​ะะ🇴​ะะ🇩​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะ🇽​ะะ🇭​ะะ🇴​ะะ🇩​ะะ🇩​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇺​ะะ🇺​ะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะะ🇦​ะ ะ🇧​ะะ🇭​ꜱ​ะะ🇴​ะะ🇩​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇮​ะะ🇮​ะะ🇮​ะะ🇮​ะ ะ🇧​ะะ🇪​ะะ🇭​ะะ🇪​ะ🇳​ะะ🇳​ะะ🇳​ะ ะ🇰​ะะ🇴​ะ ะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะะ🇩​ะะ🇩​ะะ🇺​ะะ🇺​ะะ🇺​ะะ🇺​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะ🇽​ะะ🇭​ะะ🇴​ะะ🇩​ะะ🇩​ะะ🇩​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇺​ะ ะ🇳​ะะ🇮​ะะ🇰​ะะ🇦​ะะ🇱​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇦​ะะ🇨​ะะ🇭​ะะ🇪​ะ",
+        "ะ??​ะะ🇪​ะะ🇷​ะะ🇦​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇲​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇯​ะะ🇦​ะะ🇦​ะ🇳​ะ ะ🇪​ะะ🇾​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ꜱ​ะ🇪​x​ะ🇾​ะ ะ🇧​ะะ🇦​ะะ🇭​ะะ🇪​ะ🇳​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇴​ะะ🇵​ะ",
+        "⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇧⚡🇭⚡?? ⚡🇧⚡🇳⚡🇦⚡🇱⚡🇪 ⚡🇲⚡🇺⚡🇯⚡🇪 ⚡🇷⚡🇳⚡🇩⚡🇮⚡🇰⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇦 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇪⚡🇾 ⚡🇾⚡🇦⚡🇦⚡🇩 ⚡🇪⚡🇾 ⚡🇹⚡🇺⚡🇯⚡🇭⚡🇪",
+        "⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇦 ⚡🇳⚡🇦 ⚡🇹⚡🇾⚡🇲⚡🇵⚡🇦⚡🇸⚡🇸",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇺⚡🇳⚡🇫⚡🇺⚡🇳⚡🇳⚡🇾 ⚡🇸⚡🇼⚡🇮⚡🇵⚡🇪 ⚡🇲⚡🇹⚡🇹 ⚡🇰⚡🇷",
+        "⚡🇴⚡🇭 ⚡🇭⚡🇪⚡🇱⚡🇱⚡🇴 ⚡🇧⚡🇮⚡🇭⚡🇦⚡🇷⚡🇮 ⚡🇹⚡🇪⚡??⚡🇦 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇧⚡🇮⚡🇭⚡🇦⚡🇷⚡🇮 ⚡🇴⚡🇷 ⚡🇹⚡🇺 ⚡🇻 ⚡🇧⚡🇮⚡🇭⚡🇦⚡🇷⚡🇮 ⚡🇦⚡🇺⚡🇰⚡🇦⚡🇹 ⚡🇲⚡🇪 ⚡🇷⚡🇭⚡🇦 ⚡🇰⚡🇷.",
+        "⚡🇴⚡🇾⚡🇾 ⚡🇰⚡🇮⚡🇳⚡🇳⚡🇪⚡🇷 ⚡🇹⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇬⚡🇨 ⚡🇲⚡🇪 ⚡🇦⚡🇦⚡🇳⚡🇪 ⚡🇰⚡🇮 ⚡🇵⚡🇪⚡🇷⚡🇲⚡🇮⚡🇸⚡🇸⚡🇮⚡🇴⚡🇳 ⚡🇰⚡🇮⚡🇸⚡🇳⚡🇪 ⚡🇩⚡🇮.",
+        "⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦",
+        "⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦 ⚡🇪⚡🇰 ⚡🇧⚡🇦⚡🇦⚡🇷.",
+        "⚡🇸⚡🇺⚡🇳 ⚡🇸⚡🇺⚡🇳 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇦.",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇨⚡🇦 ⚡🇧⚡🇭⚡🇴⚡🇸⚡🇩⚡🇦.",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇨⚡🇭⚡🇴⚡🇹⚡🇮 ⚡🇯⚡🇦⚡🇹⚡🇮 ⚡🇰⚡🇪 ⚡🇹⚡🇲⚡🇷.",
+        "⚡🇰⚡🇾? ⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇰⚡🇮⚡🇩⚡🇩⚡🇪.",
+        "⚡🇧⚡🇮⚡🇭⚡🇦⚡🇷⚡🇮 ⚡🇨⚡🇴⚡🇲 ⚡🇬⚡🇦⚡🇳⚡🇬 ⚡🇰⚡🇪 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇰⚡🇴 ⚡🇹⚡🇦⚡🇬 ⚡🇨⚡🇷⚡🇪⚡🇬⚡🇦 ⚡🇹⚡🇺",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇨⚡🇾⚡🇦 ⚡🇹⚡🇺 ⚡🇧⚡🇮⚡🇭⚡🇦⚡🇷⚡🇮 ⚡🇪⚡🇾 ⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇧⚡🇸",
+        "⚡🇯⚡🇦⚡🇱⚡🇩⚡🇮 ⚡🇸⚡🇪 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇵⚡🇦⚡🇵⚡🇦 ⚡🇧⚡🇴⚡🇱",
+        "⚡🇸⚡🇮⚡🇩⚡🇪 ⚡🇭⚡🇴⚡🇯⚡🇦 ⚡🇧⚡🇮⚡🇭⚡🇦⚡🇷⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇦⚡🇧",
+        "⚡🇭⚡🇾⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇧⚡🇭⚡🇬 ⚡🇲⚡🇦⚡🇹 ⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇧⚡🇭⚡🇬 ⚡🇳⚡🇾 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇹⚡🇺 ⚡🇦⚡🇯⚡🇯",
+        "⚡🇭⚡🇾⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇰⚡🇪 ⚡🇧⚡🇨⚡🇭⚡🇪 ⚡🇧⚡🇭⚡🇦⚡🇬 ⚡🇲⚡🇦⚡🇹",
+        "⚡🇭⚡🇾⚡🇪 ⚡🇩⚡🇺⚡🇷 ⚡🇭⚡🇦⚡🇹⚡🇹 ⚡🇲⚡🇦⚡🇩⚡🇭⚡🇦⚡🇷⚡🇨⚡🇭⚡🇴⚡🇩 ⚡🇰⚡🇪 ⚡🇧⚡🇦⚡🇨⚡🇭⚡🇪",
+        "⚡🇰⚡🇴⚡🇮 ⚡🇧⚡🇦⚡🇹 ⚡🇳⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾 ⚡🇪⚡🇸⚡🇱⚡🇮⚡🇾⚡🇪 ⚡🇲⚡🇦⚡🇫 ⚡🇨⚡🇷 ⚡🇷⚡🇭⚡🇦 ⚡🇭⚡🇺 ⚡🇹⚡🇺⚡🇯⚡🇭⚡🇪",
+        "⚡🇰⚡🇴⚡🇮 ⚡🇧⚡🇦⚡🇦⚡🇹 ⚡🇳⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇹⚡🇺 ⚡🇲⚡🇦⚡🇫⚡🇮 ⚡🇩⚡🇪 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦",
+        "⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇹⚡🇺 ⚡🇲⚡🇦⚡🇫⚡🇮 ⚡🇲⚡🇮⚡🇱 ⚡🇯⚡🇦⚡🇾⚡🇪⚡🇬⚡🇮 ⚡🇹⚡🇺⚡🇯⚡🇭⚡🇪",
+        "⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦 ⚡🇲⚡🇦⚡🇹 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇦 ⚡🇲⚡🇺⚡🇯⚡🇪 ⚡🇸⚡🇼⚡🇮⚡🇵⚡🇪 ⚡🇨⚡🇷⚡🇰⚡🇪",
+        "⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇺 ⚡🇸⚡🇼⚡🇮⚡🇵⚡🇪 ⚡🇨⚡🇷⚡🇰⚡🇪",
+        "⚡🇫⚡🇷 ⚡🇧⚡🇴⚡🇱⚡🇳⚡🇦 ⚡🇳⚡🇦 ⚡🇰⚡🇮 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦 ⚡🇸⚡🇼⚡🇮⚡🇵⚡🇪 ⚡🇨⚡🇷⚡🇰⚡🇪",
+        "⚡🇨⚡🇾⚡🇦 ⚡🇭⚡🇺⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇵⚡🇷 ⚡🇰⚡🇪⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇵⚡🇹⚡🇦 ⚡🇹⚡🇭⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇪⚡🇾 ⚡🇳⚡🇾 ⚡🇲⚡🇦⚡🇳⚡🇹⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇾",
+        "⚡🇱⚡🇴⚡🇩⚡🇪 ⚡🇸⚡🇪 ⚡🇺⚡🇹⚡🇷 ⚡🇲⚡🇨",
+        "⚡🇱⚡🇺⚡🇳 ⚡🇲⚡🇹 ⚡🇨⚡🇭⚡🇺⚡🇸 ⚡🇲⚡🇪⚡🇷⚡🇦",
+        "⚡🇳⚡🇮⚡🇰⚡🇦⚡🇱 ⚡🇲⚡🇦⚡🇩⚡🇦⚡🇷⚡🇨⚡🇭⚡🇩",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇴⚡🇾⚡🇪 ⚡🇬⚡🇦⚡🇸⚡🇭⚡🇹⚡🇮 ⚡🇰 ⚡🇧⚡🇦⚡🇨⚡🇭⚡🇪",
+        "⚡🇲⚡🇦⚡🇰⚡🇮⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇹⚡🇪⚡🇷⚡🇮",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇷⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇲⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇮",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇰 ⚡🇭⚡🇦⚡🇹⚡🇭 ⚡🇹⚡🇴⚡🇩⚡🇭 ⚡🇰 ⚡🇹⚡🇪⚡🇷⚡🇪 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇰 ⚡🇲⚡🇺⚡🇭 ⚡🇲⚡🇪 ⚡🇫⚡🇦⚡🇸⚡🇦⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇱⚡🇪⚡🇦⚡🇻⚡🇪 ⚡🇱⚡🇪 ⚡🇹⚡🇺 ⚡🇷⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇵⚡🇦⚡🇸⚡🇦⚡🇳⚡🇩 ⚡🇳⚡🇦⚡🇮 ⚡🇦⚡🇾⚡🇦 ⚡🇲⚡🇪⚡🇰⚡🇴",
+        "⚡🇱⚡🇪⚡🇦⚡🇻⚡🇪 ⚡🇱⚡🇪 ⚡🇹⚡🇺 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇮⚡🇩⚡🇪⚡🇷 ⚡🇸⚡🇪",
+        "⚡🇱⚡🇪⚡🇦⚡🇻⚡🇪 ⚡🇱⚡🇪 ⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇸⚡🇪 ⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇱⚡🇪⚡🇦⚡🇻⚡🇪 ⚡🇳⚡🇾 ⚡🇱⚡🇪⚡🇬⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇸⚡🇲⚡🇯⚡🇭 ⚡🇧⚡🇦⚡🇹 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇱⚡🇪⚡🇦⚡🇻⚡🇪 ⚡🇱⚡🇪",
+        "⚡🇫⚡🇦⚡🇸⚡🇹 ⚡🇱⚡🇪⚡🇦⚡🇻⚡🇪 ⚡🇱⚡🇪 ⚡🇰⚡🇦⚡🇲⚡🇯⚡🇴⚡🇷 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇹⚡🇺⚡🇹⚡🇴 ⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇷⚡🇳⚡🇩⚡🇾⚡🇰",
+        "⚡🇴⚡🇾 ⚡🇭⚡🇮⚡🇯⚡🇩⚡🇪 ⚡🇰⚡🇭⚡??⚡🇳⚡🇦 ⚡🇰⚡🇭⚡🇦 ⚡🇰⚡🇪 ⚡🇦⚡🇦 ⚡🇰⚡🇦⚡🇲⚡🇿⚡🇴⚡🇷",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇮⚡🇱⚡🇾 ⚡🇷⚡🇪⚡🇾 🌚😂",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇨⚡🇭⚡🇦⚡🇵 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇹⚡🇲⚡🇰⚡🇨",
+        "⚡🇨⚡🇭⚡🇺⚡🇵⚡🇨⚡🇭⚡🇦⚡🇵 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇹⚡🇺",
+        "⚡🇸⚡🇭⚡🇮 ⚡🇸⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡??⚡🇺 ⚡🇨⚡🇭⚡🇺⚡🇵⚡🇨⚡🇭⚡🇦⚡🇵",
+        "⚡🇫⚡🇷 ⚡🇸⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇵⚡🇨⚡🇭⚡🇦⚡🇵",
+        "⚡🇸⚡🇭⚡🇮 ⚡🇸⚡🇪 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡??⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇦 ⚡🇨⚡🇾⚡🇺 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇨⚡🇭⚡🇺⚡🇵⚡🇨⚡🇭⚡🇦⚡🇵",
+        "⚡🇵⚡🇷⚡🇴⚡🇴⚡🇫 ⚡🇨⚡🇷 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇵⚡🇷⚡🇴⚡🇴⚡🇫 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇵⚡🇷⚡🇴⚡🇴⚡🇫 ⚡🇭⚡🇴 ⚡🇨⚡🇭⚡🇺⚡🇰⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇨⚡🇭⚡🇮⚡🇱⚡🇱⚡🇦⚡🇷",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇲⚡🇦⚡🇦 ⚡🇰 ⚡🇧⚡🇴⚡🇸⚡🇩⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇴⚡🇾 ⚡🇭⚡🇮⚡🇯⚡🇩⚡🇪 ⚡🇰⚡🇭⚡🇦⚡🇳⚡🇦 ⚡🇰⚡🇭⚡🇦 ⚡🇰⚡🇪 ⚡🇦⚡🇦 ⚡🇰⚡🇦⚡🇲⚡🇿⚡🇴⚡🇷",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇲⚡🇦⚡🇩⚡🇷⚡🇨⚡🇭⚡🇴⚡🇩 ?",
+        "⚡🇦⚡🇧 ⚡🇹⚡🇰 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇭⚡🇴⚡🇬⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ?",
+        "⚡🇳⚡🇾 ⚡🇳⚡🇾 ⚡🇲⚡🇪 ⚡🇰⚡🇺⚡🇨⚡🇭 ⚡🇳⚡🇾 ⚡🇯⚡🇦⚡🇳⚡🇹⚡🇦 ⚡🇧⚡🇸 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇸⚡🇧⚡🇸⚡🇪 ⚡🇵⚡🇭⚡🇪⚡🇱⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇴 ⚡🇧⚡🇴⚡🇱 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇳⚡🇦 ⚡🇰⚡🇦⚡🇲 ⚡🇰⚡🇷⚡🇪",
+        "⚡🇾⚡🇦⚡🇭⚡🇦 ⚡🇧⚡🇭⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇦 ⚡🇹⚡🇺 ⚡🇷⚡🇳⚡🇩⚡🇾⚡🇨⚡🇪 ⚡🇵⚡🇮⚡🇱⚡🇱⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇮⚡🇲⚡🇦⚡🇰⚡🇦⚡🇧⚡🇴⚡🇸⚡🇩⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇹⚡🇴 ⚡🇧⚡🇭⚡🇪⚡🇳 ⚡🇨⚡🇺⚡🇩⚡🇪⚡🇬⚡🇮",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇷⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇹⚡🇴⚡🇲⚡🇲⚡🇾",
+        "⚡🇳⚡🇮⚡🇰⚡🇦⚡🇱 ⚡🇲⚡🇦⚡🇩⚡🇦⚡🇷⚡🇨⚡🇭⚡🇩 ⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇾⚡🇭⚡🇦 ⚡🇸⚡🇪",
+        "⚡🇨⚡🇴⚡🇿 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇦⚡🇳⚡🇩⚡🇭⚡🇮 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮 ⚡🇭⚡🇪",
+        "⚡🇳⚡🇾⚡🇹⚡🇴 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇧⚡🇴⚡🇱 ⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪",
+        "⚡🇳⚡🇾⚡🇳⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇭⚡🇴⚡🇬⚡🇮 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇯⚡🇴 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦⚡🇹⚡🇮 ⚡🇯⚡🇴⚡🇬⚡🇮",
+        "⚡🇹⚡🇷⚡🇾 ⚡🇦⚡🇲⚡🇲⚡🇮 ⚡🇨⚡🇪 ⚡🇧⚡🇭⚡🇴⚡🇸⚡🇩⚡🇪 ⚡🇲⚡🇪 ⚡🇪⚡🇲⚡🇴⚡🇯⚡🇮 ⚡🇩⚡🇦⚡🇱 ⚡🇲⚡🇨",
+        "⚡🇨⚡🇾⚡🇦 ? ⚡🇨⚡🇭⚡🇲⚡🇷 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇦 ⚡🇨⚡🇾⚡🇦 ?",
+        "⚡🇹⚡🇲 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇷⚡🇮 ⚡🇭⚡🇴⚡🇬⚡🇮 ⚡🇫⚡🇷⚡🇷⚡🇹⚡🇴",
+        "⚡🇨⚡🇾⚡🇦 ? ⚡🇰⚡🇧 ? ⚡🇵⚡🇬⚡🇱 ⚡🇪⚡🇾 ⚡🇨⚡🇾⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇰⚡🇪⚡🇰",
+        "⚡🇨⚡🇾⚡🇦 ⚡🇸⚡🇨⚡🇭 ⚡🇲⚡🇪⚡🇾 ⚡🇵⚡🇬⚡🇱 ⚡🇪⚡🇾 ⚡🇨⚡🇾⚡🇦 ⚡🇹⚡🇺 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇨⚡🇺⚡🇩⚡🇼⚡?? ⚡🇱⚡🇮 ⚡🇹⚡🇺⚡🇳⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦",
+        "⚡🇮⚡🇹⚡🇳⚡🇦 ⚡🇸⚡🇨⚡🇭 ⚡🇳⚡🇾 ⚡🇧⚡🇴⚡🇱 ⚡🇲⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇸⚡🇨⚡🇭 ⚡🇲⚡🇪⚡🇾 ⚡🇵⚡🇬⚡🇱 ⚡🇪⚡🇾 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇮⚡🇦 ⚡🇲⚡🇪⚡🇷⚡🇪 ⚡🇸⚡🇹⚡🇭",
+        "⚡🇲⚡🇹⚡🇱⚡🇧 ⚡🇹⚡🇲⚡🇷",
+        "⚡🇳⚡🇾⚡🇹⚡🇴",
+        "⚡🇵⚡🇺⚡🇷⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇲⚡🇨",
+        "⚡🇹⚡🇲⚡🇷 ⚡🇫⚡🇷⚡🇷⚡🇹⚡🇴",
+        "⚡🇴⚡🇭 ⚡🇴⚡🇰 ⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇫⚡🇮⚡🇷",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇦 ⚡🇩⚡🇦⚡🇲⚡🇦⚡🇩",
+        "⚡🇨⚡🇾⚡🇦 ? ⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇱⚡🇮⚡🇰⚡🇭⚡🇪 ⚡🇵⚡🇪⚡🇭⚡🇱⚡🇪 ⚡🇷⚡🇳⚡🇩⚡🇮⚡🇰⚡🇪⚡🇧⚡🇦⚡🇨⚡🇭⚡🇪",
+        "⚡🇳⚡🇾⚡🇹⚡🇴 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇳⚡🇪 ⚡🇲⚡🇪 ⚡🇻⚡🇾⚡🇦⚡🇸⚡🇹 ⚡🇭⚡🇺",
+        "⚡🇳⚡🇾⚡🇹⚡🇴 ⚡🇵⚡🇬⚡🇱 ⚡🇪⚡🇾 ⚡🇨⚡🇾⚡🇦 ⚡🇰⚡🇺⚡🇨⚡🇭 ⚡🇧⚡🇮",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇨⚡🇾⚡🇦 ? ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇦 ?",
+        "⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇲⚡🇹 ⚡🇭⚡🇸⚡🇸",
+        "⚡🇾⚡🇺⚡🇷 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇲⚡🇴⚡🇲",
+        "⚡🇦⚡🇷⚡🇪 ⚡🇸⚡🇧⚡🇰⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇴⚡🇷 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇧⚡🇮",
+        "⚡🇦⚡🇷⚡🇪 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇪⚡🇰 ⚡🇧⚡🇦⚡🇦⚡🇷",
+        "⚡🇹⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇮 ⚡🇹⚡🇷⚡🇭",
+        "⚡🇪⚡🇰 ⚡🇱⚡🇮⚡🇳⚡🇪 ⚡🇲⚡🇪 ⚡🇹⚡🇲⚡🇷",
+        "⚡🇶",
+        "⚡🇴⚡🇨⚡🇾 ⚡🇦⚡🇧 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇱⚡🇪",
+        "⚡🇵⚡🇪⚡🇭⚡🇪⚡🇱⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇺",
+        "⚡🇳⚡🇾⚡🇹⚡🇴",
+        "⚡?? ?",
+        "⚡🇭⚡🇾⚡🇾⚡🇾 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇦 ⚡🇪⚡🇰 ⚡🇧⚡🇦⚡🇦⚡🇷",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇸⚡🇺⚡🇳 ⚡🇩⚡🇴⚡🇸⚡🇹 ⚡🇹⚡🇲⚡🇷",
+        "⚡🇧⚡🇭⚡🇦⚡🇬 ⚡🇯⚡🇦 ⚡🇷⚡🇦⚡🇦⚡🇳⚡🇩 ⚡🇲⚡🇦⚡🇦⚡🇫 ⚡🇨⚡🇷⚡🇷 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦",
+        "⚡🇨⚡🇾⚡🇦 ⚡🇹⚡🇲⚡🇷 ⚡🇫⚡🇷⚡🇷⚡🇹⚡🇴",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦⚡🇰⚡🇪 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇱⚡🇪 ⚡🇨⚡🇭⚡🇲⚡🇷",
+        "⚡🇳⚡🇾⚡🇹⚡🇴 ⚡🇦⚡🇪⚡🇸⚡🇪 ⚡🇭⚡🇮 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇭⚡🇾⚡🇾 ⚡🇦⚡🇮⚡🇸⚡🇪 ⚡🇭⚡🇮 ⚡🇨⚡🇺⚡🇩 ⚡🇱⚡🇪⚡🇳⚡🇦",
+        "⚡🇴⚡🇷 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇱⚡🇪",
+        "⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇦 ⚡🇴⚡🇷",
+        "⚡🇭⚡🇾⚡🇾 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇴 ⚡🇳⚡🇦",
+        "⚡🇨⚡🇭⚡🇺⚡🇩⚡🇴 ⚡🇲⚡🇹 ⚡🇧⚡🇭⚡🇦⚡🇬 ⚡🇯⚡🇦⚡🇴",
+        "⚡🇧⚡🇾⚡🇾⚡🇪⚡🇪 ⚡🇭⚡🇾⚡🇾 ⚡🇨⚡🇾⚡🇦 ?",
+        "⚡🇶⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇶 ⚡🇷⚡🇭⚡🇪 ⚡🇭⚡🇴 ?",
+        "⚡🇵⚡🇬⚡🇱 ⚡🇪⚡🇾 ⚡🇨⚡🇾⚡🇦 ⚡🇲⚡🇨",
+        "⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇲⚡🇹",
+        "⚡🇨⚡🇾⚡🇦 ⚡🇵⚡🇬⚡🇱 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇦⚡🇲⚡🇲⚡🇮 ⚡🇨⚡🇪 ⚡🇧⚡🇭⚡🇴⚡🇸⚡🇩⚡🇪 ⚡🇲⚡🇪 ⚡🇨⚡🇭⚡🇦⚡🇵⚡🇵⚡🇦⚡🇱",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦 ⚡🇲⚡🇨",
+        "⚡🇰⚡🇲⚡🇿⚡🇷⚡🇴⚡🇷 ⚡🇪⚡🇾 ⚡🇨⚡??⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮⚡🇪⚡🇰",
+        "⚡🇨⚡🇾⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇷⚡🇭⚡🇦 ?",
+        "⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇹⚡🇭⚡🇦 ⚡🇨⚡🇾⚡🇦 ?",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇸⚡🇱⚡🇮⚡🇩⚡🇪 ⚡🇱⚡🇪⚡🇰⚡🇪 ⚡🇧⚡🇦⚡🇦⚡🇹 ⚡🇨⚡🇷⚡🇲⚡🇨",
+        "⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇺",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇨⚡🇵 ⚡🇲⚡🇹 ⚡🇨⚡🇷⚡🇷 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇱⚡🇪",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇭⚡🇾⚡🇾 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇦",
+        "⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦 ⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇸⚡🇨⚡🇭⚡🇴⚡🇫⚡🇺 ⚡🇰⚡🇭⚡🇦⚡🇨⚡🇭⚡🇦⚡🇷 ⚡🇰⚡🇭⚡🇦⚡🇨⚡🇭⚡🇦⚡🇷",
+        "⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦 ⚡🇯⚡🇦 ⚡🇲⚡🇨",
+        "⚡🇭⚡🇾⚡🇾 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦⚡🇰⚡🇪 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇱⚡🇪",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇰⚡🇲⚡🇿⚡🇴⚡🇷 ⚡🇲⚡🇨 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦",
+        "⚡🇾⚡🇪 ⚡🇨⚡🇾⚡🇦 ⚡🇹⚡🇲⚡🇷",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇳⚡🇾 ⚡🇨⚡🇵 ⚡🇳⚡🇾 ⚡🇨⚡🇷⚡🇷",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇲⚡🇹 ⚡🇨⚡🇷⚡🇷",
+        "⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇦⚡🇷⚡🇦⚡🇲 ⚡🇸⚡🇪 ⚡🇲⚡🇨",
+        "⚡🇵⚡🇬⚡🇱 ⚡🇪⚡🇾 ⚡🇨⚡🇾⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮⚡🇪⚡🇰",
+        "⚡🇨⚡🇵 ⚡🇨⚡🇷⚡🇨⚡🇪 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇪⚡🇬⚡🇦 !",
+        "⚡🇧⚡🇦⚡🇦⚡🇵 ? ⚡🇲⚡🇨 ⚡🇲⚡🇪⚡🇷⚡🇦 ⚡🇨⚡🇴⚡🇮 ⚡🇲⚡🇦 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇳⚡🇾 ⚡🇪⚡🇾 ⚡🇲⚡🇦⚡🇮 ⚡🇺⚡🇵⚡🇦⚡🇷 ⚡🇸⚡🇪 ⚡🇷⚡🇴⚡🇨⚡🇰⚡🇪⚡🇹 ⚡🇵⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇭 ⚡🇨⚡🇪 ⚡🇧⚡🇸⚡🇸 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇳⚡🇪 ⚡🇦⚡🇾⚡🇦 ⚡🇭⚡🇺",
+        "⚡🇨⚡🇭⚡🇴⚡🇹⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇰 ⚡🇧⚡🇦⚡🇨⚡🇭⚡🇪",
+        "⚡🇨⚡🇭⚡🇴⚡🇹⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭⚡🇦 ⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇾",
+        "⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇧⚡🇦⚡🇰⚡🇦 ⚡🇨⚡🇴⚡🇩⚡🇪⚡🇬⚡🇦",
+        "⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇲⚡🇦⚡🇮⚡🇳 ⚡🇧⚡🇺⚡🇷⚡🇫",
+        "⚡🇧⚡🇭⚡🇮⚡🇰⚡🇦⚡🇷⚡🇮 ⚡🇰⚡🇮 ⚡🇯⚡🇭⚡🇦⚡🇹 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇦 ⚡🇱⚡🇪",
+        "⚡🇨⚡🇭⚡🇴⚡🇩⚡🇰⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇲⚡🇦⚡🇷⚡🇯⚡🇦⚡🇾⚡🇪⚡🇬⚡🇮",
+        "⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇲⚡🇦⚡🇮⚡🇳 ⚡🇲⚡🇴⚡🇺⚡🇳⚡🇹 ⚡🇪⚡🇻⚡🇪⚡🇷⚡🇪⚡🇸⚡🇹",
+        "⚡🇲⚡🇺⚡🇭 ⚡🇲⚡🇪⚡🇾 ⚡🇱⚡🇪⚡🇬⚡🇦 ⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇲⚡🇪⚡🇷⚡🇦",
+        "⚡🇭⚡🇮⚡🇯⚡🇩⚡🇪 ⚡🇰⚡🇮 ⚡🇯⚡🇭⚡🇦⚡🇹 ⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮",
+        "⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇳⚡🇾 ⚡🇵⚡🇹⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾",
+        "⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇰⚡🇮 ⚡🇵⚡🇹⚡🇦 ⚡🇲⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇵⚡🇹⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇸⚡🇧 ⚡🇵⚡🇹⚡🇦 ⚡🇲⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇵⚡🇷 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾",
+        "⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇵⚡🇹⚡🇦",
+        "⚡🇹⚡🇪⚡🇳⚡🇺 ⚡🇴⚡🇷 ⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇵⚡🇹⚡🇦 ⚡🇪⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇧⚡🇸 ⚡🇧⚡🇸 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇦⚡🇵⚡🇳⚡🇮",
+        "⚡🇧⚡🇸 ⚡🇧⚡🇸 ⚡🇲⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇹⚡🇭⚡🇳⚡🇰⚡🇸⚡🇸",
+        "⚡🇧⚡🇸 ⚡??⚡🇸 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇮⚡🇦 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦⚡🇦",
+        "⚡🇧⚡🇸 ⚡🇧⚡🇸 ⚡🇰⚡🇦⚡🇲⚡🇯⚡🇴⚡🇷 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇸⚡🇲⚡🇯⚡🇭 ⚡🇬⚡🇾⚡🇦 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪 ⚡🇦⚡🇧",
+        "⚡🇸⚡🇲⚡🇯⚡🇭 ⚡🇬⚡🇾⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇸⚡🇲⚡🇯⚡🇭 ⚡🇬⚡🇾⚡🇦 ⚡🇹⚡🇺 ⚡🇸⚡🇦⚡🇧⚡🇮⚡🇹 ⚡🇰⚡🇷 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇨⚡🇾⚡🇦 ⚡🇭⚡🇺⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮",
+        "⚡🇪⚡🇦⚡🇸⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇹⚡🇺",
+        "⚡🇪⚡🇦⚡🇸⚡🇾 ⚡🇼8 ⚡🇲⚡?? ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇦⚡🇧",
+        "⚡🇸⚡🇦⚡🇳⚡🇸 ⚡🇦⚡🇷⚡🇮 ⚡🇭⚡🇦 ⚡🇰⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇬⚡🇮 ⚡🇦⚡🇯⚡🇯",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇴 ⚡🇧⚡🇮⚡🇳⚡🇦 ⚡🇸⚡🇦⚡🇳⚡🇸⚡🇸 ⚡🇱⚡🇪⚡🇹⚡🇪 ⚡🇭⚡🇺⚡🇪 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇰⚡🇪 ⚡🇰⚡🇦⚡🇲⚡🇯⚡🇴⚡🇷",
+        "⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦 ⚡🇳⚡🇴⚡🇷⚡🇲⚡🇮⚡🇪 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪 ⚡🇹⚡🇺",
+        "⚡🇫⚡🇷 ⚡🇨⚡🇾⚡🇦 ⚡🇳⚡🇴⚡🇷⚡🇲⚡🇮⚡🇪 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇧⚡🇦⚡🇸 ⚡🇹⚡🇭⚡🇪⚡🇰 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾",
+        "⚡🇧⚡🇦⚡🇸 ⚡🇹⚡🇭⚡🇪⚡🇰 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮",
+        "⚡🇰⚡🇦⚡🇲⚡🇯⚡🇴⚡🇷 ⚡🇹⚡🇭⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇪⚡🇸⚡🇱⚡🇮⚡🇾⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮",
+        "⚡🇲⚡🇦⚡🇮 ⚡🇸⚡🇧 ⚡🇯⚡🇦⚡🇳⚡🇹⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇨⚡🇭⚡🇱 ⚡🇨⚡🇭⚡🇱 ⚡🇭⚡🇹 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮",
+        "⚡🇫⚡🇷 ⚡🇰⚡🇦⚡🇮⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇦⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇧⚡🇦⚡🇸 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇫⚡🇷 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇲⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇰⚡🇦⚡🇲⚡🇯⚡🇴⚡🇷 ⚡🇲⚡🇦 ⚡🇰⚡🇦 ⚡🇧⚡🇨⚡🇭⚡🇦 ⚡🇹⚡🇺 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇧⚡🇭⚡🇴⚡🇹 ⚡🇬⚡🇳⚡🇩⚡🇮 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇵⚡🇷 ⚡🇰⚡🇦⚡🇮⚡🇸⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇮⚡🇹⚡🇳⚡🇦 ⚡🇬⚡🇳⚡🇩⚡🇦",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇨⚡🇾⚡🇦 ⚡🇧⚡🇹⚡🇦 ⚡🇷⚡🇭⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇨⚡🇾⚡🇦 ⚡🇵⚡🇹⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇫⚡🇮⚡🇷 ⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇳⚡🇾 ⚡🇵⚡🇹⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇵⚡🇹⚡🇦 ⚡🇳⚡🇾 ⚡🇰⚡🇴⚡🇳 ⚡🇨⚡🇴⚡🇩 ⚡🇩⚡🇮⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇴",
+        "⚡🇷⚡🇺⚡🇰 ⚡🇦⚡🇦⚡🇾⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇴⚡🇩⚡🇰⚡🇪",
+        "⚡🇼⚡🇦⚡🇮⚡🇹 ⚡🇨⚡🇷 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇴⚡🇩 ⚡🇷⚡🇭⚡🇦 ⚡🇭⚡🇺",
+        "⚡🇼⚡🇦⚡🇮⚡🇹 ⚡🇨⚡🇷 ⚡🇷⚡🇦⚡🇧⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇷⚡🇭⚡🇮 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇼⚡🇦⚡🇮⚡🇹 ⚡🇰⚡🇷 ⚡🇸⚡🇲⚡🇯⚡🇭 ⚡🇷⚡🇭⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇴⚡🇩⚡🇰⚡🇪",
+        "⚡🇼⚡🇦⚡🇮⚡🇹 ⚡🇱⚡🇪 ⚡🇹⚡🇭⚡🇴⚡🇩⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇳⚡🇪 ⚡🇩⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴",
+        "⚡🇷⚡🇺⚡🇰 ⚡🇯⚡🇦 ⚡🇦⚡🇦⚡🇳⚡🇩 ⚡🇷⚡🇰⚡🇭 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇪 ⚡🇱⚡🇮⚡🇾⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇫⚡🇦⚡🇲⚡🇴⚡🇺⚡🇸 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇲⚡🇦⚡🇦⚡🇳 ⚡🇱⚡🇮⚡🇦 ⚡🇲⚡🇪⚡🇳⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇸⚡🇦⚡🇱⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇦⚡🇦⚡🇳 ⚡🇱⚡🇮⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇸⚡🇭⚡🇦⚡🇳⚡🇹 ⚡🇧⚡🇪⚡🇹⚡🇭 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮",
+        "⚡🇸⚡🇭⚡🇦⚡🇳⚡🇹 ⚡🇧⚡🇪⚡🇹⚡🇭⚡🇰⚡🇪 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇹⚡🇺",
+        "⚡🇫⚡🇷 ⚡🇸⚡🇪 ⚡🇸⚡🇭⚡🇦⚡🇳⚡🇹 ⚡🇧⚡🇪⚡🇹⚡🇭 ⚡🇹⚡🇺 ⚡🇨⚡🇺⚡🇩 ⚡🇦⚡🇧 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇾⚡🇭⚡🇦",
+        "⚡🇲⚡🇪⚡🇷⚡🇪 ⚡🇸⚡🇲⚡🇯⚡🇭 ⚡🇳⚡🇾 ⚡🇦⚡🇾⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇱⚡🇪 ⚡🇰⚡🇪⚡🇱⚡🇦 ⚡🇰⚡🇭⚡🇦 ⚡🇹⚡🇺 ⚡🇲⚡🇦⚡🇩⚡🇷⚡🇨⚡🇭⚡🇴⚡🇩",
+        "⚡🇭⚡🇾⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇨⚡🇾⚡🇦",
+        "⚡🇭⚡🇾⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇲⚡🇦⚡🇷 ⚡🇬⚡🇦⚡🇮 ⚡🇨⚡🇾⚡🇦",
+        "⚡🇭⚡🇾⚡🇪 ⚡🇸⚡🇨⚡🇭 ⚡🇧⚡🇹⚡🇦 ⚡🇨⚡🇴⚡🇲 ⚡🇨⚡??⚡🇩 ⚡🇩⚡🇮⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴",
+        "⚡🇨⚡🇭⚡🇱 ⚡🇨⚡🇭⚡🇴⚡🇩 ⚡🇩⚡🇮⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇴 ⚡🇸⚡🇲⚡🇯⚡🇭⚡🇱⚡🇪",
+        "⚡🇧⚡🇦⚡🇰⚡🇮 ⚡🇰⚡🇴⚡🇮 ⚡🇩⚡🇮⚡🇰⚡🇰⚡🇦⚡🇹 ⚡🇳⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇧⚡🇦⚡🇰⚡🇮 ⚡🇸⚡🇧 ⚡🇯⚡🇦⚡🇳⚡🇹⚡🇪 ⚡🇪⚡🇾 ⚡🇰⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇩⚡🇰⚡🇦⚡🇩 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇨⚡🇾⚡🇦 ⚡🇵⚡🇹⚡🇦 ⚡🇹⚡🇭⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇳⚡🇪 ⚡🇼⚡🇱⚡🇮 ⚡🇪⚡🇾",
+        "⚡🇵⚡🇷 ⚡🇲⚡🇪⚡🇮 ⚡🇰⚡🇦⚡🇮⚡🇸⚡🇪 ⚡🇯⚡🇳⚡🇹⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇰⚡🇴 ⚡🇰⚡🇴⚡🇮 ⚡🇨⚡🇭⚡🇴⚡🇩 ⚡🇩⚡🇮⚡🇦",
+        "⚡🇵⚡🇷 ⚡🇲⚡🇪⚡🇷⚡🇦 ⚡🇻⚡🇮 ⚡🇲⚡🇦⚡🇳⚡🇳⚡🇦 ⚡🇸⚡🇭⚡🇮 ⚡🇹⚡🇭⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇵⚡🇷 ⚡🇼⚡🇴 ⚡🇬⚡🇱⚡🇹 ⚡🇳⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇵⚡🇷 ⚡🇼⚡🇴 ⚡🇸⚡🇭⚡🇮 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇩⚡🇰⚡🇦⚡🇩 ⚡🇪⚡🇾",
+        "⚡🇵⚡🇷 ⚡🇰⚡🇦⚡🇮⚡🇸⚡🇪 ⚡🇰⚡🇮⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇴⚡🇲⚡🇫⚡🇴⚡🇴",
+        "⚡🇧⚡🇺⚡🇷 ⚡🇨⚡🇭⚡🇪⚡🇪⚡🇷 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦 ⚡🇹⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇰⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇱 ⚡🇲⚡🇪 ⚡🇱⚡🇴⚡🇩⚡🇦 ⚡🇲⚡🇦⚡🇷⚡🇰⚡🇪 ⚡🇺⚡🇸⚡🇰⚡🇮 ⚡🇩⚡🇭⚡🇦⚡🇩⚡🇰⚡🇦⚡🇳 ⚡🇷⚡🇴⚡🇰 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦",
+        "⚡🇱⚡🇺⚡🇱⚡🇱⚡🇪 ⚡🇰⚡🇭⚡🇦 ⚡🇹⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇰⚡🇦⚡🇧⚡🇭⚡🇴⚡🇸⚡🇩⚡🇦",
+        "⚡🇹⚡🇷⚡🇮 ⚡🇧⚡🇭⚡🇳 ⚡🇰⚡🇮 ⚡🇧⚡🇭⚡🇴⚡🇸⚡🇩⚡🇮 ⚡🇧⚡🇪⚡🇹⚡🇦",
+        "⚡🇹⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇧⚡🇦⚡🇦⚡🇹 ⚡🇰⚡🇭⚡🇹⚡🇲",
+        "⚡🇸⚡🇺⚡🇳 ⚡🇪⚡🇰 ⚡🇲⚡🇦⚡🇿⚡🇪 ⚡🇰⚡🇮 ⚡🇧⚡🇦⚡🇦⚡🇹 ⚡🇧⚡🇦⚡🇹⚡🇦⚡🇴 ⚡🇰⚡🇾⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇭⚡🇦⚡🇮",
+        "⚡🇨⚡🇴⚡🇩⚡🇺 ⚡🇨⚡🇴⚡🇩⚡🇺 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇦⚡🇯 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇴⚡🇾⚡🇪",
+        "⚡🇸⚡🇺⚡🇳 ⚡🇸⚡🇺⚡🇳 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇪 ⚡🇧⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇹⚡🇺",
+        "⚡🇰⚡🇮⚡🇱⚡🇦⚡🇸 ⚡🇳⚡🇾 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇨⚡🇾⚡🇦 ⚡🇵⚡🇹⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇧⚡🇭⚡🇪⚡🇳 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮",
+        "⚡🇵⚡?? ⚡🇵⚡🇷 ⚡🇨⚡🇾⚡🇦 ⚡🇭⚡🇴⚡🇹⚡🇪 ⚡🇪⚡🇾 ⚡🇹⚡🇲⚡🇰⚡🇨",
+        "⚡🇹⚡🇲⚡🇨⚡🇱 ⚡🇸⚡🇺⚡🇳⚡🇱⚡🇪",
+        "⚡🇲⚡🇴⚡🇴⚡🇹 ⚡🇩⚡🇺 ⚡🇹⚡🇪⚡🇷⚡?? ⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇲⚡🇪⚡🇾",
+        "⚡🇧⚡🇭⚡🇬⚡🇳⚡🇾 ⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦 ⚡🇫⚡🇷",
+        "⚡🇫⚡🇷 ⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇹⚡🇺",
+        "⚡🇾⚡🇪 ⚡🇻⚡🇮 ⚡🇸⚡🇭⚡🇮 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇰⚡🇸 ⚡🇧⚡🇸",
+        "⚡🇦⚡🇯 ⚡🇰⚡🇺⚡🇨⚡🇭 ⚡🇳⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮",
+        "⚡🇹⚡🇷⚡🇾 ⚡🇰⚡🇷 ⚡🇲⚡🇪⚡🇷⚡🇦 ⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇨⚡🇭⚡🇺⚡🇸⚡🇰⚡🇪",
+        "⚡🇹⚡🇴⚡🇷⚡🇲⚡🇦⚡🇰⚡🇮⚡🇧⚡🇺⚡🇷 ⚡🇸⚡🇺⚡🇳",
+        "⚡🇹⚡🇴⚡🇷 ⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇫⚡🇺⚡🇩⚡🇩⚡🇮 ⚡🇴⚡🇾⚡🇪",
+        "⚡🇭⚡🇦⚡🇾⚡🇪 ⚡🇭⚡🇦⚡🇾⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇱⚡🇺⚡🇳⚡🇩⚡🇰⚡🇪 ⚡🇵⚡🇦⚡🇸⚡🇮⚡🇳⚡🇪..",
+        "⚡🇰⚡🇺⚡🇹⚡🇹⚡🇪 ⚡🇰⚡🇪 ⚡🇹⚡🇦⚡🇹⚡🇹⚡🇪 ⚡🇸⚡🇺⚡🇳",
+        "⚡🇰⚡🇺⚡🇹⚡🇹⚡🇦 ⚡🇯⚡🇦⚡🇮⚡🇸⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇷⚡🇭⚡🇦 ⚡🇹⚡🇺",
+        "⚡🇲⚡🇺⚡🇭 ⚡🇲⚡🇪⚡🇮 ⚡🇱⚡🇪 ⚡🇲⚡🇪⚡🇷⚡🇦..",
+        "⚡🇯⚡🇭⚡🇦⚡🇹 ⚡🇰⚡🇪 ⚡🇵⚡🇮⚡🇸⚡🇸⚡🇺 ⚡🇸⚡🇺⚡🇳 ⚡🇹⚡🇲⚡🇰⚡🇨",
+        "⚡🇭⚡🇦⚡🇭⚡🇦⚡🇭⚡🇭⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇹⚡🇦⚡🇹⚡🇹⚡🇪 ⚡🇺⚡🇹⚡🇭",
+        "⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇪⚡🇾 ⚡🇹⚡🇺 ⚡🇨⚡🇺⚡🇩 ⚡🇷⚡🇭⚡🇦",
+        "⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇹⚡🇺",
+        "⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇷⚡🇭⚡🇮 ⚡🇩⚡🇪⚡🇰⚡🇭",
+        "⚡🇼⚡🇪⚡🇪⚡🇰 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇦⚡🇧",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇳⚡🇾 ⚡🇷⚡🇴⚡🇰 ⚡🇹⚡🇺 ⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇪⚡🇾",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇭⚡🇮⚡🇿⚡🇩⚡🇪",
+        "⚡🇴⚡🇰⚡🇦⚡🇹 ⚡🇳⚡🇾 ⚡🇲⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮",
+        "⚡🇱⚡🇺⚡🇳 ⚡🇱⚡🇪⚡🇬⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇬⚡🇦⚡🇳⚡🇩 ⚡🇲⚡🇪⚡🇮 ?",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇧⚡🇦⚡🇨⚡🇭⚡🇮 ⚡🇨⚡🇴⚡🇩⚡🇺..",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇧⚡🇭⚡🇪⚡🇳 ⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇦⚡🇯 ⚡🇫⚡🇦⚡🇩 ⚡🇩⚡🇺",
+        "⚡🇸⚡🇵⚡🇪⚡🇪⚡🇩 ⚡🇱⚡🇪⚡🇰⚡🇷 ⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦",
+        "⚡🇸⚡🇵⚡🇪⚡🇪⚡🇩 ⚡🇳⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇪 ⚡🇦⚡🇳⚡🇩⚡🇷 ⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇵⚡🇷⚡🇴⚡🇸⚡🇳",
+        "⚡🇺⚡🇬⚡🇱⚡🇾 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇨⚡🇭⚡🇺⚡🇵",
+        "⚡🇲⚡🇦⚡🇰⚡🇦⚡🇫⚡🇺⚡🇩⚡🇩⚡🇦⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇹⚡🇪⚡🇷⚡🇦 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇰⚡🇴 ⚡🇹⚡🇦⚡🇬 ⚡🇰⚡🇷..?",
+        "⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇹⚡🇦⚡🇬 ⚡🇰⚡🇷 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇧⚡🇭⚡🇦⚡🇬⚡🇼⚡🇳 ⚡🇰⚡🇴..",
+        "⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇳⚡🇾 ⚡🇭⚡🇴 ⚡🇹⚡🇺",
+        "⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇭⚡🇴 ⚡🇷⚡🇭⚡🇦 ⚡🇹⚡🇺 ⚡🇰⚡🇮⚡🇩",
+        "⚡🇲⚡🇦 ⚡🇹⚡🇴 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇭⚡🇦⚡🇼⚡🇦⚡🇧⚡🇿⚡🇮 ⚡🇨⚡🇷..",
+        "⚡🇧⚡🇸 ⚡🇲⚡🇦 ⚡🇨⚡🇴⚡🇩⚡🇳⚡🇮 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇹⚡🇴⚡🇼⚡🇳 ⚡🇲⚡🇪⚡🇮 ⚡🇨⚡🇺⚡🇩 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇱⚡🇪⚡🇰⚡🇷",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇸⚡🇪⚡🇽⚡🇾 ⚡🇰⚡🇴 ⚡🇧⚡🇪⚡🇯 - ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇧⚡🇭⚡🇬⚡🇼⚡🇳 ⚡🇵⚡🇪",
+        "⚡🇸⚡🇵⚡🇪⚡🇪⚡🇩 ⚡🇵⚡🇰⚡🇩 ⚡🇨⚡🇵 ⚡🇳⚡🇾 ⚡🇰⚡🇷",
+        "⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇷⚡🇪⚡🇳⚡🇩⚡🇾",
+        "⚡🇧⚡🇭⚡🇰⚡🇰 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇹⚡🇪⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇧⚡🇪⚡🇭⚡🇪⚡🇳 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮",
+        "⚡🇨⚡🇺⚡🇩 ⚡🇯⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇩⚡🇮⚡🇩⚡🇮 ⚡🇷⚡🇳⚡🇩⚡🇮",
+        "⚡🇸⚡🇱⚡🇴⚡🇼",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇮⚡🇾⚡🇦 ⚡🇨⚡🇮⚡🇴⚡🇩⚡🇺",
+        "⚡🇧⚡🇭⚡🇦⚡🇬?",
+        "⚡🇧⚡🇭⚡🇦⚡🇰 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇹⚡🇲⚡🇦 ⚡🇨⚡🇴⚡🇩⚡🇺",
+        "⚡🇸⚡🇱⚡🇴⚡🇼",
+        "⚡🇸⚡🇱⚡🇴⚡🇼 ⚡🇫⚡🇮⚡🇷⚡🇸⚡🇪",
+        "⚡🇨⚡🇺⚡🇩⚡🇬⚡🇷⚡🇮⚡🇧",
+        "⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇩⚡🇴⚡🇺",
+        "⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇨⚡🇴⚡🇩⚡🇺",
+        "⚡🇳⚡🇪⚡🇹 ⚡🇴⚡🇳 ⚡🇴⚡🇫⚡🇫 ⚡🇼⚡🇦⚡🇱⚡🇮 ⚡🇷⚡🇳⚡🇩⚡🇾",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇴⚡🇩⚡🇺",
+        "⚡🇮⚡🇩⚡🇭⚡🇦⚡🇷 ⚡🇦⚡🇦⚡🇰⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇨⚡🇭⚡🇦⚡🇦⚡🇵",
+        "⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇲⚡🇷⚡🇩⚡🇺",
+        "⚡🇴⚡🇮 ⚡🇲⚡🇦⚡🇦⚡🇰⚡🇪 ⚡🇱⚡🇴⚡🇩⚡🇪⚡🇪",
+        "⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇪⚡🇯",
+        "⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇺",
+        "⚡🇸⚡🇺⚡🇦⚡🇷 ⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇪⚡🇯",
+        "⚡🇳⚡🇪⚡🇹 ⚡🇴⚡🇫⚡🇫 ⚡🇴⚡🇳 ⚡🇰⚡🇷 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇱⚡🇦⚡🇩⚡🇰⚡🇪",
+        "⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇮 ⚡🇰⚡🇪⚡🇸⚡🇪",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇸⚡🇱⚡🇴⚡🇼 ⚡🇲⚡🇦⚡🇩⚡🇭⚡🇦⚡🇷⚡🇨⚡🇴⚡🇩",
+        "⚡🇹⚡??⚡🇰⚡🇨 ⚡🇨⚡🇴⚡🇩⚡🇺 ⚡🇰⚡🇷 ⚡🇲⚡🇸⚡🇬 ⚡🇩⚡🇪⚡🇱⚡🇪⚡🇹⚡🇪",
+        "⚡🇴⚡🇮 ⚡🇸⚡🇺⚡🇦⚡🇷 ⚡🇰⚡🇪 ⚡🇱⚡🇦⚡🇩⚡🇰⚡🇪",
+        "⚡🇹⚡??⚡🇰⚡🇨 ⚡🇫⚡🇺⚡🇫⚡🇮",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇩⚡🇮⚡🇩⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇮",
+        "⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦",
+        "⚡🇨⚡🇺⚡🇩 ⚡🇦⚡🇧",
+        "⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇧⚡🇭⚡🇦⚡🇰 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇲⚡🇷⚡🇺",
+        "⚡🇹⚡🇲⚡🇰⚡🇱 ⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇬⚡🇷⚡🇮⚡🇧",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇧⚡🇪⚡🇭⚡🇪⚡🇳 ⚡🇻⚡🇪⚡🇸⚡🇮⚡🇾⚡🇦⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮",
+        "⚡🇮⚡🇹⚡🇳⚡🇦 ⚡🇬⚡🇳⚡🇩⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇦 ⚡🇹⚡🇺 ⚡🇫⚡🇮⚡🇷⚡🇸⚡🇪 ⚡🇳⚡🇪⚡🇹 ⚡🇴⚡🇳 ⚡🇴⚡🇫⚡🇫",
+        "⚡🇬⚡🇷⚡🇮⚡🇧 ⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇪",
+        "⚡🇧⚡🇭⚡🇦⚡🇬 ⚡🇯⚡🇦 ⚡🇱⚡🇴⚡🇩⚡🇪 ⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇲⚡🇦⚡🇷⚡🇺 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦",
+        "⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇲⚡🇷⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦⚡🇦",
+        "⚡🇧⚡🇭⚡🇦⚡🇬 ⚡🇹⚡🇲⚡🇰⚡🇨",
+        "⚡🇧⚡🇭⚡🇦⚡🇬 ⚡🇹⚡🇧⚡🇰⚡🇨",
+        "⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇲⚡🇪⚡🇾 ⚡🇨⚡🇵",
+        "⚡🇨⚡🇵 ⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇲⚡🇪⚡🇭⚡🇭",
+        "⚡🇨⚡🇵 ⚡🇹⚡🇲⚡🇰⚡🇱 ⚡🇲⚡🇪⚡🇭",
+        "⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇦⚡🇧⚡🇪 ⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇩⚡🇴⚡🇺⚡🇧⚡🇱⚡🇪 ⚡🇸⚡🇪⚡🇳⚡🇩 ⚡🇰⚡🇴 ⚡🇨⚡🇵 ⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇨⚡🇴⚡🇩⚡🇺",
+        "⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇲⚡🇪 ⚡🇨⚡🇵 ⚡🇨⚡🇴⚡🇩 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦 ⚡🇦⚡🇦⚡🇯 ⚡🇲⚡🇪⚡🇭⚡🇭",
+        "⚡🇭⚡🇹 ⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇩⚡🇦⚡🇱⚡🇦⚡🇱 ⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇪.",
+        "⚡🇷⚡🇳⚡🇩⚡🇾 ⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇨⚡🇺⚡🇩⚡🇶 ⚡🇹⚡🇷⚡🇾⚡🇲⚡🇦",
+        "⚡🇵⚡🇦⚡🇷⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭⚡🇪⚡🇬⚡🇦..",
+        "⚡🇹⚡🇷⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇭⚡🇧⚡🇭⚡🇦⚡🇰",
+        "⚡🇱⚡🇦⚡🇬⚡🇩⚡🇮 ⚡🇰⚡🇪 ⚡🇱⚡🇦⚡🇩⚡🇨⚡🇪 ⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱",
+        "⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱 ⚡🇱⚡🇦⚡🇬⚡🇩⚡🇮 ⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇪..",
+        "⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱",
+        "⚡🇧⚡🇭⚡🇮⚡🇰⚡🇦⚡🇷⚡🇮 ⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇨⚡🇭⚡🇺⚡🇸 ⚡🇲⚡🇪⚡🇷⚡??.",
+        "⚡🇱⚡🇴⚡🇼 ⚡🇱⚡🇪⚡🇻⚡🇪⚡🇱 ⚡🇨⚡🇵 ⚡🇨⚡🇷",
+        "⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱 ⚡🇱⚡🇴⚡🇼 ⚡🇱⚡🇪⚡🇻⚡🇪⚡🇱 ⚡🇼⚡🇪⚡🇦⚡🇰",
+        "⚡🇲⚡🇪⚡🇷⚡🇪 ⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇵⚡🇪 ⚡🇪⚡🇾 ⚡🇹⚡🇺 ⚡🇭⚡🇮⚡🇯⚡🇩⚡🇪",
+        "⚡🇫⚡🇷⚡🇪⚡🇪 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴",
+        "⚡🇫⚡🇷⚡🇪⚡🇪 ⚡🇲⚡🇪⚡🇾 ⚡🇨⚡🇺⚡🇩 ⚡🇹⚡🇺 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪"
+        "⚡🇸⚡🇵⚡🇪⚡🇪⚡🇩 ⚡🇳⚡🇾 ⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇹⚡🇦⚡🇹⚡🇹⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇲⚡🇪",
+        "⚡??⚡🇮⚡🇹⚡🇳⚡🇮 ⚡🇧⚡🇷 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦⚡🇾⚡🇪⚡🇬⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾⚡🇲⚡🇦⚡🇰⚡🇴",
+        "⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇱⚡🇪 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇧⚡🇦⚡🇵⚡🇰⚡🇦",
+        "⚡🇱⚡🇺⚡🇳 ⚡🇨⚡🇺⚡🇸 ⚡🇯⚡🇦⚡🇱⚡🇩⚡🇮 ⚡🇸⚡🇪 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇧⚡🇦⚡🇵⚡🇰⚡🇦",
+        "⚡🇰⚡🇴⚡🇮 ⚡🇳⚡🇾 ⚡🇩⚡🇪⚡🇰⚡🇭 ⚡🇷⚡🇭⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇹⚡🇺",
+        "⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇮⚡🇨⚡🇭⚡🇴⚡🇩 ⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪",
+        "⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇧⚡🇸 ⚡🇾⚡🇪⚡🇭⚡🇮 ⚡🇯⚡🇦⚡🇳⚡🇹⚡🇦 ⚡🇲⚡🇪⚡🇾",
+        "⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱⚡🇪⚡🇬⚡🇦 ⚡🇹⚡🇴 ⚡🇹⚡🇲⚡🇰⚡🇨",
+        "⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇯⚡🇦⚡🇾⚡🇪⚡🇬⚡🇮",
+        "⚡🇸⚡🇱⚡🇴⚡🇼 ⚡🇪⚡🇾 ⚡🇹⚡🇺 ⚡🇰⚡🇮⚡🇩",
+        "⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇱⚡🇮⚡🇰⚡🇭..",
+        "⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇱⚡🇮⚡🇰⚡🇭..",
+        "⚡🇹⚡🇾⚡🇲 ⚡🇸⚡🇪 ⚡🇵⚡🇭⚡🇱⚡🇪 ⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦",
+        "⚡🇹⚡🇾⚡🇲 ⚡🇭⚡🇴⚡🇬⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦",
+        "⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇹⚡🇾⚡🇲 ⚡🇸⚡🇪 ⚡🇵⚡🇭⚡🇱⚡🇪",
+        "⚡🇺⚡🇹⚡🇭 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇨⚡🇪 ⚡🇰⚡🇪 ⚡🇱⚡🇩⚡🇰⚡🇪",
+        "⚡🇲⚡🇦⚡🇨⚡🇦⚡🇧⚡🇴⚡🇸⚡🇩⚡🇦⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇨⚡🇴⚡🇳 ⚡🇰⚡🇧 ⚡🇨⚡🇴⚡🇩 ⚡🇩⚡🇮⚡🇦 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇰⚡🇴⚡🇮 ⚡🇭⚡🇴⚡🇬⚡🇦 ⚡🇹⚡🇲⚡🇱",
+        "⚡🇲⚡🇦⚡🇨⚡🇭⚡🇦⚡🇷 ⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇹⚡🇺",
+        "⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇨⚡🇴⚡🇩⚡🇳⚡🇦 ⚡🇸⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇧⚡🇴⚡🇱 ⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇨⚡🇴⚡🇩 ⚡🇩⚡🇪",
+        "⚡🇧⚡🇸 ⚡🇲⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩⚡🇳⚡🇦 ⚡🇨⚡🇭⚡🇹⚡🇦 ⚡🇭⚡🇺",
+        "⚡🇪⚡🇼⚡🇼 ⚡🇲⚡🇦⚡🇰⚡🇦 ⚡🇱⚡🇴⚡🇩⚡🇪 ⚡🇺⚡🇹⚡🇭",
+        "⚡🇲⚡🇪⚡🇴⚡🇼 ⚡🇨⚡🇷 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇨⚡🇴⚡🇩⚡🇺",
+        "⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇷⚡🇰⚡🇭 ⚡🇩⚡🇮⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇪 ⚡🇫⚡🇺⚡🇩⚡🇪 ⚡🇵⚡🇪",
+        "⚡🇲⚡🇪⚡🇷⚡🇦 ⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇰⚡🇪 ⚡🇧⚡🇦⚡🇱 ⚡🇺⚡🇹⚡🇭",
+        "⚡🇰⚡🇮⚡🇩⚡🇪⚡🇪 ⚡🇿⚡🇮⚡🇳⚡🇩⚡🇦 ⚡🇭⚡🇴",
+        "⚡🇲⚡🇦⚡🇷 ⚡🇳⚡🇾 ⚡🇰⚡🇮⚡🇩⚡🇩⚡🇪 ⚡🇹⚡🇾⚡🇵⚡🇪 ⚡🇰⚡🇷",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇧⚡🇰⚡🇱",
+        "⚡🇧⚡🇨 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹",
+        "⚡🇲⚡🇨 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇫⚡🇦⚡🇸⚡🇹",
+        "⚡🇫⚡🇦⚡🇸⚡🇹 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇫⚡🇦⚡🇸⚡🇹 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇰⚡🇦⚡🇲⚡🇿⚡🇴⚡🇷"
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇨⚡🇱⚡🇦⚡🇮⚡🇲 ⚡🇨⚡🇷⚡🇼⚡🇦",
+        "⚡🇦⚡🇼⚡🇿 ⚡🇳⚡🇮⚡🇨⚡🇭⚡🇪 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇨⚡🇪 ⚡🇰⚡🇪 ⚡🇧⚡🇨⚡🇭⚡🇪",
+        "⚡🇸⚡🇦⚡🇼⚡🇦⚡🇱 ⚡🇳⚡🇾 ⚡🇵⚡🇺⚡🇨⚡🇭 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇦⚡🇧⚡🇴⚡🇸⚡🇩⚡🇦",
+        "⚡🇫⚡🇾⚡🇹⚡🇪⚡🇷 ⚡🇧⚡🇳⚡🇪⚡🇬⚡🇦 ⚡🇱⚡🇦⚡🇬⚡🇩⚡🇪 ⚡🇲⚡🇦⚡🇩⚡🇷⚡🇨⚡🇭⚡🇴⚡🇩",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇰⚡🇦⚡🇦⚡🇱⚡🇪 ⚡🇷⚡🇴 ⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇰⚡🇦⚡🇦⚡🇱⚡🇪 ⚡🇷⚡🇴⚡🇴 ⚡🇳⚡🇾",
+        "⚡🇸⚡🇭⚡🇴⚡🇷⚡🇹 ⚡🇳⚡🇾 ⚡🇨⚡🇺⚡🇩 ⚡🇹⚡🇺 ⚡🇧⚡🇮⚡🇳⚡🇦 ⚡🇷⚡🇺⚡🇰⚡🇪",
+        "⚡🇸⚡🇭⚡🇴⚡🇷⚡🇹 ⚡🇳⚡🇾 ⚡🇨⚡🇺⚡🇩 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇱⚡🇪⚡🇰⚡🇷",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇪 ⚡🇸⚡🇹⚡🇭 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇧⚡🇭⚡🇪⚡🇳 ⚡🇻⚡🇮 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇪 ⚡🇸⚡🇹⚡🇭 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇩⚡🇮⚡🇩⚡🇮 ⚡🇻⚡🇮 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮",
+        "⚡🇨⚡🇭⚡🇦⚡🇹 ⚡🇫⚡🇾⚡🇹⚡🇪⚡🇷 ⚡🇧⚡🇳⚡🇪⚡🇬⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇨⚡🇪 ⚡🇨⚡🇴⚡🇩⚡🇺 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴",
+        "⚡🇧⚡🇴⚡🇱 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇩⚡🇦⚡🇩⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇧⚡🇺⚡🇱⚡🇱⚡🇾🇽 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇺⚡🇹⚡🇭",
+        "⚡🇲⚡🇦⚡🇷 ⚡🇲⚡🇦⚡🇷⚡🇰⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇷⚡🇭⚡🇦 ⚡🇹⚡🇺",
+        "⚡🇴⚡🇷 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇲⚡🇦⚡🇷⚡🇰⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮"
+        "⚡🇯⚡🇦⚡🇱⚡🇩⚡🇮 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇷⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇯",
+        "⚡🇴⚡🇷 ⚡🇧⚡🇩⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇹⚡🇲⚡🇨",
+        "⚡🇴⚡🇷 ⚡🇧⚡🇩⚡🇦 2 ⚡🇱⚡🇮⚡🇳⚡🇪 ⚡🇼⚡🇱⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇹⚡🇲⚡🇰⚡🇨",
+        "⚡🇴⚡🇷 ⚡🇧⚡??⚡🇦 ⚡🇴⚡🇾⚡🇪 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇹⚡🇲⚡🇱",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇦 ⚡🇧⚡🇺⚡🇷",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇰⚡🇪⚡🇪⚡🇩⚡🇪",
+        "⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮 ⚡🇰⚡🇪 ⚡🇱⚡🇦⚡🇩⚡🇰⚡🇪",
+        "⚡🇯⚡🇦⚡🇱⚡🇩⚡🇮 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇧⚡🇪⚡🇭⚡🇪⚡🇳 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇺",
+        "⚡🇲⚡🇰⚡🇱 ⚡🇺⚡🇹⚡🇭 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮 ⚡🇰⚡🇪 ⚡🇧⚡🇦⚡🇨⚡🇨⚡🇭⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇳⚡🇦⚡🇳⚡🇮 ⚡🇲⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦⚡🇱",
+        "⚡🇹⚡🇪⚡🇯 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇨⚡🇪",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇲⚡🇦⚡🇦⚡🇰⚡🇪 ⚡🇱⚡🇴⚡🇩⚡🇪 ⚡🇲⚡🇷⚡🇪⚡🇳⚡🇬⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇾",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇮⚡🇾⚡🇦 ⚡🇰⚡🇮 ⚡🇬⚡🇦⚡🇳⚡🇩",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇩⚡🇦⚡🇩⚡🇮 ⚡🇰⚡🇦 ⚡🇫⚡🇺⚡🇩⚡🇩⚡🇦",
+        "⚡🇲⚡🇰⚡🇱 ⚡🇺⚡🇹⚡🇭 ⚡🇧⚡🇪⚡🇭⚡🇪⚡🇳⚡🇨⚡🇴⚡🇩",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇮 ⚡🇧⚡🇺⚡🇷 ⚡🇩⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇦 ⚡🇫⚡🇺⚡🇩⚡🇩⚡🇦 ⚡🇲⚡🇪 ⚡🇱⚡🇦⚡🇺⚡🇩⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇻⚡🇦",
+        "⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮 ⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇪 ⚡🇲⚡🇦⚡🇷 ⚡🇬⚡🇦⚡🇾⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇲⚡🇷⚡🇺",
+        "⚡🇯⚡🇦⚡🇱⚡🇮⚡🇩 ⚡🇰⚡🇷 ⚡🇸⚡🇵⚡🇦⚡🇲",
+        "⚡🇲⚡🇨 ⚡🇸⚡🇵⚡🇦⚡🇲 ⚡🇷⚡🇴⚡🇰⚡🇪⚡🇳⚡🇬⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇸⚡🇵⚡🇦⚡🇲 ⚡🇰⚡🇷",
+        "⚡🇸⚡🇵⚡🇦⚡🇲 ⚡🇰⚡🇷.⚡🇲⚡🇦⚡🇦⚡🇰⚡🇪 ⚡🇱⚡🇴⚡🇩⚡🇪",
+        "⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇪 ⚡🇸⚡🇵⚡🇦⚡🇲 ⚡🇰⚡🇷 ⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇹⚡🇺",
+        "⚡🇸⚡🇵⚡🇦⚡🇲 ⚡🇰⚡🇷 ⚡🇰⚡🇮⚡🇩",
+        "⚡🇳⚡🇴⚡🇴⚡🇧 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇺",
+        "⚡🇷⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇪 ⚡🇲⚡🇦⚡🇷 ⚡🇲⚡🇦⚡🇹 ⚡🇹⚡🇺",
+        "⚡🇳⚡🇴⚡🇴⚡🇧 ⚡🇯⚡🇦⚡🇱⚡🇩⚡🇮 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩",
+        "⚡🇨⚡🇺⚡?? ⚡🇬⚡🇦⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇳⚡🇴⚡🇴⚡🇧",
+        "⚡🇺⚡🇹⚡🇭 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇳⚡🇴⚡🇴⚡🇧",
+        "⚡🇨⚡🇭⚡🇱 ⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦 ⚡🇳⚡🇴⚡🇴⚡🇧",
+        "⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇹⚡🇾⚡🇵 ⚡🇨⚡🇷 ⚡🇳⚡🇴⚡🇴⚡🇧 ⚡🇭⚡🇦⚡🇱⚡🇰⚡🇪",
+        "⚡🇨⚡🇺⚡🇩 ⚡🇰⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇳⚡🇾 ⚡🇭⚡🇴 ⚡🇳⚡🇴⚡🇴⚡🇧",
+        "⚡🇨⚡🇺⚡🇩 ⚡🇨⚡🇺⚡🇩 ⚡🇰⚡🇪 ⚡🇷⚡🇦⚡🇳⚡🇩 ⚡🇧⚡🇳⚡🇯⚡🇦 ⚡🇹⚡🇺 ⚡🇳⚡🇴⚡🇴⚡🇧",
+        "⚡🇲⚡🇦⚡🇰⚡🇮⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇳⚡🇴⚡🇴⚡🇧",
+        "⚡🇬⚡🇦⚡🇳⚡🇩⚡🇦 ⚡🇨⚡🇾⚡🇺 ⚡🇨⚡🇺⚡🇩 ⚡🇷⚡🇭⚡🇦 ⚡🇹⚡🇺 ?",    "⚡🇮⚡🇹⚡🇳⚡🇦 ⚡🇬⚡🇳⚡🇩⚡🇦 ⚡🇳⚡🇾 ⚡🇨⚡🇺⚡🇩 ⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇲⚡🇦⚡🇦⚡🇳 ⚡🇱⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇦 ⚡🇹⚡🇺 ⚡🇸⚡🇺⚡🇳 ⚡🇧⚡🇦⚡🇹 ⚡🇦⚡🇧",
+        "⚡🇲⚡🇦⚡🇰⚡🇦⚡🇫⚡🇺⚡🇩⚡🇩⚡🇦 ⚡🇫⚡🇦⚡🇹 ⚡🇬⚡🇾⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇷⚡🇺⚡🇰",
+    ]
 
-        # ─── DEATHGOD REPLIES ────────────────────────────────────────────────────
-        deathgod_replies = [
-            "𝐊ʏᴀ 𝐑ᴇ 𝐑ᴀɴᴅɪᴋᴇ 𝐂ᴏᴏʟ ",
-            "𝚃𝙴𝚁𝙸 𝐌ᴀᴀ 𝐌ᴀʀʀ 𝐆ᴀʏɪ 𝐘ᴀᴀʀ - 𝐉ᴀɪ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️   ! 🌙",
-            "acha beta 😂🔥👊🏻 koi na me toh TUJHE Choduga 😹💔🔥😆👊🏻💥",
-            "chudke bhaga kaise 😂💥🤣🤘🏻",
-            "ne toh  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  ka lun muh me lelia 😂🙏🏻😂🙏🏻",
-            "try maa सूर्य☀ nikalte hi pel du 😹🔥💔",
-            "mkl lun te vaj 😂✊🏻💦",
-            "𝗧ᴍᴋ𝗕 pe  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  ka hamla 😂⚔🔥💥",
-            "𝐂ʜʟ 𝐇ᴀʀᴍᴢᴀᴅ𝐈 𝐊ᴇ लड़के 💛🤍🩵",
-            "oi 𝐓ᴇʀɪ 𝐌‌ᴀᴀ गुलाम ₰🖤",
-            "chl rndyce chud ke dikha 😂💥🤣🔥",
-            "𝐊ɪ 𝐌ᴀᴀ 𝐌ᴀʀʀ 𝐆ᴀʏɪ naacho 💃🏻💃🏻🕺🏻🎶😂😆💞🔥 !",
-            "tera baap bass  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  hai 😂🎀",
-            " try maa hagte hue paad mari -#😹🔥🥀",
-            "  𝐓ᴇʀɪ 𝐌ᴜᴍᴍʏ 𝐂ʜᴏᴅ 𝐃ɪ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐍ᴇ 𝐁ᴡᴀʜᴀʜᴀʜᴀ ⚜",
-            "𝐊ʏᴀ 𝐑ᴇ 𝐑ᴀɴᴅɪᴋᴇ 𝐂ᴏᴏʟ 𝐁ᴀɴᴇɢᴀ 𝐓ᴜ 𝐂ʜᴀʟ 𝐀ʙ 𝐂ʜᴜᴅ 𝐀ᴘɴᴇ 𝐁ᴀᴀᴘ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐒ᴇ - 🦢💘",
-            "𝐊ɪ 𝐌ᴀᴀ 𝐌ᴀʀʀ 𝐆ᴀʏɪ 𝐘ᴀᴀʀ - 𝐉ᴀɪ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  ! 🌙",
-            "acha beta 😂🔥👊🏻 koi na me toh TUJHE Choduga 😹💔🔥😆👊🏻💥",
-            "chudke bhaga kaise 😂💥🤣🤘🏻",
-            "ne toh  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  ka lun muh me lelia 😂🙏🏻😂🙏🏻",
-            "try maa सूर्य☀ nikalte hi pel du 😹🔥💔",
-            "mkl lun te vaj 😂✊🏻💦",
-            "𝗧ᴍᴋ𝗕 pe  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  ka hamla 😂⚔🔥💥",
-            "𝐂ʜʟ 𝐇ᴀʀᴍᴢᴀᴅ𝐈 𝐊ᴇ लड़के 💛🤍🩵",
-            "oi 𝐓ᴇʀɪ 𝐌‌ᴀᴀ गुलाम ₰🖤",
-            "chl rndyce chud ke dikha 😂💥🤣🔥",
-            "𝐊ɪ 𝐌ᴀᴀ 𝐌ᴀʀʀ 𝐆ᴀʏɪ naacho 💃🏻💃🏻🕺🏻🎶😂😆💞🔥 !",
-            "tera baap bass  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  hai 😂🎀",
-            " T 𝒦𝐼 𝑀𝒜𝒜 𝐵𝐻𝐸𝒩 𝐾♡ 𝑅𝒜𝒩𝒟𝐼 𝐵𝒜𝒩𝒜 𝒦𝒜  𝒞𝐻♡𝒟𝒰𝒰😹🥀",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝙃𝙄𝙎 𝙈𝙊𝙈 𝙋𝙍𝙊𝙋𝙀𝙍𝙇𝙔",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘼𝙎𝙆 𝙃𝙄𝙈 𝙏𝙊 𝘾𝙊𝙑𝙀𝙍 𝙃𝙄𝙎 𝙈𝙊𝙈'𝙎 𝘼𝙎𝙎",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙄𝙓 𝙈𝙔 𝘼‌𝙋𝙋𝙊𝙄𝙉𝙏𝙈𝙀𝙉𝙏 𝙒𝙄𝙏𝙃 𝙃𝙄𝙎 𝙎𝙄𝙎",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝘼𝙉𝘿 𝙏𝙃𝙍𝙊𝙒 𝙏𝙃𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽 𝙎𝙊𝙉",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘿𝙊 𝙉𝙊𝙏 𝙎𝙏𝙊𝙋 𝙁𝙐𝘾𝙆𝙄𝙉𝙂 𝙈𝙔 𝙂𝙐𝙇𝘼‌𝙈",
-            "𝙂𝙀𝙈𝙄𝙉𝙄 𝙎𝘼𝙄𝘿  𝙄𝙎 𝙍𝙉𝘿𝙔 𝙋𝙐𝙏𝙍𝘼",
-            "𝙋𝙀𝙍𝙋𝙇𝙀𝙓𝙄𝙏𝙔 𝙎𝘼𝙄𝘿 This 𝙄𝙎 𝙂𝙐𝙇𝘼𝙈",
-            "𝙂𝙍𝙊𝙆 𝘼𝙄 𝙎𝘼𝙄𝘿 𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽",
-            "𝘽𝙊𝙏 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝘾𝙃𝙐𝘿𝘼𝙆𝘼𝘿",
-            "𝙈𝙊𝘿𝙄 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝙋𝙊𝙇𝙀 𝘿𝘼𝙉𝘾𝙀𝙍",
-            "𝙏𝙍𝙐𝙈𝙋 𝙎𝘼𝙄𝘿 THis 𝙄𝙎 𝘽𝙇𝙊𝙊𝘿Y 𝙈𝙊𝙏𝙃𝙀𝙍𝙁*\"𝘾𝙆𝙀𝙍",
-            "𝗧𝗢𝗛𝗔𝗥 𝗠𝗨𝗠𝗠𝗬 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜𝗡𝗚𝗙𝗜𝗦𝗛𝗘𝗥 𝗞𝗜 𝗕𝗢𝗧𝗧𝗟𝗘 𝗗𝗔𝗟 𝗞𝗘 𝗧𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗔𝗡𝗗𝗘𝗥 𝗛𝗜 😱😂🤩",
-            "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄 ✋ 𝐇𝐀𝐓𝐓𝐇 𝐃𝐀𝐋𝐊𝐄 👶 𝐁𝐀𝐂𝐂𝐇𝐄 𝐍𝐈𝐊𝐀𝐋 𝐃𝐔𝐍𝐆𝐀 😍",
-            "𝐓𝐄𝐑𝐀 𝐏𝐄𝐇𝐋𝐀 𝐁𝐀𝐀𝐏 𝐇𝐔 𝐌𝐀𝐃𝐀𝐑𝐂𝐇𝐎𝐃",
-            "𝗧𝗘𝗥𝗜 𝗠𝗨𝗠𝗠𝗬 𝗞𝗘 𝗦𝗔𝗔𝗧𝗛 𝗟𝗨𝗗𝗼 𝗞𝗛𝗘𝗟𝗧𝗘 𝗞𝗛𝗘𝗟𝗧𝗘 𝗨𝗦𝗞𝗘 𝗠𝗨𝗛 𝗠𝗘 𝗔𝗣𝗡𝗔 𝗟𝗢𝗗𝗔 𝗗𝗘 𝗗𝗨𝗡𝗚𝗔☝🏻☝🏻😬",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗦𝗨𝗧𝗟𝗜 𝗕𝗢𝗠𝗕 𝗙𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗝𝗛𝗔𝗔𝗧𝗘 𝗝𝗔𝗟 𝗞𝗘 𝗞𝗛𝗔𝗔𝗞 𝗛𝗢 𝗝𝗔𝗬𝗘𝗚𝗜💣🔥",
-            "𝐓𝐄𝐑𝐈 𝐕𝐀𝐇𝐄𝐈𝐍 𝐊𝐎 𝐀𝐏𝐍𝐄 𝐋𝐔𝐍𝐃 𝐏𝐑 𝐈𝐓𝐍𝐀 𝐉𝐇𝐔𝐋𝐀𝐀𝐔𝐍𝐆𝐀 𝐊𝐈 𝐉𝐇𝐔𝐋𝐓𝐄 𝐉𝐇𝐔𝐋𝐓𝐄 𝐇𝐈 𝐁𝐀𝐂𝐇𝐀 𝐏𝐀𝐈𝐃𝐀 𝐊𝐑 𝐃𝐄𝐆𝐈 💦💋",
-            "𝐆𝐀𝐋𝐈 𝐆𝐀𝐋𝐈 𝐌𝐄 𝐑𝐄𝐇𝐓𝐀 𝐇𝐄 𝐒𝐀𝐍𝐃 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐂𝐇𝐎𝐃 𝐃𝐀𝐋𝐀 𝐎𝐑 𝐁𝐀𝐍𝐀 𝐃𝐈𝐀 𝐑𝐀𝐍𝐃 🤤🤣",
-            "𝐒𝐀𝐁 𝐁𝐎𝐋𝐓𝐄 𝐌𝐔𝐉𝐇𝐊𝐎 𝐏𝐀𝐏𝐀 𝐊𝐘𝐎𝐔𝐍𝐊𝐈 𝐌𝐄𝐍𝐄 𝐁𝐀𝐍𝐀𝐃𝐈𝐀 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐏𝐑𝐄𝐆𝐍𝐄𝐍𝐓 🤣🤣",
-            "𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙇𝙀𝙏𝙄 𝙈𝙀𝙍𝙄 𝙇𝙐𝙉𝘿 𝘽𝘼𝘿𝙀 𝙈𝘼𝙎𝙏𝙄 𝙎𝙀 𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙆𝙊 𝙈𝙀𝙉𝙀 𝘾𝙃𝙊𝘿 𝘿𝘼𝙇𝘼 𝘽𝙊𝙃𝙊𝙏 𝙎𝘼𝙎𝙏𝙀 𝙎𝙀",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗖𝗛𝗔𝗡𝗚𝗘𝗦 𝗖𝗢𝗠𝗠𝗜𝗧 𝗞𝗥𝗨𝗚𝗔 𝗙𝗜𝗥 𝗧𝗘𝗥𝗜 𝗕𝗛𝗘𝗘𝗡 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗔𝗨𝗧𝗢𝗠𝗔𝗧𝗜𝗖𝗔𝗟𝗟𝗬 𝗨𝗣𝗗𝗔𝗧𝗘 𝗛𝗢𝗝𝗔𝗔𝗬𝗘𝗚𝗜🤖🙏🤔",
-            "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐀𝐊𝐈 𝐂𝐇𝐔𝐃𝐀𝐈 𝐊𝐎 𝐏𝐎𝐑𝐍𝐇𝐔𝐁.𝐂𝐎𝐌 𝐏𝐄 𝐔𝐏𝐋𝐎𝐀𝐃 𝐊𝐀𝐑𝐃𝐔𝐍𝐆𝐀 𝐒𝐔𝐀𝐑 𝐊𝐄 𝐂𝐇𝐎𝐃𝐄 🤣💋💦",
-            "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐆𝐀𝐀𝐍𝐃 𝐌𝐄𝐈 𝐎𝐍𝐄𝐏𝐋𝐔𝐒 𝐊𝐀 𝐖𝐑𝐀𝐏 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 𝟑𝟎𝐖 𝐇𝐈𝐆𝐇 𝐏𝐎𝐖𝐄𝐑 💥😂😎",
-            "𝐓𝐔𝐉𝐇𝐄 𝐀𝐁 𝐓𝐀𝐊 𝐍𝐀𝐇𝐈 𝐒𝐌𝐉𝐇 𝐀𝐘𝐀 𝐊𝐈 𝐌𝐀𝐈 𝐇𝐈 𝐇𝐔 𝐓𝐔𝐉𝐇𝐄 𝐏𝐀𝐈𝐃𝐀 𝐊𝐀𝐑𝐍𝐄 𝐖𝐀𝐋𝐀 𝐁𝐇𝐎𝐒𝐃𝐈𝐊𝐄𝐄 𝐀𝐏𝐍𝐈 𝐌𝐀𝐀 𝐒𝐄 𝐏𝐔𝐂𝐇 𝐑𝐀𝐍𝐃𝐈 𝐊𝐄 𝐁𝐀𝐂𝐇𝐄𝐄𝐄𝐄 🤩👊👤😍",
-            "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄𝐈 𝐀𝐏𝐏𝐋𝐄 𝐊𝐀 𝟏𝟖𝐖 𝐖𝐀𝐋𝐀 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 🔥🤩",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗢 𝗜𝗧𝗡𝗔 𝗖𝗛𝗢𝗗𝗨𝗡𝗚𝗔 𝗞𝗜 𝗦𝗔𝗣𝗡𝗘 𝗠𝗘𝗜 𝗕𝗛𝗜 𝗠𝗘𝗥𝗜 𝗖𝗛𝗨𝗗𝗔𝗜 𝗬𝗔𝗔𝗗 𝗞𝗔𝗥𝗘𝗚𝗜 𝗥Æ𝗡𝗗𝗜 🥳😍👊💥",
-            "𝙋𝘼𝙋𝘼 𝙆𝙄 𝙎𝙋𝙀𝙀𝘿 𝙈𝙏𝘾𝙃 𝙉𝙃𝙄 𝙃𝙊 𝙍𝙃𝙄 𝙆𝙔𝘼",
-            "𝙆𝙄𝙏𝙉𝙄 𝘾𝙃𝙊𝘿𝙐 𝙏𝙀𝙍𝙄 𝙈𝘼 𝘼𝘽 𝙊𝙍..",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔𝗨𝗦𝗜 𝗞𝗘 𝗕𝗛𝗢𝗦𝗗𝗘 𝗠𝗘𝗜 𝗜𝗡𝗗𝗜𝗔𝗡 𝗥𝗔𝗜𝗟𝗪𝗔𝗬 🚂💥😂",
-            "𝙆𝙄𝙏𝙉𝙄 𝙂𝙇𝙄𝙔𝘼 𝙋𝘿𝙒𝙀𝙂𝘼 𝘼𝙋𝙉𝙄 𝙈𝘼 𝙆𝙊",
-            "𝗧𝗘𝗥𝗜 𝗜𝗧𝗘𝗠 𝗞𝗜 𝗚𝗔𝗔𝗡𝗗 𝗠𝗘 𝗟𝗨𝗡𝗗 𝗗𝗔𝗔𝗟𝗞𝗘,𝗧𝗘𝗥𝗘 𝗝𝗔𝗜𝗦𝗔 𝗘𝗞 𝗢𝗥 𝗡𝗜𝗞𝗔𝗔𝗟 𝗗𝗨𝗡𝗚𝗔 𝗠𝗔‌𝗔‌𝗗𝗔𝗥𝗖𝗛Ø𝗗🤘🏻🙌🏻☠️",
-            "2 𝙍𝙐𝙋𝘼𝙔 𝙆𝙄 𝙋𝙀𝙋𝙎𝙄 𝙏𝙀𝙍𝙄 𝙈𝙐𝙈𝙈𝙔 𝙎𝘼𝘽𝙎𝙀 𝙎𝙀𝙓𝙔 💋💦",
-            "𝐓ᴇʀɪ 𝐌ᴜᴍᴍʏ 𝐂ʜᴏᴅ 𝐃ɪ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐍ᴇ 𝐁ᴡᴀʜᴀʜᴀʜᴀ ⚜",
-            "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
-            "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
-            "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
-            "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
-            "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
-            "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
-            "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
-            "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
-            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SHAMBHOG करती है ! 🛐",
-            "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
-            "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
-            "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
-            "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
-            "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
-            "Hello hello?? saas aarahi है? रण्डी पुत्र 🧘🏻",
-            "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
-            "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
-            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐",
-            "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
-            "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
-            "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
-            "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
-            "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
-            "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
-            "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
-            "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
-            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐",
-            "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
-            "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
-            "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
-            "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
-            "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
-            "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
-            "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
-            "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝙃𝙄𝙎 𝙈𝙊𝙈 𝙋𝙍𝙊𝙋𝙀𝙍𝙇𝙔",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘼𝙎𝙆 𝙃𝙄𝙈 𝙏𝙊 𝘾𝙊𝙑𝙀𝙍 𝙃𝙄𝙎 𝙈𝙊𝙈'𝙎 𝘼𝙎𝙎",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙄𝙓 𝙈𝙔 𝘼‌𝙋𝙋𝙊𝙄𝙉𝙏𝙈𝙀𝙉𝙏 𝙒𝙄𝙏𝙃 𝙃𝙄𝙎 𝙎𝙄𝙎",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝘼𝙉𝘿 𝙏𝙃𝙍𝙊𝙒 𝙏𝙃𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽 𝙎𝙊𝙉",
-            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘿𝙊 𝙉𝙊𝙏 𝙎𝙏𝙊𝙋 𝙁𝙐𝘾𝙆𝙄𝙉𝙂 𝙈𝙔 𝙂𝙐𝙇𝘼‌𝙈",
-            "𝙂𝙀𝙈𝙄𝙉𝙄 𝙎𝘼𝙄𝘿  𝙄𝙎 𝙍𝙉𝘿𝙔 𝙋𝙐𝙏𝙍𝘼",
-            "𝙋𝙀𝙍𝙋𝙇𝙀𝙓𝙄𝙏𝙔 𝙎𝘼𝙄𝘿 This 𝙄𝙎 𝙂𝙐𝙇𝘼𝙈",
-            "𝙂𝙍𝙊𝙆 𝘼𝙄 𝙎𝘼𝙄𝘿 𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽",
-            "𝘽𝙊𝙏 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝘾𝙃𝙐𝘿𝘼𝙆𝘼𝘿",
-            "𝙈𝙊𝘿𝙄 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝙋𝙊𝙇𝙀 𝘿𝘼𝙉𝘾𝙀𝙍",
-            "𝙏𝙍𝙐𝙈𝙋 𝙎𝘼𝙄𝘿 THis 𝙄𝙎 𝘽𝙇𝙊𝙊𝘿Y 𝙈𝙊𝙏𝙃𝙀𝙍𝙁*\"𝘾𝙆𝙀𝙍",
-            "𝗧𝗢𝗛𝗔𝗥 𝗠𝗨𝗠𝗠𝗬 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜𝗡𝗚𝗙𝗜𝗦𝗛𝗘𝗥 𝗞𝗜 𝗕𝗢𝗧𝗧𝗟𝗘 𝗗𝗔𝗟 𝗞𝗘 𝗧𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗔𝗡𝗗𝗘𝗥 𝗛𝗜 😱😂🤩",
-            "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄 ✋ 𝐇𝐀𝐓𝐓𝐇 𝐃𝐀𝐋𝐊𝐄 👶 𝐁𝐀𝐂𝐂𝐇𝐄 𝐍𝐈𝐊𝐀𝐋 𝐃𝐔𝐍𝐆𝐀 😍",
-            "𝐓𝐄𝐑𝐀 𝐏𝐄𝐇𝐋𝐀 𝐁𝐀𝐀𝐏 𝐇𝐔 𝐌𝐀𝐃𝐀𝐑𝐂𝐇𝐎𝐃",
-            "𝗧𝗘𝗥𝗜 𝗠𝗨𝗠𝗠𝗬 𝗞𝗘 𝗦𝗔𝗔𝗧𝗛 𝗟𝗨𝗗𝗼 𝗞𝗛𝗘𝗟𝗧𝗘 𝗞𝗛𝗘𝗟𝗧𝗘 𝗨𝗦𝗞𝗘 𝗠𝗨𝗛 𝗠𝗘 𝗔𝗣𝗡𝗔 𝗟𝗢𝗗𝗔 𝗗𝗘 𝗗𝗨𝗡𝗚𝗔☝🏻☝🏻😬",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗦𝗨𝗧𝗟𝗜 𝗕𝗢𝗠𝗕 𝗙𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗝𝗛𝗔𝗔𝗧𝗘 𝗝𝗔𝗟 𝗞𝗘 𝗞𝗛𝗔𝗔𝗞 𝗛𝗢 𝗝𝗔𝗬𝗘𝗚𝗜💣🔥",
-            "𝐓𝐄𝐑𝐈 𝐕𝐀𝐇𝐄𝐈𝐍 𝐊𝐎 𝐀𝐏𝐍𝐄 𝐋𝐔𝐍𝐃 𝐏𝐑 𝐈𝐓𝐍𝐀 𝐉𝐇𝐔𝐋𝐀𝐀𝐔𝐍𝐆𝐀 𝐊𝐈 𝐉𝐇𝐔𝐋𝐓𝐄 𝐉𝐇𝐔𝐋𝐓𝐄 𝐇𝐈 𝐁𝐀𝐂𝐇𝐀 𝐏𝐀𝐈𝐃𝐀 𝐊𝐑 𝐃𝐄𝐆𝐈 💦💋",
-            "𝐆𝐀𝐋𝐈 𝐆𝐀𝐋𝐈 𝐌𝐄 𝐑𝐄𝐇𝐓𝐀 𝐇𝐄 𝐒𝐀𝐍𝐃 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐂𝐇𝐎𝐃 𝐃𝐀𝐋𝐀 𝐎𝐑 𝐁𝐀𝐍𝐀 𝐃𝐈𝐀 𝐑𝐀𝐍𝐃 🤤🤣",
-            "𝐒𝐀𝐁 𝐁𝐎𝐋𝐓𝐄 𝐌𝐔𝐉𝐇𝐊𝐎 𝐏𝐀𝐏𝐀 𝐊𝐘𝐎𝐔𝐍𝐊𝐈 𝐌𝐄𝐍𝐄 𝐁𝐀𝐍𝐀𝐃𝐈𝐀 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐏𝐑𝐄𝐆𝐍𝐄𝐍𝐓 🤣🤣",
-            "𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙇𝙀𝙏𝙄 𝙈𝙀𝙍𝙄 𝙇𝙐𝙉𝘿 𝘽𝘼𝘿𝙀 𝙈𝘼𝙎𝙏𝙄 𝙎𝙀 𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙆𝙊 𝙈𝙀𝙉𝙀 𝘾𝙃𝙊𝘿 𝘿𝘼𝙇𝘼 𝘽𝙊𝙃𝙊𝙏 𝙎𝘼𝙎𝙏𝙀 𝙎𝙀",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗖𝗛𝗔𝗡𝗚𝗘𝗦 𝗖𝗢𝗠𝗠𝗜𝗧 𝗞𝗥𝗨𝗚𝗔 𝗙𝗜𝗥 𝗧𝗘𝗥𝗜 𝗕𝗛𝗘𝗘𝗡 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗔𝗨𝗧𝗢𝗠𝗔𝗧𝗜𝗖𝗔𝗟𝗟𝗬 𝗨𝗣𝗗𝗔𝗧𝗘 𝗛𝗢𝗝𝗔𝗔𝗬𝗘𝗚𝗜🤖🙏🤔",
-            "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐀𝐊𝐈 𝐂𝐇𝐔𝐃𝐀𝐈 𝐊𝐎 𝐏𝐎𝐑𝐍𝐇𝐔𝐁.𝐂𝐎𝐌 𝐏𝐄 𝐔𝐏𝐋𝐎𝐀𝐃 𝐊𝐀𝐑𝐃𝐔𝐍𝐆𝐀 𝐒𝐔𝐀𝐑 𝐊𝐄 𝐂𝐇𝐎𝐃𝐄 🤣💋💦",
-            "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐆𝐀𝐀𝐍𝐃 𝐌𝐄𝐈 𝐎𝐍𝐄𝐏𝐋𝐔𝐒 𝐊𝐀 𝐖𝐑𝐀𝐏 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 𝟑𝟎𝐖 𝐇𝐈𝐆𝐇 𝐏𝐎𝐖𝐄𝐑 💥😂😎",
-            "𝐓𝐔𝐉𝐇𝐄 𝐀𝐁 𝐓𝐀𝐊 𝐍𝐀𝐇𝐈 𝐒𝐌𝐉𝐇 𝐀𝐘𝐀 𝐊𝐈 𝐌𝐀𝐈 𝐇𝐈 𝐇𝐔 𝐓𝐔𝐉𝐇𝐄 𝐏𝐀𝐈𝐃𝐀 𝐊𝐀𝐑𝐍𝐄 𝐖𝐀𝐋𝐀 𝐁𝐇𝐎𝐒𝐃𝐈𝐊𝐄𝐄 𝐀𝐏𝐍𝐈 𝐌𝐀𝐀 𝐒𝐄 𝐏𝐔𝐂𝐇 𝐑𝐀𝐍𝐃𝐈 𝐊𝐄 𝐁𝐀𝐂𝐇𝐄𝐄𝐄𝐄 🤩👊👤😍",
-            "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄𝐈 𝐀𝐏𝐏𝐋𝐄 𝐊𝐀 𝟏𝟖𝐖 𝐖𝐀𝐋𝐀 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 🔥🤩",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗢 𝗜𝗧𝗡𝗔 𝗖𝗛𝗢𝗗𝗨𝗡𝗚𝗔 𝗞𝗜 𝗦𝗔𝗣𝗡𝗘 𝗠𝗘𝗜 𝗕𝗛𝗜 𝗠𝗘𝗥𝗜 𝗖𝗛𝗨𝗗𝗔𝗜 𝗬𝗔𝗔𝗗 𝗞𝗔𝗥𝗘𝗚𝗜 𝗥Æ𝗡𝗗𝗜 🥳😍👊💥",
-            "𝙋𝘼𝙋𝘼 𝙆𝙄 𝙎𝙋𝙀𝙀𝘿 𝙈𝙏𝘾𝙃 𝙉𝙃𝙄 𝙃𝙊 𝙍𝙃𝙄 𝙆𝙔𝘼",
-            "𝙆𝙄𝙏𝙉𝙄 𝘾𝙃𝙊𝘿𝙐 𝙏𝙀𝙍𝙄 𝙈𝘼 𝘼𝘽 𝙊𝙍..",
-            "𝗧𝗘𝗥𝗜 𝗠𝗔𝗨𝗦𝗜 𝗞𝗘 𝗕𝗛𝗢𝗦𝗗𝗘 𝗠𝗘𝗜 𝗜𝗡𝗗𝗜𝗔𝗡 𝗥𝗔𝗜𝗟𝗪𝗔𝗬 🚂💥😂",
-            "𝙆𝙄𝙏𝙉𝙄 𝙂𝙇𝙄𝙔𝘼 𝙋𝘿𝙒𝙀𝙂𝘼 𝘼𝙋𝙉𝙄 𝙈𝘼 𝙆𝙊",
-            "𝗧𝗘𝗥𝗜 𝗜𝗧𝗘𝗠 𝗞𝗜 𝗚𝗔𝗔𝗡𝗗 𝗠𝗘 𝗟𝗨𝗡𝗗 𝗗𝗔𝗔𝗟𝗞𝗘,𝗧𝗘𝗥𝗘 𝗝𝗔𝗜𝗦𝗔 𝗘𝗞 𝗢𝗥 𝗡𝗜𝗞𝗔𝗔𝗟 𝗗𝗨𝗡𝗚𝗔 𝗠𝗔‌𝗔‌𝗗𝗔𝗥𝗖𝗛Ø𝗗🤘🏻🙌🏻☠️",
-            "2 𝙍𝙐𝙋𝘼𝙔 𝙆𝙄 𝙋𝙀𝙋𝙎𝙄 𝙏𝙀𝙍𝙄 𝙈𝙐𝙈𝙈𝙔 𝙎𝘼𝘽𝙎𝙀 𝙎𝙀𝙓𝙔 💋💦",
-            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐",
-            "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
-            "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
-            "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
-            "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
-            "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
-            "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
-            "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
-            "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
-            "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
-            "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
-            "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
-            "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
-            "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
-            "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
-            "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
-            "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
-            "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
-            "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
-            "🇮🇳 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ɴᴅɪᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇳",
-            "🇯🇵 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐉ᴀᴘᴀɴ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇯🇵",
-            "🇺🇸 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐒𝐀 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇺🇸",
-            "🇬🇧 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐊 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇬🇧",
-            "🇰🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐊ᴏʀᴇᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇰🇷",
-            "🇩🇪 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐆ᴇʀᴍᴀɴʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇩🇪",
-            "🇫🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐅ʀᴀɴᴄᴇ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇫🇷",
-            "🇮🇹 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ᴛᴀʟʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇹",
-            "🇧🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐁ʀᴀᴢɪʟ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇧🇷",
-            "🇨🇦 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐂ᴀɴᴀᴅᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇨🇦",
-            "𓂃˖˳·˖ ִֶָ ⋆🧡͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚🧡 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💛͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💛 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💚͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💚 ݁˖⭑.ᐟ",
-            "𓂃˖˳·˖ ִֶָ ⋆💙͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💙 ݁˖⭑.ᐟ",
-        ]
+            bar_texts = [
+                "★🆂★🅷★🅰★🅽★🆃 ★🅱★🅴★🆃★🅷 ★🅼★🅰★🅳★🆁★🅲★🅷★🅾★🅳 ★🆆★🆁★🅽★🅰 ★🅼★🅰★🅺★🅰★🅱★🅾★🆂★🅳★🅰 ★🆃★🅴★🅴★🆈.",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃..",
+        "★🅻★🆆★🅳★🅴 ★🅺★🅴 ★🅱★🅰★🅰★🅰★🅻★🅻★🅻 ★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🅲★🆄★🅳★🅺★🅴 ★🅿★🅶★🅻 ★🅳★🅴★🅺★🅷.",
+        "★🅼★🅰★🅲★🅷★🅰★🆁 ★🅺★🅸 ★🅹★🅷★🅰★🅰★🆃 ★🅺★🅴 ★🅱★🅰★🅰★🅰★🅻★🅻★🅻★🅻 ★🅲★🆄★🅳 ★🅰★🅲★🅷★🅴 ★🆂★🅴 ★🆈★🅷★🅰★🅿★🅴 ★🆃★🅤",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼 ★🅳★🆄 ★🆃★🅰★🅿★🅰 ★🆃★🅰★🅿?",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅷★🅽 ★🅰★🅱★🅰★🅱★🅴 ★🅱★🅳★🅸 ★🆁★🅰★🅽★🅳★🅸.",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅾★🅰★🅰★🅴 ★🅱★🅰★🅳★🅸 ★🆁★🅰★🅽★🅳★🅳★🅳★🅳★🅳",
+        "★🆃★🅴★🆁★🅰 ★🅱★🅰★🅰★🅿 ★🆁★🅰★🅽★🅳★🅸★🅱★🅰★🅰★🅾 ★🅴★🅈 ★🅳★🅴★🅺★🅷",
+        "★🅺★🅸★🆃★🅽★🅸 ★🅲★🅷★🅾★🅳★🆄 ★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅰★🅱 ★🅾★🆁..",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅲★🅷★🅾★🅳 ★🅳★🅸 ★🅷★🅼 ★🅽★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅴 ★🅱★🅴★🅴★🅻★🅰 ★🅱★🅽★🅴★🅶★🅰 ★🆁★🅾★🅰★🅳 ★🅿★🅴★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅴★🅺 ★🅳★🅰★🅼 ★🆃★🅾★🅿 ★🅱★🅴★🆇★🆈",
+        "★🅼★🅰★🅻★🆄★🅼 ★🅽★🅰 ★🅿★🅷★🆁 ★🅺★🅴★🅰★🅴 ★🅻★🅴★🆃★🅰 ★🅷★🆄 ★🅼 ★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🆃★🅰★🅿★🅰 ★🆃★🅰★🅿★🅿★🅿★🅿★🅿",
+        "★🅻★🆄★🅽★🅳 ★🅺★🅴 ★🅲★🅷★🅾★🅳★🅴 ★🆃★🅤 ★??★🅴★🆁★🅴★🅶★🅰 ★🆃★🆈★🅿★🅸★🅽★🅶 ★🅺★🆁★🅴★🅶★🅰 ★🆃★🅼★🅺★🅲",
+        "★🅱★🅴★🅱★🅳 ★🅿★🅺★🅳 ★🅻★🆆★🅳★🅴★🅴★🅴★🅴 ★🆆★🆁★🅽★🅰 ★🅼★🅴★🆁★🅰 ★🅻★🆄★🅽★🅳 ★🅿★🅺★🅳",
+        "★🅱★🅰★🅰★🅿 ★🅺★🅸 ★🅱★🅴★🅱★🅳 ★🅼★🆃★🅲★🅷 ★🅺★🆁★🆁★🆁",
+        "★🅻★🆆★🅳★🅰 ★🅻★🅴 ★🅼★🅴★🆁★🅰 ★🅹★🅰★🅻★🅳★🅸 ★🆂★🅴 ★🆃★🅤",
+        "★🅿★🅰★🅿★🅰 ★🅺★🅸 ★🅱★🅴★🅱★🅳 ★🅼★🆃★🅲★🅷 ★🅽★🅷★🅸 ★🅷★🅾 ★🆁★🅷★🅸 ★🅺★🆈★🅰 ★🆃★??★🆁★🅴★🆂★🅴",
+        "★🅰★🅻★🅴 ★🅰★🅻★🅴 ★🅼★🅴★🅻★🅰 ★🅱★🅲★🅷★🅰★🅰★🅰 ★🆃★🅴★🆁★🆈 ★🅼★🅰★🅺★🅰 ★🅱★🅾★🅂★🅳★🅰 ★🆂★🆄★🅽",
+        "★🅲★🅷★🆄★🅳 ★🅶★🆈★🅰 ★🆁★🅰★🅽★🅳★🅸★🅱★🅰★🅰★🅾 ★🅿★🅰★🅿★🅰 ★🅱★🅴★🅴★🅴 ★🆃★🅤",
+        "★🅼★🅴★🅽★🆄 ★🅺★🅸 ★🅿★🆃★🅰 ★🆃★🅴★🆁★🆈 ★🅼★🅰 ★🅲★🆄★🅳 ★🅶★🅰★🅸",
+        "★🅺★🅾★🅸 ★🅱★🅰★🅰★🆃 ★🅽★🅈 ★🅼★🅰★🅰 ★🆁★🅰★🅽★🅳★🆈 ★🆃★🅴★🆁★🆈",
+        "★🅷★🅰★🅷★🅰★🅷★🅰★🅰★🅰★🅰★🅰 ★🅼★🅰★🅺★🅰★🅱★🅾★🅂★🅳★🅰 ★🆃★🅴★🆁★🆈",
+        "★🆇★🅷★🆄★🅳 ★🅶★🅰★🅸 ★🅼★🅰★🅰 ★🆃★🅴★🆁★🆈 ★🅺★🅸★🅳★🅰★🅰★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅲★🅷★🆄★🅳 ★🅶★🆈★🅸 ★🅰★🅱 ★🅱★🅰★🆁 ★🅼★🆃 ★🅷★🅾★🅽★🅰",
+        "★🆈★🅴 ★🅻★🆄★🅽★🅳 ★🅻★🅴 ★🅼★🅴★🆁★🅰 ★🅲★🅷★🅻 ★🅹★🅰★🅻★🅳★🅸 ★🆂★🅴",
+        "★🅺★🅸★🅳★🅰★🅰★🅰 ★🅱★🅰★🆁 ★🅽★🅰 ★🅷★🅾 ★🆃★🅤 ★🅷★🅰★🅷★🅰★🅷★🅷",
+        "★🅱★🅷★🅴★🅽 ★🅺★🅴 ★🅻★🆆★🅳★🅴 ★🅱★🅷★🆁★🅼 ★🅺★🆁",
+        "★🅺★🅸★🆃★🅽★🅸 ★🅶★🅻★🅸★🅈★🅰 ★🅿★🅳★🆆★🅴★🅶★🅰 ★🅰★🅿★🅽★🅸 ★🅼★🅰 ★🅺★🅾",
+        "★🅲★🅷★🆄★🅿 ★🅽★🅰★🅻★🅻★🅸★🅸 ★🆁★🅰★🅽★🅳★🆈★🅺★🅴 ★🅻★🅰★🅳★🅺★🅴",
+        "★🅱★🅰★🅰★🆁 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅱★🅰★🅳★🅰★🅺 ★🅿★🅁 ★🅻★🅸★🆃★🅰★🅺★🅴 ★🅲★🅷★🅾★🅳 ★🅳★🆄★🅽★🅶★🅰 😂😆🤤",
+        "★🅰★🅱★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰 ★🅼★🅰★🅳★🅴★🆁★🅲★🅷★🅾★🅾★🅳 ★🅺★🆁 ★🅿★🅸★🅻★🅻★🅴 ★🅿★🅰★🅿★🅰 ★🅱★🅴★🅴 ★🅻★🅰★🅳★🅴★🅶★🅰 ★🆃★🅤 😼😂🤤",
+        "★🅶★🅰★🅻★🅸 ★🅶★🅰★🅻★🅸 ★🅽★🅴 ★🅱★🅷★🅾★🆁 ★🅷★🅴 ★🆃★🅴★??★🅸 ★🅼★🅰★🅰 ★🆁★🅰★🅽★🅳★🅸 ★🅲★🅷★🅾★🆁 ★🅷★🅴 💋💋💦",
+        "★🅰★🅱★🅴 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅾 ★🅲★🅷★🅾★🅳★🆄 ★🆁★🅰★🅽★🅳★🅸★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 ★🅺★🆄★🆃★🆃★🅴 ★🅺★🅴 ★🅲★🅷★🅾★🅳★🅴 😂👻🔥",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅰★🅸★🅱★🅴 ★🅲★🅷★🅾★🅳★🅰 ★🅰★🅸★🅱★🅴 ★🅲★🅷★🅾★🅳★🅰 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅰 ★🅱★🅴★🅳 ★🅿★🅴★🅷★🅸 ★🅼★🆄★🆃★🅷 ★🅳★🅸★🅰 💦💦💦💦",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅴 ★🅱★🅷★🅾★🅱★🅴★🅳★🅴 ★🅼★🅴 ★🅰★??★🅰★🅶 ★🅻★🅰★🅶★🅰★🅳★🅸★🅰 ★🅼★🅴★🆁★🅰 ★🅼★🅾★🆃★🅰 ★🅻★🆄★🅽★🅳 ★🅳★🅰★🅻★🅺★🅴 🔥🔥💦😆😆",
+        "★🆁★🅰★🅽★🅳★🅸★🅺★🅴 ★🅱★🅰★🅲★🅷★🅷★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅲★🅷★🅾★🅳★🆄 ★🅲★🅷★🅰★🅻 ★🅽★🅸★🅺★🅰★🅻",
+        "★🅺★🅸★🆃★🅽★🅰 ★🅲★🅷★🅾★🅳★🆄 ★🆃★🅴★🆁★🅸 ★🆁★🅰★🅽★🅳★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅰★🅱★🅱 ★🅰★🅿★🅽★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅾 ★🅱★🅷★🅴★🅹 😆👻🤤",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅾★🆃★🅾 ★🅲★🅷★🅾★🅳 ★🅲★🅷★🅾★🅳★🅺★🅴 ★🅿★🆄★🆁★🅰 ★🅱★🅰★🅰★🅳 ★🅳★🅸★🅰 ★🅲★🅷★🆄★🆃★🅷 ★🅰★🅱★🅱 ★??★🅴★🆁★🅸 ★🅶★🅱 ★🅺★🅾 ★🅱★🅷★🅴★🅹 😆💦🤤",
+        "★🆃★🅴★🆁★🅸 ★🅶★🅱 ★🅺★🅾 ★🅴★🆃★🅽★🅰 ★🅲★🅷★🅾★🅳★🅰 ★🅱★🅴★🅷★🅴★🅽 ★??★🅴 ★🅻★🅾★🅳★🅴 ★🆃★🅴★🆁★🅸 ★🅶★🅱 ★🆃★🅾 ★🅼★🅴★🆁★🅸 ★🆁★🅰★🅽★🅳★🅸 ★🅱★🅰★🅽★🅶★🅰★🆈★🅸 ★🅰★🅱★🅱 ★🅲★🅷★🅰★🅻 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅲★🅷★🅾★🅳★🆃★🅰 ★🅱★🅸★🆁★🅱★🅴 ♥️💦😆😆😆😆",
+        "★🅷★🅰★🆁★🅸 ★🅷★🅰★🆁★🅸 ★🅶★🅷★🅰★🅰★🅱 ★🅼★🅴 ★🅹★🅷★🅾★🅿★🅳★🅰 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰 🤣🤣💋💦",
+        "★🅲★🅷★🅰★🅻 ★🆃★🅴★🆁★🅴 ★🅱★🅰★🅰★🅿 ★🅺★🅾 ★🅱★🅷★🅴★🅹 ★🆃★🅴★🆁★🅰 ★🅱★🅰★🅱★🅺★🅰 ★🅽★🅷★🅸 ★🅷★🅴 ★🅿★🅰★🅿★🅰 ★🅱★🅴★🅴 ★🅻★🅰★🅳★🅴★🅶★🅰 ★🆃★🅤",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅼★🅴 ★🅱★🅾★🅼★🅱 ★🅳★🅰★🅻★🅺★🅴 ★🆄★🅳★🅰 ★🅳★🆄★🅽★🅶★🅰 ★🅼★🅰★🅰★🅺★🅴 ★🅻★🅰★🆆★🅳★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🆃★🆁★🅰★🅸★🅽 ★🅼★🅴 ★🅻★🅴★🅹★🅰★🅺★🅴 ★🆃★🅾★🅿 ★🅱★🅴★🅳 ★🅿★🅴 ★🅻★🅸★🆃★🅰★🅺★🅴 ★🅲★🅷★🅾★🅳 ★🅳★🆄★🅽★🅶★🅰 ★🅱★🅰★🅰★🆁 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 🤣🤣💋💋",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅴 ★🅽★🆄★🅳★🅴★🅰 ★🅶★🅾★🅾★🅶★🅻★🅴 ★🅿★🅴 ★🆄★🅿★🅻★🅾★🅰★🅳 ★🅺★🅰★🆁★🅳★🆄★🅽★🅶★🅰 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅴 ★🅻★🅰★🅴★🆆★🅳★🅴 👻🔥",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅴 ★🅽★🆄★🅳★🅴★🅰 ★🅶★🅾★🅾★🅶★🅻★🅴 ★🅿★🅴 ★🆄★🅿★🅻★🅾★🅰★🅳 ★🅺★🅰★🆁★🅳★🆄★🅽★🅶★🅰 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅴 ★🅻★🅰★🅴★🆆★🅳★🅴 👻🔥",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅾 ★🅲★🅷★🅾★🅳 ★??★🅷★🅾★🅳★🅺★🅴 ★🅱★🅰★🅽★🅰★🅺★🅴 ★🅱★🅸★🅳★🅴★🅾 ★🅱★🅰★🅽★🅰★🅺★🅴 ★🆇★🅽★🆇★🆇.★🅲★🅾★🅼 ★🅿★🅴 ★🅽★🅴★🅴★🅻★🅰★🅼 ★🅺★🅰★🆁★🅳★🆄★🅽★🅶★🅰 ★🅺★🆄★🆃★🆃★🅴 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 💦💋",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🅳★🅰★🅸 ★🅺★🅾 ★🅿★🅾★🆁★🅽★🅷★🆄★🅱.★🅲★🅾★🅼 ★🅿★🅴 ★🆄★🅿★🅻★🅾★🅰★🅳 ★🅺★🅰★🆁★🅳★🆄★🅽★🅶★🅰 ★🅱★🅰★🅰★🆁 ★🅺★🅴 ★🅲★🅷★🅾★🅳★🅴 🤣💋💦",
+        "★🅰★🅱★🅴 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅾 ★🅲★🅷★🅾★🅳★🆄 ★🆁★🅰★🅽★🅳★🅸★🅺★🅴 ★🅱★🅰★🅲★🅷★🅷★🅴 ★🆃★🅴★🆁★🅴★🅺★🅾 ★🅲★🅷★🅰★🅺★🅺★🅾 ★🅱★🅴★🅴 ★🅿★🅸★🅻★🆆★🅰★🆅★🆄★🅽★🅶★🅰 ★🆁★🅰★🅽★🅳★🅸★🅺★🅴 ★🅱★🅰★🅲★🅷★🅷★🅴 🤣🤣",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅱★🅰★🅰★🅳★🅺★🅴 ★🆁★🅰★🅺★🅳★🅸★🅰 ★🅼★🅰★🅰★🅺★🅴 ★🅻★🅾★🅳★🅴 ★🅹★🅰★🅰 ★🅰★🅱★🅱 ★🅱★🅸★🅻★🆆★🅰★🅻★🅴 👄👄",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅼★🅴 ★🅼★🅴★🆁★🅰 ★🅻★🆄★🅽★🅳 ★🅺★🅰★🅰★🅻★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅻★🅴★🆃★🅸 ★🅼★🅴★🆁★🅸 ★🅻★🆄★🅽★🅳 ★🅱★🅰★🅳★🅴 ★🅼★🅰★🅱★🅰★🅱★🅸 ★🅱★🅴★🅴 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅾 ★🅼★🅴★🅽★🅴 ★🅲★🅷★🅾★🅳 ★🅳★🅰★🅻★🅰 ★🅱★🅾★🅷★🅾★🆃 ★🅱★🅰★🅱★🆃★🅴 ★🅱★🅴★🅴",
+        "★🅱★🅴★🆃★🅴 ★🆃★🅤 ★🅱★🅰★🅰★🅿 ★🅱★🅴★🅴 ★🅻★🅴★🅶★🅰 ★🅿★🅰★🅽★🅶★🅰 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅰 ★🅺★🅾 ★🅲★🅷★🅾★🅳 ★🅳★🆄★🅽★🅶★🅰 ★🅺★🅰★🆁★🅺★🅴 ★🅽★🅰★🅽★🅶★🅰 💦💋",
+        "★🅷★🅰★🅷★🅰★🅷★🅰★🅷 ★🅼★🅴★🆁★🅴 ★🅱★🅴★🆃★🅴 ★🅰★🅶★🅻★🅸 ★🅱★🅰★🅰★🆁 ★🅰★🅿★🅽★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅻★🅴★🅺★🅴 ★🅰★🅰★🆈★🅰 ★🅼★🅰★🆃★🅷 ★🅺★🅰★🆃 ★🅾★🆁 ★🅼★🅴★🆁★🅴 ★🅼★🅾★🆃★🅴 ★🅻★🆄★🅽★🅳 ★🅱★🅴★🅴 ★🅲★🅷★🆄★🅳★🆆★🅰★🆈★🅰 ★🅼★🅰★🆃★🅷 ★🅺★🅰★🆁",
+        "★🅲★🅷★🅰★🅻 ★🅱★🅴★🆃★🅰 ★🆃★🆄★🅹★🅷★🅴 ★🅼★🅰★🅰★🅱 ★🅺★🅸★🅰 🤣★🆃★🅤 ★🅰★🅱★🅱 ★🅰★🅿★🅽★🅸 ★🅼★🅰★🅺★🅾 ★🅱★🅷★🅴★🅹",
+        "★🅱★🅷★🅰★🆁★🅰★🅼 ★🅺★🅰★🆁 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅳★🅰 ★🅺★🅸★🆃★🅽★🅰 ★🅶★🅰★🅰★??★🅸★🅰 ★🅱★🆄★🅽★🆆★🅰★🆈★🅴★🅶★🅰 ★🅰★🅿★🅽★🅸 ★🅼★🅰★🅰★🅰 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅴 ★🆄★🅿★🅴★🆁",
+        "★🅰★🅱★🅴 ★🆁★🅰★🅽★🅳★🅸★🅺★🅴 ★🅱★🅰★🅲★🅷★🅷★🅴 ★🅰★🆄★🅺★🅰★🆃 ★🅽★🅷★🅸 ★🅷★🅴★🆃★🅾 ★🅰★🅿★🅽★🅸 ★🆁★🅰★🅽★🅳★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅻★🅴★🅺★🅴 ★🅰★🅰★🆈★🅰 ★🅼★🅰★🆃★🅷 ★🅺★🅰★🆁 ★🅷★🅰★🅷★🅰★🅷★🅰★🅷★🅰",
+        "★🅺★🅸★🅳★🅾 ★🅼★🅰★🅳★🅰★🆁★🅲★🅷★🅾★🅳 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅲★🅷★🅾★?? ★🅲★🅷★🅾★🅳★🅺★🅴 ★🆃★🅴★🆁★🆁 ★🅻★🅸★🆈★🅴 ★🅱★🅷★🅰★🅸 ★🅳★🅴★🅳★🅸★🆈★🅰",
+        "★🅹★🆄★🅽★🅶★🅻★🅴 ★🅼★🅴 ★🅽★🅰★🅲★🅷★🆃★🅰 ★🅷★🅴 ★🅼★🅾★🆁★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🅳★🅰★🅸 ★🅳★🅴★🅺★🅺★🅴 ★🅱★🅰★🅱 ★🅱★🅾★🅻★🆃★🅴 ★🅾★🅽★🅲★🅴 ★🅼★🅾★🆁★🅴 ★🅾★🅽★🅲★🅴 ★🅼★🅾★🆁★🅴 🤣🤣💦💋",
+        "★🅶★🅰★??★🅸 ★🅶★🅰★🅻★🅸 ★🅼★🅴 ★🆁★🅴★🅷★🆃★🅰 ★🅷★🅴 ★🅱★🅰★🅽★🅳 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅲★🅷★🅾★🅳 ★🅳★🅰★🅻★🅰 ★🅾★🆁 ★🅱★🅰★🅽★🅰 ★🅳★🅸★🅰 ★🆁★🅰★🅽★🅳 🤤🤣",
+        "★🅱★🅰★🅱 ★🅱★🅾★🅻★🆃★🅴 ★🅼★🆄★🅹★🅷★🅺★🅾 ★🅿★🅰★🅿★🅰 ★🅲★🆈★🆄★🅺★🅸 ★🅼★🅴★🅽★🅴 ★🅺★🆁★🅳★🅸★🅰 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅿★🆁★🅴★🅶★🅽★🅴★🅽★🆃 🤣🤣",
+        "★🅱★🅰★🅰★🆁 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅼★🅴 ★🅱★🅰★🅰★🆁 ★🅺★🅰 ★🅻★🅾★🆄★🅳★🅰 ★🅾★🆁 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅼★🅴 ★🅼★🅴★🆁★🅰 ★🅻★🅾★🅳★🅰",
+        "★🅲★🅷★🅰★🅻 ★🅲★🅷★🅰★🅻 ★🆃★🅤 ★🅰★🅿★🅽★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🅲★🅷★🅸★🆈★🅰 ★🅳★🅸★🅺★🅰",
+        "★🅷★🅰★🅷★🅰★🅷★🅰★🅷★🅰 ★🅱★🅰★🅲★🅷★🅷★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅰★🅺★🅾 ★🅲★🅷★🅾★🅳 ★🅳★🅸★🅰 ★🅽★🅰★🅽★🅶★🅰 ★🅺★🅰★🆁★🅺★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅶★🅱 ★🅷★🅴 ★🅱★🅰★🅳★🅸 ★🅱★🅴★🆇★🆈 ★🆄★🅱★🅺★🅾 ★🅿★🅸★🅻★🅰★🅺★🅴 ★🅲★🅷★🅾★🅾★🅳★🅴★🅽★🅶★🅴 ★🅿★🅴★🅿★🅱★🅸",
+        "2 ★🆁★🆄★🅿★🅰★🆈 ★🅺★🅸 ★🅿★🅴★🅿★🅱★🅸 ★🆃★🅴★🆁★🅸 ★🅼★🆄★🅼★🅼★🆈 ★🅱★??★🅱★🅱★🅴 ★🅱★🅴★🆇★🆈 💋💦",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅲★🅷★🅴★🅴★🅼★🅱 ★🅱★🅴★🅴 ★🅲★🅷★🆄★🅳★🆆★🅰★🆅★🆄★🅽★🅶★🅰 ★🅼★🅰★🅳★🅴★🆁★🅲★🅷★🅾★🅾★🅳 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 💦🤣",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅼★🅴 ★🅼★🆄★🆃★🅷★🅺★🅴 ★🅱★🅰★🆁★🅰★🆁 ★🅷★🅾★🅹★🅰★🆅★🆄★🅽★🅶★🅰 ★🅷★🆄★🅸 ★🅷★🆄★🅸 ★🅷★🆄★🅸",
+        "★🅱★🅴★🅱★🅳 ★🅻★🅰★🅰★🅰 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅲★🅷★🅾★🅳★🆄 ★🆁★🅰★🅽★🅳★🅸★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 💋💦🤣",
+        "★🅰★🆁★🅴 ★🆁★🅴 ★🅼★🅴★🆁★🅴 ★🅱★🅴★🆃★🅴 ★🅲★🆈★🆄 ★🅱★🅴★🅱★🅳 ★🅿★🅰★🅺★🅰★🅳 ★🅽★🅰 ★🅿★🅰★🅰★🅰 ★🆁★🅰★🅷★🅰 ★🅰★🅿★🅽★🅴 ★🅱★🅰★🅰★🅿 ★🅺★🅰 ★🅷★🅰★🅷★🅰★🅷★🅰 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅲★🆄★🅳 ★🅶★🅰★🅸🤣🤣",
+        "★🅱★🆄★🅽 ★🅱★🆄★🅽 ★🅱★🅰★🅰★🆁 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 ★🅹★🅷★🅰★🅽★🆃★🅾 ★🅺★🅴 ★🅱★🅾★🆄★🅳★🅰★🅶★🅰★🆁 ★🅰★🅿★🅽★🅸 ★🅼★🆄★🅼★🅼★🆈 ★🅺★🅸 ★🅽★🆄★🅳★🅴★🅱 ★🅱★🅷★🅴★🅹",
+        "★🅰★🅱★🅴 ★🅱★🆄★🅽 ★🅻★🅾★🅳★🅴 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅳★🅰 ★🅱★🅰★🅰★🅳 ★🅳★🆄★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅺★🅷★🆄★🅻★🅴 ★🅱★🅰★🅹★🅰★🆁 ★🅼★🅴 ★🅲★🅷★🅾★🅳 ★🅳★🅰★🅻★🅰 🤣🤣💋",
+        "★🅱★🅷★🆁★🅼 ★🅺★🆁 ★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🅲★🆄★🅳 ★🅶★🅰★🅸 ★🆈★🅷★🅰",
+        "★🅼★🅴★🆁★🅴 ★🅻★🆄★🅽★🅳 ★🅺★🅴 ★🅱★🅰★🅰★🅰★🅰★🅻★🅻★🅻★🅻★🅻 ★🅿★🅺★🅳 ★🅹★🅰★🅻★🅳★🅸 ★🅱★🅴★🅴",
+        "★🆃★🅤 ★🅴★🅺 ★🅺★🅰★🅰★🅼 ★🅺★🆁 ★🅰★🅿★🅽★🅸 ★🅼★🅰 ★🅱★🅷★🅴★🅽 ★🅺★🅾 ★🅲★🆄★🅳★🆆★🅰 ★🅻★🅴 ★🅼★🅴★🆁★🅴 ★🅱★🆃★🅷",
+        "★🆁★🅽★🅳★🅸 ★🅺★🅴 ★🅻★🅳★🅺★🅴★🅴★🅴★🅴★🅴★🅴★🅴★🅴 ★🅲★🅷★🆄★🅿 ★🅾★🆁 ★🅲★🆄★🅳 ★🆈★🅷★🅰",
+        "★🅲★🅷★🆄★🅿 ★🆃★🅼★🅺★🅲 ★🅺★🅸★🅳★🅰★🅰★🅰★🅰★🅰★🅰★🅰★🅰★🅰★🅰★🅰★🅰★🅰",
+        "★🅰★🅿★🅽★🅸 ★🅶★🅰★🅰★🅽★🅳 ★🅼★🅴★🅸★🅽 ★🅼★🆄★🆃★🅷★🅸 ★🅳★🅰★🅰★🅻",
+        "★🅼★🅴★🆁★🅰 ★🅻★🆄★🅽★🅳 ★🅲★🅷★🅾★🅾★🅱 ★🅹★🅰★🅻★🅳★🅸 ★🅱★🅴★🅴",
+        "★🅰★🅿★🅽★🅸 ★🅼★🅰 ★🅺★🅾 ★🅲★🆄★🅱★🆆★🅰 ★🅼★🅴★🆁★🅰 ★🅻★🆄★🅽★🅳",
+        "★🅱★🅷★🅴★🅽 ★🅺★🅴 ★🅻★🅰★🆄★🅳★🅴 ★🆃★🅼★🅲",
+        "★🅱★🅷★🅴★🅽 ★🅺★🅴 ★🆃★🅰★🅺★🅺★🅴 ★🆃★🅼★🅻",
+        "★🅰★🅱★🅻★🅰 ★🆃★🅴★🆁★🅰 ★🅺★🅷★🅰★🅽 ★🅳★🅰★🅽 ★🅲★🅷★🅾★🅳★🅽★🅴 ★🅺★🅸 ★🅱★🅰★🆁★🅸★🅸",
+        "★🅱★🅴★🆃★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅱★🅰★🅱★🅱★🅴 ★🅱★🅳★🅸 ★🆁★🅰★🅽★🅳",
+        "★🅻★🆄★🅽★🅳 ★🅺★🅴 ★🅱★🅰★🅰★🅰★🅻 ★🅹★🅷★🅰★🆃 ★🅺★🅴 ★🅿★🅸★🅱★🅱★🅱★🆄★🆄★🆄★🆄★🆄★🆄 ★🆃★🅼★🅺★🅲",
+        "★🅻★🆄★🅽★🅳 ★🅿★🅴 ★🅻★🆃★🅺★🅸★🆃 ★🅼★🅰★🅰★🅻★🅻★🅻★🅻 ★🅺★🅸 ★🅱★🅾★🅽★🅳 ★🅷 ★🆃★🆄★??★🆄",
+        "★🅺★🅰★🅱★🅷 ★🅾★🅱 ★🅳★🅸★🅽 ★🅼★🆄★🆃★🅷 ★🅼★🆁★🅺★🅴 ★🅱★🅾★🅹★🆃★🅰 ★🅼 ★🆃★🅤 ★🅿★🅰★🅸★🅳★🅰 ★🅽★🅰 ★🅷★🅾★🆃★🅰★🅰",
+        "★🅶★🅻★🆃★🅸 ★🅺★🆁★🅳★🅸 ★🆃★🆄★🅹★🆆 ★🅿★🅰★🅸★🅳★🅰 ★🅺★🆁★🅺★🅴 ★🆃★🅴★🆁★🆈 ★🅼★🅰 ★🅽★🅴 ★🅰★🅱 ★🅲★🆄★🅳 ★🆃★🅤 ★🆈★🅷★🅰",
+        "★🅱★🅴★🅱★🅳 ★🅿★🅺★🅳★🅳★🅳",
+        "★🅶★🅰★🅰★🅽★🅳 ★🅼★🅰★🅸★🅽 ★🅻★🆆★🅳★🅰 ★🅳★🅰★🅻 ★🅻★🅴 ★🅰★🅿★🅽★🅸 ★🅼★🅴★🆁★🅰★🅰★🅰",
+        "★🅶★🅰★🅰★🅽★🅳 ★🅼★🅴★🅸★🅽 ★🅱★🅰★🅼★🅱★🆄 ★🅳★🅴★🅳★🆄★🅽★🅶★🅰★🅰★🅰★🅰★🅰",
+        "★🅶★🅰★🅽★🅳 ★🅱★🆃★🅸 ★🅺★🅴 ★🅱★🅰★🅻★🅺★🅺★🅺 ★🆃★🅤 ★🅲★🆄★🅳 ★🆈★🅷★🅰",
+        "★🅶★🅾★🆃★🅴 ★🅺★🅸★🆃★🅽★🅴 ★🅱★🅷★🅸 ★🅱★🅰★🅳★🅴 ★🅷★🅾, ★🅻★🆄★🅽★🅳 ★🅺★🅴 ★🅽★🅸★🅲★🅷★🅴 ★🅷★🅸 ★🆁★🅴★🅷★🆃★🅴 ★🅷★🅰",
+        "★🅷★🅰★🅾★??★🅰★🆁 ★🅻★🆄★🅽★🅳 ★🆃★🅴★🆁★🅸 ★🅶★🅰★🅰★🅽★🅳 ★🅼★🅰★🅸★🅽",
+        "★🅹★🅷★🅰★🅰★🅽★🆃 ★🅺★🅴 ★🅿★🅸★🅱★🅱★🆄 ★🆃★🅼★🅺★🅲 ★🅱★🆄★🅽",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅸 ★🅺★🅰★🅻★🅸 ★🅲★🅷★🆄★🆃",
+        "★🅺★🅷★🅾★🆃★🅴★🆈 ★🅺★🅸 ★🅰★🆄★??★🅳★🅰 ★🅴★🆈 ★🆃★🅤 ★🆁★🅰★🅽★🅳★🆈★🅺★🅴",
+        "★🅺★🆄★🆃★🆃★🅴 ★🅺★🅰 ★🅰★🆆★🅻★🅰★🆃 ★🅹★🅰★🅸★🅱★🅰 ★🅻★🅶 ★🆁★🅷★🅰 ★🆃★🅤",
+        "★🅺★🆄★🆃★🆃★🅴 ★🅺★🅸 ★🅹★🅰★🆃 ★🅹★🅰★🅸★🅱★🅰 ★🅴★🆈 ★🆃★🅤 ",
+        "★🅺★🆄★🆃★🆃★🅴 ★🅺★🅴 ★🆃★🅰★🆃★🆃★🅰 ★🅴★🆈 ★🆃★🅤",
+        "★🆃★🅴★🆃★🅸 ★🅼★🅰 ★🅺★🅸.★🅲★🅷★🆄★🆃 , ★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🆁★🅽★🅳★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸",
+        "★🅻★🅰★🆅★🅳★🅴 ★🅺★🅴 ★🅱★🅰★🅻 ★🅿★🅺★🅳 ★🅻★🅴 ★🅼★🅴★🆁★🅴",
+        "★🅼★🆄★🅷 ★🅼★🅴★🅸 ★🅻★🅴★🅻★🅴 ★🅼★🅴★🆁★🅰 ★🅻★🆄★🅽★🅳",
+        "★🅻★🆄★🅽★🅳 ★🅺★🅴 ★🅿★🅰★🅱★🅸★🅽★🅴 ★🅲★🅷★🆄★🅿 ★🅱★🅴★🆃★🅷 ★🅾★🆁 ★🅲★🆄★🅳",
+        "★🅼★🅴★🆁★🅴 ★🅻★🆆★🅳★🅴 ★🅺★🅴 ★🅱★🅰★🅰★🅰★🅰★🅻★🅻★🅻",
+        "★🅷★🅰★🅷★🅰★🅷★🅰★🅰★🅰★🅰★🅰★🅰 ★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🅲★🆄★🅳 ★🅶★🅰★🅸",
+        "★🆃★🅤 ★🅲★🅷★🆄★🅳 ★🅶★🆈★🅰★🅰★🅰★🅰",
+        "★🆁★🅰★🅽★🅳★🅸 ★🅺★🅷★🅰★🅽★🅴 ★🅺★🅸 ★🆄★🅻★🅰★🅳★🅳★🅳",
+        "★🅱★🅰★🅳★🅸 ★🅷★🆄★🅸 ★🅶★🅰★🅰★🅽★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅶★🅰★🅰★🅽★🅳 ★🅼★🅰★🅸★🅽 ★🅺★🆄★🆃★🅴 ★🅺★🅰 ★🅻★🆄★🅽★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃",
+        "★🆃★🅴★🆁★🅴 ★🅶★🅰★🅰★🅽★🅳 ★🅼★🅴★🅸★🅽 ★🅺★🅴★🅴★🅳★🅴 ★🅿★🅰★🅳★🅰★🆈",
+        "★🅽★🆈 ★🅽★🆈 ★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🆁★🅰★🅽★🅳★🅸",
+        "★🅱★🆄★🅽★🅽 ★🅼★🅰★🅳★🅴★🆁★🅲★🅷★🅾★🅳 ★🆃★🅼★🅻",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰",
+        "★🅱★🅴★🅷★🅴★🅽 ★🅺 ★🅻★🆄★🅽★🅳 ★🅲★🅷★🆄★🅿★🅲★🅷★🅰★🅿 ★🅲★🆄★🅳 ★🆈★🅷★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅰 ★🅲★🅷★🆄★🆃 ★🅺★🅸 ★🅲★🅷★🆃★🅽★🅸★🅸★🅸",
+        "★🅼★🅴★🆁★🅰 ★🅻★🅰★🆆★🅳★🅰 ★🅻★🅴★🅻★🅴 ★🆃★🅤 ★🅰★🅶★🅰★🆁 ★🅲★🅷★🅰★🅸★🆈★🅴 ★🆃★🅾★🅷",
+        "★🅲★🅷★🆄★🅿 ★🅶★🅰★🅰★🅽★🅳★🆄",
+        "★🅲★🅷★🆄★🅿 ★🅲★🅷★🆄★🆃★🅸★🆈★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅿★🅴 ★🅹★🅲★🅱 ★🅲★🅷★🅰★🅳★🅷★🅰★🅰 ★🅳★🆄★🅽★🅶★🅰",
+        "★🅱★🅰★🅼★🅹★🅷★🅰★🅰 ★🅻★🅰★🆆★🅳★🅴",
+        "★🆈★🅰 ★🅳★🆄 ★🆃★🅴★🆁★🅸 ★🅶★🅰★🅰★🅽★🅳 ★🅼★🅴 ★🆃★🅰★🅿★🅰★🅰 ★🆃★🅰★🅿",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅼★🅴★🆁★🅰 ★🆁★🅾★🅾 ★🅻★🅴★🆃★🅸 ★🅷★🅰★🅸",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅴 ★🅱★🅰★🅰★🆃★🅷 ★🅼★🅼★🅱 ★🅱★🅰★🅽★🅰★🅰 ★🅲★🅷★🆄★🅺★🅰 ★🅷★🆄",
+        "★🆃★🅤 ★🅲★🅷★🆄★🆃★🅸★🆈★🅰 ★🆃★🅴★🆁★🅰 ★🅺★🅷★🅰★🅽★🅳★🅰★🅰★🅽 ★🅲★🅷★🆄★🆃★🅸★🆈★🅰",
+        "★🅰★🆄★🆁 ★🅺★🅸★🆃★🅽★🅰 ★🅱★🅾★🅻★🆄 ★🅱★🅴★🆈 ★🅼★🅰★🅽★🅽 ★🅱★🅷★🅰★🆁 ★🅶★🅰★🆈★🅰 ★🅼★🅴★🆁★🅰",
+        "★🆃★🅴★🆁★🅸★🅸★🅸★🅸★🅸 ★🅼★🅰★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃★🆃★🆃 ★🅼★🅴 ★🅰★🅱★🅲★🅳 ★🅻★🅸★🅺★🅷 ★🅳★🆄★🅽★🅶★🅰 ★🅼★🅰★🅰 ★🅺★🅴 ★🅻★🅾★🅳★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅾 ★🅻★🅴★🅺★🅰★🆁 ★🅼★🅰★🅸 ★🅱★🅰★🆁★🅰★🆁",
+        "★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🆁★🅰★🅽★🅸★🅳★🅸★🅸",
+        "★🅲★🅷★🆄★🅿 ★🅱★🅰★🅲★🅷★🅴★🅴 ★🆃★🅼★🅺★🅲",
+        "★🆃★🅴★🆁★🆈 ★🅼★🅰★🅺★🅾★🅲★🅷★🅾★🅳★🆄",
+        "★🆁★🅰★🅽★🅳★🅸 ★🅼★🅰★🅰 ★🆃★🅴★🆁★🆈",
+        "★🆃★🅤 ★🆁★🅰★🅽★🅳★🅸 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅰 ★🅴★🆈",
+        "★🆃★🅴★🆁★🅸★🅸★🅸★🅸 ★🅼★🅰★🅰★🅰 ★🅺★🅾 ★🅱★🅷★🅴★🅹★🅹★🅹",
+        "★🆃★🅴★🆁★🅰★🅰 ★🅱★🅰★🅰★🅰★🅿 ★🅷★🆄",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🅴 ★🅷★🅰★🅰★🆃 ★🅳★🅰★🅰★🅻★🅻★🅺★🅴 ★🅱★🅷★🅰★🅰★🅶 ★🅹★🅰★🅰★🅽★🆄★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅾 ★🅱★🅰★🆁★🅰★🅺 ★🅿★🅴 ★🅻★🅴★??★🅰★🅰 ★🅳★🆄★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅾 ★🅶★🅱 ★🆁★🅾★🅰★🅳 ★🅿★🅴 ★🅻★🅴★🅹★🅰★🅺★🅴 ★🅱★🅴★🅲★🅷 ★🅳★🆄★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🅴★🅰 ★🅺★🅰★🅰★🅻★🅸 ★🅼★🅸★🆃★🅲★🅷",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅱★🅰★🅱★🆃★🅸 ★🆁★🅰★🅽★🅳★🅸 ★🅷★🅰★🅸",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🅴 ★🅺★🅰★🅱★🆄★🆃★🅰★🆁 ★🅳★🅰★🅰★🅻 ★🅺★🅴 ★🅱★🅾★🆄★🅿 ★🅱★🅰★🅽★🅰★🆄★🅽★🅶★🅰 ★🅼★🅰★??★🅰★🆁★🅲★🅷★🅾★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅰 ★🆁★🅰★🅽★🅳★🅸 ★🅷★🅰★🅸",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🅴 ★🅳★🅴★🆃★🅾★🅻 ★🅳★🅰★🅰★🅻 ★🅳★🆄★🅽★🅶★🅰 ★🅼★🅰★🅳★🅰★🆁★🅲★🅷★🅾★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅰★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🅴 ★🅻★🅰★🅿★🆃★🅾★🅿",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🆁★🅰★🅽★🅳★🅸 ★🅷★🅰★🅸",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅾 ★🅱★🅸★🅱★🆃★🅰★🆁 ★🅿★🅴 ★🅻★🅴★🆃★🅰★🅰★🅺★🅴 ★🅲★🅷★🅾★🅳★🆄★🅽★🅶★??",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅾 ★🅰★🅼★🅴★🆁★🅸★🅲★🅰 ★🅶★🅷★🆄★🅼★🅰★🆄★🅽★🅶★🅰 ★🅼★🅰★🅳★🅰★🆁★🅲★🅷★🅾★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🅴 ★🅽★🅰★🅰★🆁★🅸★🆈★🅰★🅻 ★🅿★🅷★🅾★🆁 ★🅳★🆄★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅴 ★🅶★🅰★🅽★🅳 ★🅼★🅴 ★🅳★🅴★🆃★🅾★🅻 ★🅳★🅰★🅰★🅻 ★🅳★🆄★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅰 ★🅺★🅾 ★🅷★🅾★🆁★🅻★🅸★🅲★🅺★🅱 ★🅿★🅸★🅻★🅰★🆄★🅽★🅶★🅰 ★🅼★🅰★🅳★🅰★🆁★🅲★🅷★🅾★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅾 ★🅱★🅰★🆁★🅰★🅺 ★🅿★🅴 ★🅻★🅴★🆃★🅰★🅰★🅰 ★🅳★🆄★🅽★🅶★🅰★🅰★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅰★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰",
+        "★🅼★🅴★🆁★🅰★🅰 ★🅻★🆄★🅽★🅳 ★🅿★🅰★🅺★🅰★🅳 ★🅻★🅴 ★🅼★🅰★🅳★🅰★🆁★🅲★🅷★🅾★🅳",
+        "★🅲★🅷★🆄★🅿 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅰★🅺★🅰★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰★🅰",
+        "★🆃★🅴★🆁★🅸★🅸 ★🅼★🅰★🅰 ★🅲★🅷★🆄★🅱 ★🅶★🅴★🆈★🅸 ★🅺★🆈★🅰★🅰 ★🅻★🅰★🆆★🅳★🅴★🅴★🅴",
+        "★🆃★🅴★🆁★🅸★🅸 ★🅼★🅰★🅰 ★🅺★🅰★🅰 ★🅱★🅹★🅱★🅾★🅳★🅰★🅰",
+        "★🅼★🅰★🅳★🅰★🆁★🅇★🅷★🅾★🅳★🅳★🅳",
+        "★🆃★🅴★🆁★🅸★🆄★🆄★🅸 ★🅼★🅰★🅰★🅰 ★🅺★🅰★🅰 ★🅱★🅷★🅱★🅾★🅳★🅰★🅰",
+        "★🆃★🅴★🆁★🅸★🅸★🅸★🅸★🅸 ★🅱★🅴★🅷★🅴★🅽★🅽★🅽 ★🅺★🅾 ★🅲★🅷★🅾★🅳★🅳★🅳★🆄★🆄★🆄★🆄 ★🅼★🅰★🅳★🅰★🆁★🅇★🅷★🅾★🅳★🅳★🅳★🅳",
+        "★🆃★🅤 ★🅽★🅸★🅺★🅰★🅻 ★🅼★🅰★🅳★🅰★🆁★🅲★🅷★🅾★🅳",
+        "★🅲★🅷★🆄★🅿 ★🆁★🅰★🅽★🅳★🅸 ★🅺★🅴 ★🅱★🅰★🅲★🅷★🅴",
+        "★🆃★🅴★🆁★🅰 ★🅼★🅰★🅰 ★🅼★🅴★🆁★🅸 ★🅹★🅰★🅰★🅽 ★🅴★🆈",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅰★🅱★🅴★🅽 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅾★🅿",
+        "★🅹★🅰★🅻★🅳★🅸 ★🅻★🅸★🅺★🅷 ★🆁★🅽★🅳★🆈★🅺★🅴 ★🅱★🅴★🅹",
+        "★🅾★🆁 ★🅱★🅳★🅰 ★🅻★🅸★🅺★🅷",
+        "★🅾★🆁 ★🅱★🅳★🅰",
+        "★🅾★🆁 ★🅱★🅳★🅰 ★🅾★🆈★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅰 ★🅱★🆄★🆁",
+        "★🅾★🆈★🅴 ★🅺★🅴★🅴★🅳★🅴",
+        "★🆁★🅰★🅽★🅳★🅸 ★🅺★🅴 ★🅻★🅰★🅳★🅺★🅴",
+        "★🅹★🅰★🅻★🅳★🅸 ★🅻★🅸★🅺★🅷 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅲★🅷★🅾★🅳★🆄",
+        "★🅼★🅺★🅻 ★🆄★🆃★🅷 ★🆁★🅰★🅽★🅳★🅸 ★🅺★🅴 ★🅱★🅰★🅲★🅲★🅷★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅽★🅰★🅽★🅸 ★🅼★🅴★🆁★🅸 ★🅼★🅰★🅰★🅻",
+        "★🆃★🅴★🅹 ★🅻★🅸★🅺★🅷 ★🆁★🅰★🅽★🅳★🅲★🅴",
+        "★🅾★🆈★🅴 ★🅼★🅰★🅰★🅺★🅴 ★🅻★🅾★🅳★🅴 ★🅼★🆁★🅴★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅲★🅷★🅾★🅳★🆈",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅸★🆈★🅰 ★🅺★🅸 ★🅶★🅰★🅽★🅳",
+        "★🆃★🅴★🆁★🆈 ★🅳★🅰★🅳★🅸 ★🅺★🅰 ★🅵★🆄★🅳★🅳★🅰",
+        "★🅼★🅺★🅻 ★🆄★🆃★🅷 ★🅱★🅴★🅷★🅴★🅽★🅲★🅾★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅱★🆄★🆁 ★🅳★🅴",
+        "★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🅺★🅰 ★🅵★🆄★🅳★🅳★🅰 ★🅼★🅴 ★🅻★🅰★🆄★🅳★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅲★🅷★🆄★🅳★🆅★🅰",
+        "★🆁★🅰★🅽★🅳★🅸 ★🅺★🅴 ★🅱★🅴★🆃★🅴 ★🅼★🅰★🆁 ★🅶★🅰★🆈★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🆁★🆄",
+        "★🅹★🅰★🅻★🅸★🅳 ★🅺★🆁 ★🆂★🅿★🅰★🅼",
+        "★🅼★🅲 ★🆂★🅿★🅰★🅼 ★🆁★🅾★🅺★🅴★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🆂★🅿★🅰★🅼 ★🅺★🆁",
+        "★🆂★🅿★🅰★🅼 ★🅺★🆁.★🅼★🅰★🅰★🅺★🅴 ★🅻★🅾★🅳★🅴",
+        "★🆁★🅽★🅸★🅳 ★🅺★🅴 ★🅲★🅷★🅾★🅳★🅴 ★🆂★🅿★🅰★🅼 ★🅺★🆁",
+        "★🆂★🅿★🅰★🅼 ★🅺★🆁 ★🅺★🅸★🅳",
+        "★🅽★🅾★🅾★🅱 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅲★🅷★🅾★🅳★🆄",
+        "★🆁★🅽★🅳★🅸 ★🅺★🅴 ★🅱★🅴★🆃★🅴",
+        "★🅽★🅾★🅾★🅱 ★🅹★🅰★🅻★🅳★🅸 ★🅻★🅸★🅺★🅷 ★🆆★🆁★🅽★🅰 ★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🆁★🅰★🅽★🅳",
+        "★🅲★🆄★🅳 ★🅶★🅰★🅸 ★🅼★🅰★🅰 ★🆃★🅴★🆁★🆈 ★🅽★🅾★🅾★🅱",
+        "★🆄★🆃★🅷 ★🆁★??★🅽★🅳★🆈★🅺★🅴 ★🅽★🅾★🅾★🅱",
+        "★🅲★🅷★🅻 ★🅲★🆄★🅳★🅺★🅴 ★🅳★🅸★🅺★🅷★🅰 ★🅽★🅾★🅾★🅱",
+        "★🅹★🅻★🅳★🅸 ★🆃★🆈★🅿 ★🅲★🆁 ★🅽★🅾★🅾★🅱 ★🅷★🅰★🅻★🅺★🅴",
+        "★🅲★🆄★🅳 ★🅺★🅴 ★🅿★🅶★🅻 ★🅽★🆈 ★🅷★🅾 ★🅽★🅾★🅾★🅱",
+        "★🅲★🆄★🅳 ★🅲★🆄★🅳 ★🅺★🅴 ★🆁★🅰★🅽★🅳 ★🅱★🅽★🅹★🅰 ★🆃★🅤 ★🅽★🅾★🅾★🅱",
+        "★🅼★🅰★🅺★🅸★🅲★🅷★🆄★🆃 ★🆃★🅴★🆁★🆈 ★🅽★🅾★🅾★🅱",
+        "★🅶★🅰★🅽★🅳★🅰 ★🅲★🆈★🆄 ★🅲★🆄★🅳 ★🆁★🅷★🅰 ★🆃★🆄 ?",
+        "★🅸★??★🅽★🅰 ★🅶★🅽★🅳★🅰 ★🅽★🆈 ★🅲★🆄★🅳 ★🅰★🅲★🅷★🅴 ★🆂★🅴 ★🅲★🆄★🅳",
+        "★🅼★🅰★🅰★🅽 ★🅻★🅴 ★🅲★🆄★🅳 ★🅶★🆈★🅰 ★🆃★🅤 ★🆂★🆄★🅽 ★🅱★🅰★🆃 ★🅰★🅱",
+        "★🅼★🅰★🅺★🅰★🅵★🆄★🅳★🅳★🅰 ★🅵★🅰★🆃 ★🅶★🆈★🅰 ★🆃★🅴★🆁★🆈 ★🆁★🆄★🅺",
+        
+    ]
+            gr_texts = [
+                """~~~~~ ~~~~~ ~~~~~ ~~~~~
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Pᴀɴɪ Kɪ Tᴀʀᴀʜ Cʜᴏᴅᴀ
+    ~~~~~ ~~~~~ ~~~~~ ~~~~~""",
+        """████████████████████████████
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴅᴀɪ Kɪ
+    ████████████████████████████
+        ✦ (🩷) ✦ (❤️) ✦ (🧡) ✦""",
+        """☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Zʜᴇʀ Dᴀʟᴀ
+    ☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️""",
+        """✦━━━━━━━━━━━━━━━━━━━━━━━✦
+        🥇 ZA Nᴇ 🥇
+        Tᴇʀɪ Mᴀᴀ Kᴏ Gᴏʟᴅ Cʜᴜᴅᴀɪ Dɪ
+    ✦━━━━━━━━━━━━━━━━━━━━━━━✦""",
+        """🗑️━━━━━━━━━━━━━━━━━🗑️
+        ║  ZA Nᴇ  ║
+        ║  Tᴇʀɪ Mᴀᴀ Kᴏ Kᴀᴄʀᴀ Bɴᴀʏᴀ ║
+    🗑️━━━━━━━━━━━━━━━━━🗑️""",
+        """☢️☢️☢️☢️☢️☢️☢️☢️☢️☢️
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴀ Bᴏsᴅᴀ Kʜᴏʟ Dɪʏᴀ
+    ☢️☢️☢️☢️☢️☢️☢️☢️☢️☢️""",
+        """🚀 Sᴘᴀᴄᴇ Mɪssɪᴏɴ: ZA
+    👨‍🚀 Cᴏᴍᴍᴀɴᴅᴇʀ: ZA
+    🌍 Tᴀʀɢᴇᴛ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    🌟 Mɪssɪᴏɴ: Cʜᴏᴅ ᴀɴᴅ Dᴇsᴛʀᴏʏ""",
+        """⏰ Tɪᴍᴇ: 3:00 AM
+    📍 Lᴏᴄᴀᴛɪᴏɴ: Tᴇʀɪ Mᴀᴀ Kᴇ Bʜᴏsᴅᴇ Mᴇ
+    👨 ZA Iɴ Aᴄᴛɪᴏɴ
+    🎬 Lɪᴠᴇ Sᴛʀᴇᴀᴍɪɴɢ...""",
+        """🌧️ Mᴀᴜsᴀᴍ: Bᴀʀɪsʜ
+    🌊 Lᴇᴠᴇʟ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bᴀᴅʜ
+    ⚡ ZA Nᴇ Bᴀɴᴅʜ Tᴏᴅᴀ""",
+        """📰 Bʀᴇᴀᴋɪɴɢ Nᴇᴡs!
+    🗞️ ZA Nᴇ Cʜᴏᴅᴀ
+    👑 Tʀᴇɴᴅɪɴɢ #1 Oɴ Tᴇʟᴇɢʀᴀᴍ
+    ⭐ ZA""",
+        """🎬 Mᴏᴠɪᴇ: ZA
+    🎭 Sᴛᴀʀʀɪɴɢ: ZA
+    🎟️ Rᴀᴛɪɴɢ: ⭐⭐⭐⭐⭐
+    🍿 Bᴏx Oғғɪᴄᴇ: Tᴇʀɪ Mᴀᴀ""",
+        """🎮 Gᴀᴍᴇ: ZA
+    👾 Pʟᴀʏᴇʀ: ZA
+    🏆 Lᴇᴠᴇʟ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    💀 Sᴄᴏʀᴇ: Iɴғɪɴɪᴛʏ""",
+        """📋 Mᴇɴᴜ Cᴀʀᴅ:
+    🍽️ Mᴀɪɴ Cᴏᴜʀsᴇ: Tᴇʀɪ Mᴀᴀ
+    🍜 Sɪᴅᴇ Dɪsʜ: Tᴇʀɪ Bʜᴇɴ
+    🍰 Dᴇssᴇʀᴛ: ZA Kᴀ Lᴜɴᴅ
+    💵 Pʀɪᴄᴇ: Fʀᴇᴇ Cʜᴜᴅᴀɪ""",
+        """🗺️ Nᴀᴠɪɢᴀᴛɪᴏɴ:
+    Sᴛᴀʀᴛ: ZA
+    Dᴇsᴛɪɴᴀᴛɪᴏɴ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    Dɪsᴛᴀɴᴄᴇ: 0 Mᴇᴛᴇʀs
+    ETA: Aʙʜɪ Cʜᴏᴅ Rʜᴀ Hᴜ""",
+        """🎵 Nᴏᴡ Pʟᴀʏɪɴɢ:
+    🎶 Tʀᴀᴄᴋ: ZA
+    🎤 Aʀᴛɪsᴛ: ZA
+    💿 Aʟʙᴜᴍ: ZA Sᴇʀɪᴇs
+    🔥 Vɪᴇᴡs: 69M""",
+        """🏏 Mᴀᴛᴄʜ: ZA Vs Tᴇʀɪ Mᴀᴀ
+    🏆 Wɪɴɴᴇʀ: ZA
+    📊 Sᴄᴏʀᴇ: Cʜᴏᴅ ᴏᴜᴛ
+    🔥 Mᴀɴ ᴏғ ᴛʜᴇ Mᴀᴛᴄʜ: Lᴜɴᴅ""",
+        """🏥 Rᴇᴘᴏʀᴛ:
+    Dᴏᴄᴛᴏʀ: ZA
+    Pᴀᴛɪᴇɴᴛ: Tᴇʀɪ Mᴀᴀ
+    Dɪᴀɢɴᴏsɪs: Cʜᴜᴛ Mᴇ Lᴜɴᴅ
+    Tʀᴇᴀᴛᴍᴇɴᴛ: Cʜᴏᴅɴᴀ""",
+        """🏫 Sᴄʜᴏᴏʟ: ZA Aᴄᴀᴅᴇᴍʏ
+    📚 Sᴜʙᴊᴇᴄᴛ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴅᴀɪ 101
+    👨‍🏫 Tᴇᴀᴄʜᴇʀ: ZA
+    ✅ Cʟᴀss: Iɴ Sᴇssɪᴏɴ""",
+        """🛒 Sʜᴏᴘᴘɪɴɢ Cᴀʀᴛ:
+    🛍️ Iᴛᴇᴍ: Tᴇʀɪ Mᴀᴀ
+    💰 Pʀɪᴄᴇ: Fʀᴇᴇ
+    🛒 Bᴏᴜɢʜᴛ Bʏ: ZA
+    📦 Sᴛᴀᴛᴜs: Cʜᴏᴅ Dɪʏᴀ""",
+        """🏨 Hᴏᴛᴇʟ: ZA Pᴀʟᴀᴄᴇ
+    🛏️ Rᴏᴏᴍ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    👤 Gᴜᴇsᴛ: ZA
+    ⭐ Rᴀᴛɪɴɢ: 5 Sᴛᴀʀs""",
+        """✈️ Fʟɪɢʜᴛ: ZA 101
+    🛫 Dᴇᴘᴀʀᴛᴜʀᴇ: ZA
+    🛬 Aʀʀɪᴠᴀʟ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    ⏰ Tɪᴍᴇ: Nᴏᴡ""",
+        """🚂 Tʀᴀɪɴ: ZA Exᴘʀᴇss
+    🚉 Sᴛᴀᴛɪᴏɴ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    👨‍✈️ Dʀɪᴠᴇʀ: ZA
+    🕒 Tɪᴍɪɴɢ: 24x7""",
+        """🍕 Rᴇsᴛᴀᴜʀᴀɴᴛ: ZA Bᴀᴢᴀᴀʀ
+    🍽️ Sᴘᴇᴄɪᴀʟ: Tᴇʀɪ Mᴀᴀ
+    👨‍🍳 Cʜᴇғ: ZA
+    🍴 Oʀᴅᴇʀ: Cʜᴏᴅ ᴀɴᴅ Gᴏ""",
+        """💪 Gʏᴍ: ZA Fɪᴛɴᴇss
+    🏋️ Tʀᴀɪɴᴇʀ: ZA
+    🎯 Tᴀʀɢᴇᴛ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    ✅ Rᴇsᴜʟᴛ: Pʜᴏᴏʟ Cʜᴏᴅ""",
+        """🎉 Pᴀʀᴛʏ: ZA Nɪɢʜᴛ
+    🕺 Hᴏsᴛ: ZA
+    💃 Gᴜᴇsᴛ: Tᴇʀɪ Mᴀᴀ
+    🎵 Sᴏɴɢ: Cʜᴏᴅ Tʜᴇ Fʟᴏᴏʀ""",
+        """🏛️ Mᴜsᴇᴜᴍ: ZA Hɪsᴛᴏʀʏ
+    🖼️ Exʜɪʙɪᴛ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    🎨 Aʀᴛɪsᴛ: ZA
+    📅 Dᴀᴛᴇ: Hᴀʀ Rᴏᴢ""",
+        """🦁 Zᴏᴏ: ZA Wᴏʀʟᴅ
+    🐯 Mᴀɪɴ Aᴛᴛʀᴀᴄᴛɪᴏɴ: Tᴇʀɪ Mᴀᴀ
+    🐺 Kᴇᴇᴘᴇʀ: ZA
+    🔥 Sʜᴏᴡ: Cʜᴏᴅᴜɴɢᴀ""",
+        """🎪 Cɪʀᴄᴜs: ZA Mᴀsᴛɪ
+    🤡 Cʟᴏᴡɴ: ZA
+    🎪 Sʜᴏᴡ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴅᴀɪ
+    🎟️ Tɪᴄᴋᴇᴛ: Fʀᴇᴇ""",
+        """📚 Lɪʙʀᴀʀʏ: ZA Bᴏᴏᴋs
+    📖 Bᴏᴏᴋ: ZA
+    ✍️ Aᴜᴛʜᴏʀ: ZA
+    📕 Cʜᴀᴘᴛᴇʀ: Cʜᴏᴅɴᴀ""",
+        """🌸 Gᴀʀᴅᴇɴ: ZA Fʟᴏᴡᴇʀs
+    🌹 Mᴀɪɴ Fʟᴏᴡᴇʀ: Tᴇʀɪ Mᴀᴀ
+    🌻 Gᴀʀᴅᴇɴᴇʀ: ZA
+    💧 Wᴀᴛᴇʀ: Lᴜɴᴅ Kᴀ Pᴀɴɪ""",
+        """🏖️ Bᴇᴀᴄʜ: ZA Sʜᴏʀᴇ
+    🌊 Wᴀᴠᴇs: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    🏄 Sᴜʀғᴇʀ: ZA
+    🌅 Tɪᴍᴇ: Sᴜɴsᴇᴛ Cʜᴏᴅ""",
+        """☕ Cᴏғғᴇᴇ Sʜᴏᴘ: ZA Cᴀғᴇ
+    🍵 Sᴘᴇᴄɪᴀʟ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    👨‍🍳 Bᴀʀɪsᴛᴀ: ZA
+    💦 Aᴅᴅɪᴛɪᴏɴ: Lᴜɴᴅ Kᴀ Cʀᴇᴀᴍ""",
+        """🎰 Cᴀsɪɴᴏ: ZA Pᴀʟᴀᴄᴇ
+    🃏 Gᴀᴍᴇ: Cʜᴏᴅ Tʜᴇ ZA
+    🎲 Bᴇᴛ: Tᴇʀɪ Mᴀᴀ
+    💰 Wɪɴɴᴇʀ: ZA""",
+        """🌙 Nɪɢʜᴛ Sʜᴏᴡ:
+    🌚 Mᴀɪɴ Aᴛᴛʀᴀᴄᴛɪᴏɴ: Tᴇʀɪ Mᴀᴀ
+    🌟 Hᴏsᴛ: ZA
+    💫 Pᴇʀғᴏʀᴍᴀɴᴄᴇ: Cʜᴏᴅɴᴀ""",
+        """🌋🌋🌋🌋🌋🌋🌋🌋
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Jᴡᴀʟᴀ Pʜᴏᴅɪ
+    🌋🌋🌋🌋🌋🌋🌋🌋""",
+        """🌊🌊🌊🌊🌊🌊🌊🌊
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Tᴏᴏғᴀɴ Lᴀʏᴀ
+    🌊🌊🌊🌊🌊🌊🌊🌊""",
+        """🌀🌀🌀🌀🌀🌀🌀🌀
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bʜᴜᴄʜᴀʟ Lᴀʏɪ
+    🌀🌀🌀🌀🌀🌀🌀🌀""",
+        """💻💻💻💻💻💻💻💻
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Cʏʙᴇʀ Cʜᴏᴅᴀ
+    💻💻💻💻💻💻💻💻""",
+        """🤖🤖🤖🤖🤖🤖🤖🤖
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Rᴏʙᴏᴛ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ
+    🤖🤖🤖🤖🤖🤖🤖🤖""",
+        """👽👽👽👽👽👽👽👽
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Aʟɪᴇɴ Gʜᴜsᴀʏᴀ
+    👽👽👽👽👽👽👽👽""",
+        """🐉🔥🐉🔥🐉🔥🐉🔥
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Dʀᴀɢᴏɴ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ
+    🐉🔥🐉🔥🐉🔥🐉🔥""",
+        """⚡🔨⚡🔨⚡🔨⚡🔨
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Tʜᴏʀ Kᴀ Hᴀᴍᴍᴇʀ Mᴀʀᴀ
+    ⚡🔨⚡🔨⚡🔨⚡🔨""",
+        """🦾💥🦾💥🦾💥🦾💥
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Iʀᴏɴ Mᴀɴ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ
+    🦾💥🦾💥🦾💥🦾💥""",
+        """💚💢💚💢💚💢💚💢
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Hᴜʟᴋ Sᴛʏʟᴇ Mᴇ Sᴍᴀsʜ Kɪʏᴀ
+    💚💢💚💢💚💢💚💢""",
+        """🕷️🕸️🕷️🕸️🕷️🕸️🕷️🕸️
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sᴘɪᴅᴇʀ Wᴇʙ Bɴᴀʏᴀ
+    🕷️🕸️🕷️🕸️🕷️🕸️🕷️🕸️""",
+        """🦇🌙🦇🌙🦇🌙🦇🌙
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Bᴀᴛᴍᴀɴ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ
+    🦇🌙🦇🌙🦇🌙🦇🌙""",
+        """🦸💫🦸💫🦸💫🦸💫
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Sᴜᴘᴇʀᴍᴀɴ Sᴛʏʟᴇ Mᴇ Uᴅᴀʏᴀ
+    🦸💫🦸💫🦸💫🦸💫""",
+        """🗡️💢🗡️💢🗡️💢🗡️💢
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Wᴏʟᴠᴇʀɪɴᴇ Cʟᴀᴡs Mᴀʀᴇ
+    🗡️💢🗡️💢🗡️💢🗡️💢""",
+        """🔥💀🔥💀🔥💀🔥💀
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Gʜᴏsᴛ Rɪᴅᴇʀ Gʜᴜsᴀʏᴀ
+    🔥💀🔥💀🔥💀🔥💀""",
+        """💀🔫💀🔫💀🔫💀🔫
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Pᴜɴɪsʜᴇʀ Dᴀʟᴀ
+    💀🔫💀🔫💀🔫💀🔫""",
+        """🦸🔫🦸🔫🦸🔫🦸🔫
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Dᴇᴀᴅᴘᴏᴏʟ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ
+    🦸🔫🦸🔫🦸🔫🦸🔫""",
+        """🖤👅🖤👅🖤👅🖤👅
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Vᴇɴᴏᴍ Gʜᴜsᴀʏᴀ
+    🖤👅🖤👅🖤👅🖤👅""",
+        """🃏💚🃏💚🃏💚🃏💚
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Jᴏᴋᴇʀ Kʜᴇʟᴀ
+    🃏💚🃏💚🃏💚🃏💚""",
+        """💕🔨💕🔨💕🔨💕🔨
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Hᴀʀʟᴇʏ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ
+    💕🔨💕🔨💕🔨💕🔨""",
+        """⚡💨⚡💨⚡💨⚡💨
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Fʟᴀsʜ Sᴘᴇᴇᴅ Dɪ
+    ⚡💨⚡💨⚡💨⚡💨""",
+        """🌊🔱🌊🔱🌊🔱🌊🔱
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Aǫᴜᴀᴍᴀɴ Gʜᴜsᴀʏᴀ
+    🌊🔱🌊🔱🌊🔱🌊🔱""",
+        """👁️💥👁️💥👁️💥👁️💥
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Cʏᴄʟᴏᴘs Bᴇᴀᴍ Mᴀʀᴀ
+    👁️💥👁️💥👁️💥👁️💥""",
+        """🧲💢🧲💢🧲💢🧲💢
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Mᴀɢɴᴇᴛᴏ Gʜᴜsᴀʏᴀ
+    🧲💢🧲💢🧲💢🧲💢""",
+        """🌩️⚡🌩️⚡🌩️⚡🌩️⚡
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sᴛᴏʀᴍ Lᴀʏᴀ
+    🌩️⚡🌩️⚡🌩️⚡🌩️⚡""",
+        """💋💢💋💢💋💢💋💢
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Rᴏɢᴜᴇ Kɪss Dɪ
+    💋💢💋💢💋💢💋💢""",
+        """🃏🔥🃏🔥🃏🔥🃏🔥
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Gᴀᴍʙɪᴛ Cᴀʀᴅs Dᴀʟᴇ
+    🃏🔥🃏🔥🃏🔥🃏🔥""",
+        """💨🌀💨🌀💨🌀💨🌀
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Nɪɢʜᴛᴄʀᴀᴡʟᴇʀ Gʜᴜsᴀʏᴀ
+    💨🌀💨🌀💨🌀💨🌀""",
+        """💙🌀💙🌀💙🌀💙🌀
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Mʏsᴛɪǫᴜᴇ Gʜᴜsᴀʏᴀ
+    💙🌀💙🌀💙🌀💙🌀""",
+        """🐾💢🐾💢🐾💢🐾💢
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bᴇᴀsᴛ Gʜᴜsᴀʏᴀ
+    🐾💢🐾💢🐾💢🐾💢""",
+        """❄️🧊❄️🧊❄️🧊❄️🧊
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Iᴄᴇᴍᴀɴ Gʜᴜsᴀʏᴀ
+    ❄️🧊❄️🧊❄️🧊❄️🧊""",
+        """🔥💥🔥💥🔥💥🔥💥
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Pʏʀᴏ Gʜᴜsᴀʏᴀ
+    🔥💥🔥💥🔥💥🔥💥""",
+        """🌑🌀🌑🌀🌑🌀🌑🌀
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sʜᴀᴅᴏᴡ Gʜᴜsᴀʏᴀ
+    🌑🌀🌑🌀🌑🌀🌑🌀""",
+        """🔥🦅🔥🦅🔥🦅🔥🦅
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Pʜᴏᴇɴɪx Fɪʀᴇ Dᴀʟɪ
+    🔥🦅🔥🦅🔥🦅🔥🦅""",
+        """🍔🍔🍔🍔🍔🍔🍔🍔🍔
+        ??   😋   🍔
+        🍔  🧀   🍔
+        🍔  🥩   🍔
+        🍔🍔🍔🍔🍔🍔🍔🍔🍔
+        
+        Tᴇʀɪ Mᴀᴀ Kᴏ Bᴜʀɢᴇʀ Bɴᴀᴋᴇ Kʜᴀʏᴀ""",
+        """🍕🍕🍕🍕🍕🍕🍕🍕
+        🍕  🍅  🍕
+        🍕  🧀  🍕
+        🍕  🍕  🍕
+        🍕🍕🍕🍕🍕🍕🍕🍕
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Pɪᴢᴢᴀ Dᴀʟᴀ""",
+        """🌮🌮🌮🌮🌮🌮🌮🌮
+        🌮  😋  🌮
+        🌮  🥩  🌮
+        🌮  🌮  🌮
+        🌮🌮🌮🌮🌮🌮🌮🌮
+        
+        Tᴇʀɪ Mᴀᴀ Kᴏ Tᴀᴄᴏ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ""",
+        """🍩🍩🍩🍩🍩🍩🍩🍩
+        🍩  😋  🍩
+        🍩  🍩  🍩
+        🍩  🍩  🍩
+        🍩🍩🍩🍩🍩🍩🍩🍩
+        
+        Tᴇʀɪ Mᴀᴀ Kᴏ Dᴏɴᴜᴛ Bɴᴀᴋᴇ Cʜᴏᴅᴀ""",
+        """☕☕☕☕☕☕☕☕
+        ☕  😋  ☕
+        ☕  ☕  ☕
+        ☕  ☕  ☕
+        ☕☕☕☕☕☕☕☕
+        
+        Tᴇʀɪ Mᴀᴀ Kᴏ Cᴏғғᴇᴇ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ""",
+        """👑👑👑👑👑👑👑👑
+        👑  😎  👑
+        👑  👑  👑
+        👑  👑  👑
+        👑👑👑👑👑👑👑👑
+        
+        ZA Nᴇ Tᴇʀɪ Mᴀᴀ Kᴏ Cʜᴏᴅᴀ""",
+        """💖💖💖💖💖💖💖💖
+        💖  😍  💖
+        💖  💖  💖
+        💖  💖  💖
+        💖💖💖💖💖💖💖💖
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Pʏᴀʀ""",
+        """💀💀💀💀💀💀💀💀
+        💀  😈  💀
+        💀  💀  💀
+        💀  💀  💀
+        💀💀💀💀💀💀💀💀
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴀʀ Gᴀʏɪ""",
+        """🔥🔥🔥🔥🔥🔥🔥🔥
+        🔥  😈  🔥
+        🔥  🔥  🔥
+        🔥  🔥  🔥
+        🔥🔥🔥🔥🔥🔥🔥🔥
+        
+        ZA Nᴇ Aᴀɢ Lɢᴀʏɪ""",
+        """👻👻👻👻👻👻👻👻
+        👻  😱  👻
+        👻  👻  👻
+        👻  👻  👻
+        👻👻👻👻👻👻👻👻
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Gʜᴏsᴛ""",
+        """🌈🌈🌈🌈🌈🌈🌈🌈
+        🌈  😋  🌈
+        🌈  🌈  🌈
+        🌈  🌈  🌈
+        🌈🌈🌈🌈🌈🌈🌈🌈
+        
+        Tᴇʀɪ Mᴀᴀ Kᴏ Rᴀɪɴʙᴏᴡ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ""",
+        """💣➖💣➖➖💣➖💣
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🔥             ✨
+                /    \\
+                💥    💥 
 
-        # ─── FUN RAIDS TEXT LISTS (Menu8) ──────────────────────────────────────
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bᴏᴍʙ Pʜᴏᴅᴜɴɢᴀ""",
+        """☢️➖☢️➖➖☢️➖☢️
+    🌟        \\         /          🌟
+    ⭐️          \\☠️/            ⭐️
+    ✨           💀             ✨
+                /    \\
+                🦴    🦴 
 
-        shayari_texts = [
-            "तेरी आँखों में खोया रहूँ, तू मिले तो ये जहाँ भूल जाऊँ। 💕",
-            "प्यार में क्या रखा है, बस तेरे बिना लगता है जीना भी सज़ा नहीं। 💔",
-            "चाँद से खूबसूरत है तेरा चेहरा, तू है तो दुनिया लगती है मेरी। 🌙",
-            "तेरी यादों में खोया रहूँ, हर सांस में तू बसी है। 💭",
-            "हर दिन तुझसे प्यार बढ़े, हर सांस तुझसे निभे। 💗",
-            "तेरी हँसी में जान है, तेरी बातों में पहचान है। 😊",
-            "तेरी बाहों में मिली राहत, तेरी आँखों में मिला सुकून। 🌹",
-            "तू है तो हर ग़म भूला, तू है तो ये दिल झूला। 🎠",
-            "हर रोज़ तुझसे प्यार हो, हर शाम तुझपे निसार हो। 🌅",
-            "तेरी मुस्कान है जादू, जो बिखेरे हर दिन बहार। 🌺",
-            "Your love is the poetry my heart always wanted to write. 📝💖",
-            "In a world full of trends, I want to remain your timeless classic. 🌟",
-            "You are the missing piece of my soul, the calm in my chaos. 🧩",
-            "Every love story is beautiful, but ours is my favorite chapter. 📖",
-            "You are the sun in my day, the moon in my night, and the stars in my dreams. 🌞🌙",
-            "Meeting you was fate, becoming your friend was a choice, but falling in love with you was beyond my control. 💫",
-            "I didn't choose you, my heart did. And it doesn't know how to unchoose. ❤️‍🔥",
-            "You are not just my love; you are my home. 🏠",
-            "Your smile is the best part of my day, and your laugh is my favorite sound. 😄🎶",
-            "You are my today and all of my tomorrows. 📅❤️",
-            "Teri smile dekh ke lagta hai, jaise mera wifi full signal pe aa gaya. 📶😄",
-            "Pyaar kya hai? Maine tujhse jaana, tera naam sunke hi dil ho jaata hai deewana. 🫀",
-            "Tu hai toh din hai, warna toh har pal hai night shift. 🌃",
-            "Dil ki baat kehni thi, bas yahi socha, tujhse milke samjha, pyaar kya hai bhai! 🥰",
-            "Teri ek smile pe, main de doon jaan bhi, par tu maange toh, de doon duniya bhi. 😄🌎",
-            "Chand se chura ke laaya hoon, teri muskaan, rakh lo dil mein, yeh hai meri jaan. 🌙💖",
-            "Tere bina dil hai veeran, tu aaja ve, dil ki yeh raah, hai bas teri hi ore. 🛤️💔",
-            "Pyaar ka sabak mila, tujhse hi yaar, ab toh bas tera hi hai, yeh dil bekarar. 🫀",
-            "Kya baat hai tujh mein, hai koi jaadu, dekhta hi rahu, na ho mera wajood. 👀✨",
-            "Tu hi meri subah, tu hi mera sukoon, tere bina toh jaise, khaali hai yeh khwabon ka jahoon. ☁️"
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Nᴜᴄʟᴇᴀʀ Aᴛᴛᴀᴄᴋ""",
+        """🐉➖🐉➖➖🐉➖🐉
+    🌟        \\         /          🌟
+    ⭐️          \\🔥/            ⭐️
+    ✨           🐲             ✨
+                /    \\
+                🔥    🔥 
 
-        rizz_texts = [
-            "क्या तुम सड़क हो? क्योंकि मैं हर दिन तुम्हें क्रॉस करना चाहता हूँ। 😏",
-            "तुम्हारी हँसी सुनकर लगता है जैसे मेरा दिन बन गया। 😄",
-            "तुम्हारी आँखों में खो जाऊँ तो वापस न आऊँ। 👀",
-            "क्या तुम्हारे पास कोई मैप है? क्योंकि मैं तुम्हारे दिल में खो गया हूँ। 🗺️",
-            "तुम बिना makeup के भी परफेक्ट हो – लेकिन मैं तो तुम्हें हर तरह से चाहता हूँ। 💋",
-            "मैं तुमसे प्यार नहीं करता – मैं तो तुम्हें worship करता हूँ। 🙌",
-            "तुम मेरे दिन की सबसे अच्छी notification हो। 🔔",
-            "तुम मेरे सबसे पसंदीदा गाने की धुन हो। 🎶",
-            "मैं तुम्हें चाँद से भी ऊपर रखता हूँ – क्योंकि तुम तो सूरज हो। ☀️",
-            "तुम मेरी रूह की तसल्ली हो – बस साथ रहो। 🕊️",
-            "Are you a magician? Because whenever I look at you, everyone else disappears. 🎩✨",
-            "Do you have a map? I keep getting lost in your eyes. 🗺️👀",
-            "Is your name Google? Because you have everything I'm searching for. 🔍💕",
-            "Are you a camera? Because every time I look at you, I smile. 📸😊",
-            "If beauty were a crime, you'd be serving a life sentence. ⛓️🔥",
-            "Do you believe in love at first sight, or should I walk by again? 🚶‍♂️🔄",
-            "Excuse me, but I think you dropped something – my jaw. 👇😮",
-            "Are you Wi-Fi? Because I'm feeling a connection. 📶❤️",
-            "If you were a vegetable, you'd be a cute-cumber! 🥒😉",
-            "You must be a 10 because you've got me feeling like a 1 with you. 1️⃣0️⃣",
-            "Tera naam kya hai? Kyunki mera plan hai tera baap banana! 😎👀",
-            "Kya tum Google ho? Kyunki mujhe tum mein woh sab milta hai jo main dhundh raha tha. 🔍💕",
-            "Tum toh mere WiFi jaisi ho, bina tumhare connection hi nahi aata. 📶😏",
-            "Kya tum chocolate ho? Kyunki main toh din raat tumhe kha sakta hoon. 🍫😋",
-            "Tumhari smile dekh ke lagta hai, mera din set aur raat forget. 🌞",
-            "Main driver nahi hoon, par tumhare dil ki steering le sakta hoon? 🚗💨",
-            "Kya tum Starbucks ho? Kyunki main har din tumhara naam pukaarna chahta hoon. ☕😄",
-            "Meri battery low hai, kya tum mere charger ban sakte ho? 🔋❤️",
-            "Kya tum doctor ho? Kyunki mera dil dekh ke toh tumne dhadkana sikha diya. 👨‍⚕️💓",
-            "Tumhari height kya hai? Kyunki lagta hai tum heaven se chhidi hui ho. 📏👼"
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Dʀᴀɢᴏɴ Gʜᴜsᴀʏᴀ""",
+        """👿➖👿➖➖👿➖👿
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           👹             ✨
+                /    \\
+                🔱    🔱 
 
-        pickup_texts = [
-            "क्या तुम्हारा नाम Google है? क्योंकि तुममें वो सब है जो मैं ढूंढ रहा हूँ। 🔍",
-            "तुम्हारी आँखें तारे हैं और मैं उनमें खो जाना चाहता हूँ। ✨",
-            "क्या तुम WiFi हो? क्योंकि मुझे तुमसे कनेक्शन महसूस हो रहा है। 📶",
-            "तुम्हारी मुस्कान देखकर मेरा दिन बन जाता है। 😊",
-            "क्या तुम चॉकलेट हो? क्योंकि मैं तुम्हें हर वक़्त खाना चाहता हूँ। 🍫",
-            "तुम्हारे बिना मेरी ज़िंदगी अधूरी है। 💔",
-            "तुम मेरे सपनों की रानी हो। 👑",
-            "तुम्हारी बातें सुनकर दिल खुश हो जाता है। 💕",
-            "क्या तुम मेरे साथ चलोगी? 🚶‍♀️",
-            "तुम मेरी दुनिया हो। 🌍",
-            "Are you a time traveler? Because I see you in my future. ⏳",
-            "Is your name Angel? Because you fell from heaven. 👼",
-            "Do you have a Band-Aid? Because I just scraped my knee falling for you. 🩹",
-            "Are you a magician? Because whenever I look at you, everyone else disappears. 🎩",
-            "Can I follow you home? Because my parents always told me to follow my dreams. 🏠",
-            "Are you French? Because Eiffel for you. 🗼",
-            "Is your name Google? Because you have everything I'm searching for. 🔍",
-            "You must be a 10 because you've got me feeling like a 1 with you. 1️⃣0️⃣",
-            "Roses are red, violets are blue, sugar is sweet, and so are you. 🌹",
-            "I must be a snowflake because I've fallen for you. ❄️",
-            "Tum toh mere WiFi jaisi ho, bina tumhare connection hi nahi aata. 📶",
-            "Kya tum chocolate ho? Kyunki main toh din raat tumhe kha sakta hoon. 🍫",
-            "Tumhari smile dekh ke lagta hai, mera din set aur raat forget. 🌞",
-            "Meri battery low hai, kya tum mere charger ban sakte ho? 🔋",
-            "Kya tum doctor ho? Kyunki mera dil dekh ke toh tumne dhadkana sikha diya. 👨‍⚕️",
-            "Tumhari aankhon mein pyaar hai ya paani, maine toh dooba marne ka plan banaya. 🏊",
-            "Mera DNA toh tumse match karta hai, kyunki main toh tumhara hi bana hoon. 🧬",
-            "Tumse milke lagta hai jaise, sach mein pyaar hota hai. 😅",
-            "Tum toh mere sapno ki rani ho. 👑",
-            "Tumhari baatein sunke lagta hai, jaise koi khwab ho. 💭"
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Dᴇᴍᴏɴ Gʜᴜsᴀʏᴀ""",
+        """💀➖💀➖➖💀➖💀
+    🌟        \\         /          🌟
+    ⭐️          \\☠️/            ⭐️
+    ✨           💀             ✨
+                /    \\
+                🦴    🦴 
 
-        romance_texts = [
-            "तेरी आँखों की गहराई में मेरी दुनिया बसी है। 💕",
-            "हर सांस में तू बसी है, तू ही मेरी हँसी है। 😊",
-            "चाँद से खूबसूरत है तेरा चेहरा। 🌙",
-            "तेरी यादों में खोया रहूँ। 💭",
-            "प्यार का हर लम्हा तेरे साथ जीया। 🥀",
-            "तेरे बिना ये दिल है बेक़रार। ❤️",
-            "हर दिन तुझसे प्यार बढ़े। 💗",
-            "तेरी हँसी में जान है। 😊",
-            "तेरी बाहों में मिली राहत। 🌹",
-            "तू है तो हर ग़म भूला। 🎠",
-            "You are the poetry my heart always wanted to write. 📝",
-            "In a world full of trends, I want to be your classic. 🌟",
-            "You are the missing piece of my soul. 🧩",
-            "Our love story is my favorite chapter. 📖",
-            "You are the sun in my day, the moon in my night. 🌞🌙",
-            "Falling in love with you was beyond my control. 💫",
-            "I didn't choose you, my heart did. ❤️‍🔥",
-            "You are not just my love; you are my home. 🏠",
-            "Your smile is the best part of my day. 😄",
-            "You are my today and all of my tomorrows. 📅",
-            "Teri smile dekh ke lagta hai, wifi full signal pe aa gaya. 📶",
-            "Pyaar kya hai? Maine tujhse jaana. 🫀",
-            "Tu hai toh din hai, warna toh har pal hai night shift. 🌃",
-            "Tujhse milke samjha, pyaar kya hai bhai! 🥰",
-            "Teri ek smile pe, de doon jaan bhi. 😄",
-            "Chand se chura ke laaya hoon, teri muskaan. 🌙",
-            "Tere bina dil hai veeran. 💔",
-            "Pyaar ka sabak mila, tujhse hi yaar. 🫀",
-            "Kya baat hai tujh mein, hai koi jaadu. 👀",
-            "Tu hi meri subah, tu hi mera sukoon. ☁️"
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴀʀ Gᴀʏɪ""",
+        """🔫➖🔫➖➖🔫➖🔫
+    🌟        \\         /          🌟
+    ⭐️          \\😎/            ⭐️
+    ✨           🎯             ✨
+                /    \\
+                💥    💥 
 
-        troll_texts = [
-            "Bhai tujhe dekh ke lagta hai troll ka mascot tu hai 😂",
-            "Ter personality ek sada hua pyaz jaisi hai — khole toh aansu aaye 🧅",
-            "Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟",
-            "Teri maa ne bhi socha hoga — yaar galti ho gayi 😹",
-            "Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂",
-            "Teri iq level calculator mein error aata hai 🧮",
-            "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
-            "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
-            "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
-            "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂",
-            "Your life is like a bad web series — flop in season 1 📺",
-            "Your personality is like a blank meme template — nothing 😂",
-            "You're so boring that even sleep runs away from you 😴",
-            "Your existence is proof that anyone can use the internet 📶",
-            "Your thinking is 2G speed in a 5G world 📡",
-            "Your life is a loading screen that never loads ⏳",
-            "You're the reason 'error' exists in the dictionary 📖",
-            "Your vibe check: FAILED 😂",
-            "You're irrelevant — even Google doesn't know you 🔍",
-            "You're a hero whose movie flopped in 3 minutes 🎬",
-            "Bhai tera swag Excel mein error hai — #NAME? 📊",
-            "Tu itna dheema hai ke kachhua bhi race jeet gaya 🐢",
-            "Teri thinking 2G speed pe chal rahi hai 📡",
-            "Beta tera ek message dekh ke aasman bhi sharma gaya ☁️",
-            "Bhai teri life ek loading screen hai — jo kabhi load nahi hoti ⏳",
-            "Ter maa ne tujhe chhoda nahi chhodni chahiye thi 😂",
-            "Beta tera existence proof hai ke koi bhi internet use kar sakta hai 📶",
-            "Bhai teri personality ek blank page hai — aur blank hi rahega 📄",
-            "Tu sirf chat mein hero hai real duniya mein zero 💻",
-            "Beta teri soch itni outdated hai ke floppy disk bhi reject kar de 💾",
-            "🤡 Bhai tujhe dekh ke lagta hai troll ka mascot tu hai 😂🔥",
-            "😹 Tu itna troll hai ke khud ko pata nahi 💀🤡",
-            "🤡 Teri baatein sun ke log seriously nahi lete — aur le bhi nahi chahiye 😂😹",
-            "😹 Beta tu internet ka troll #1 candidate hai 💀🤡",
-            "🤡 Tujhe real life mein bhi ignore karte honge log 😂🔥",
-            "😹 Bhai teri comments section mein sabne dislike diya 👎🤡",
-            "🤡 Tu troll karne ki koshish karta hai — khud troll bana rehta hai 😂💀",
-            "😹 Teri troll game weak hai — aur weak troll game bhi troll hai 🤡🔥",
-            "🤡 Beta jo tu sochta hai funny hai woh boring hai 😂😹",
-            "😹 Bhai tera troll skill level: tutorial mode pe stuck 🤡💀",
-            "🤡 Tu troll hai par original nahi — copy-paste troll 😂🔥",
-            "😹 Teri trolling se logon ko secondhand embarrassment hoti hai 🤡😂",
-            "🤡 Beta tujhe seriously lena — woh troll hoga apne aap pe 😹💀",
-            "😹 Bhai tera meme quality — delete worthy 🤡😂",
-            "🤡 Tu troll karta hai online — real duniya mein kaanta nahi milta 😹🔥",
-            "😹 Beta teri har post pe raat ko cry karta hai 🤡💀",
-            "🤡 Tujhe dekh ke pata chalta hai — internet access free nahi honi chahiye 😂😹",
-            "😹 Bhai teri troll attempt genuine cringe hai 🤡🔥",
-            "🤡 Tu troll ka wannabe version hai 😂💀",
-            "😹 Beta asli troll woh hota hai jise pata nahi woh troll hai — tu wahi hai 🤡😂",
-            "🤡 Bhai teri comments log copy karke dusron ko dikhate hain — example ke liye kya nahi karna chahiye 😹🔥",
-            "😹 Tu troll karta hai par khud hi jal jaata hai 🤡💀",
-            "🤡 Beta teri troll attempts fail hoti hain kyunki tujhe original hona chahiye 😂😹",
-            "😹 Bhai seriously — apni energy sahi jagah lagao 🤡🔥",
-            "🤡 Teri trolling mein timing nahi content nahi creativity nahi 😂💀",
-            "😹 Beta tu woh insaan hai jo khud ko troll king samjhta hai — aur paida hota hai troll ke neeche 🤡😂",
-            "🤡 Bhai tera troll fail isliye hota hai — genuine nahi hai 😹🔥",
-            "😹 Tu troll karta hai aur end mein rota hai — classic 🤡💀",
-            "🤡 Beta tujhe sun ke logon ko stress nahi hoti — pity hoti hai 😂😹",
-            "😹 Bhai teri troll quality inspect hua — returned as defective 🤡🔥",
-            "🤡 Tu original troll nahi — fan-made version hai 😂💀",
-            "😹 Beta teri trolling attempt mein best cheez — mujhe engage nahi karta 🤡😂",
-            "🤡 Bhai teri presence troll community ke liye embarrassment hai 😹🔥",
-            "😹 Tu troll karta hai aur log silent ho jaate hain — cringe se 🤡💀",
-            "🤡 Beta teri troll ka response — ignore — kyunki deserve nahi karta 😂😹",
-            "😹 Bhai tera troll skill tree mein sirf ek node hai — aur woh bhi locked hai 🤡🔥",
-            "🤡 Tu troll ka demo version hai — full version nahi aaya 😂💀",
-            "😹 Beta trolling seekh pehle phir aa — abhi tu syllabus mein nahi hai 🤡😂",
-            "🤡 Bhai teri baatein sun ke log empathy feel karte hain — tere liye 😹🔥",
-            "😹 Tu troll nahi — annoying hai — alag concept hai 🤡💀",
-            "🤡 Beta tera troll game 0/10 — ek baar apni chat history padh 😂😹",
-            "😹 Bhai tu sirf apna time barbad kar raha hai — mera nahi 🤡🔥",
-            "🤡 Teri troll attempt ek baar bhi hit nahi hui — streak: 0 😂💀",
-            "😹 Beta tera troll unprovoked aur uninspired tha 🤡😂",
-            "🤡 Bhai tu troll ke bhi standards neeche hai 😹🔥",
-            "😹 Teri trolling see aur feel karna — dono experience kharab hain 🤡💀",
-            "🤡 Beta teri troll ne sirf yeh prove kiya — tujhe better kaam dhundhna chahiye 😂😹",
-            "😹 Bhai troll mein skill hoti hai — teri mein nahi 🤡🔥",
-            "🤡 Tu troll hai aur tera troll bhi troll hai — recursion 😂💀",
-            "😹 Beta ek advice — yeh mat kar — seriously apni life mein focus kar 🤡😎",
-            "Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟",
-            "Teri maa ne bhi socha hoga — yaar galti ho gayi 😹",
-            "Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂",
-            "Teri iq level calculator mein error aata hai 🧮",
-            "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
-            "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
-            "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
-            "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂",
-            "Your life is like a bad web series — flop in season 1 📺",
-            "Your personality is like a blank meme template — nothing 😂",
-            "You're so boring that even sleep runs away from you 😴",
-            "Your existence is proof that anyone can use the internet 📶",
-            "Your thinking is 2G speed in a 5G world 📡",
-            "Your life is a loading screen that never loads ⏳",
-            "You're the reason 'error' exists in the dictionary 📖",
-            "Your vibe check: FAILED 😂",
-            "You're irrelevant — even Google doesn't know you 🔍",
-            "You're a hero whose movie flopped in 3 minutes 🎬",
-            "Bhai tera swag Excel mein error hai — #NAME? 📊",
-            "Tu itna dheema hai ke kachhua bhi race jeet gaya 🐢",
-            "Teri thinking 2G speed pe chal rahi hai 📡",
-            "Beta tera ek message dekh ke aasman bhi sharma gaya ☁️",
-            "Bhai teri life ek loading screen hai — jo kabhi load nahi hoti ⏳",
-            "Ter maa ne tujhe chhoda nahi chhodni chahiye thi 😂",
-            "Beta tera existence proof hai ke koi bhi internet use kar sakta hai 📶",
-            "Bhai teri personality ek blank page hai — aur blank hi rahega 📄",
-            "Tu sirf chat mein hero hai real duniya mein zero 💻",
-            "Beta teri soch itni outdated hai ke floppy disk bhi reject kar de 💾"
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Tᴀɴᴋ Gʜᴜsᴀʏᴀ""",
+        """⚔️➖⚔️➖➖⚔️➖⚔️
+    🌟        \\         /          🌟
+    ⭐️          \\🗡️/            ⭐️
+    ✨           ⚔️             ✨
+                /    \\
+                🩸    🩸 
 
-        ragebait_texts = [
-            "Bhai tera reaction dekh ke mujhe hasi aa rahi hai 😂",
-            "Tu itna triggered ho gaya, jaise meri baat teri maa ne sun li ho 😹",
-            "Rage bait pe itna emotional mat ho, beta 😂",
-            "Tu toh aisa gussa ho raha hai jaise teri team world cup haar gayi 🏏",
-            "Bhai shant ho ja, tera BP high ho jayega 😂",
-            "Teri gaali sun ke mujhe neend aa rahi hai 😴",
-            "Tu rage karta hai aur main popcorn kha raha hoon 🍿",
-            "Beta tu toh aisa hai jaise bina phone ke reh gaya ho 📱",
-            "Teri rage dekh ke lagta hai, teri gf ne break up kar diya 💔",
-            "Tu toh aisa hai jaise internet slow ho gaya ho 😂",
-            "Your rage is entertaining, please continue 😂",
-            "Getting triggered over this? That's cute 🥺",
-            "You're so angry, did someone steal your Wi-Fi? 📶",
-            "Rage bait level: professional 😂",
-            "Your anger is my daily dose of comedy 🤡",
-            "Calm down, it's just a message 📩",
-            "You're acting like I insulted your whole bloodline 😂",
-            "The rage is real, and it's hilarious 😭",
-            "You need a therapist for that anger issues 🧠",
-            "I love how easy it is to get you triggered 😈",
-            "Bhai tera reaction dekh ke mujhe hasi aa rahi hai 😂",
-            "Tu itna triggered ho gaya, jaise maine teri game delete kar di ho 🎮",
-            "Rage bait pe itna emotional mat ho, beta 😂",
-            "Tu toh aisa gussa ho raha hai jaise teri team haar gayi 🏏",
-            "Bhai shant ho ja, tera BP high ho jayega 😂",
-            "Teri gaali sun ke mujhe neend aa rahi hai 😴",
-            "Tu rage karta hai aur main popcorn kha raha hoon 🍿",
-            "Beta tu toh aisa hai jaise bina phone ke reh gaya ho 📱",
-            "Teri rage dekh ke lagta hai, teri gf ne break up kar diya 💔",
-            "Tu toh aisa hai jaise internet slow ho gaya ho 😂"
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sᴡᴏʀᴅ Gʜᴜsᴀʏᴀ""",
+        """🐍➖🐍➖➖🐍➖🐍
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🐍             ✨
+                /    \\
+                ☠️    ☠️ 
 
-        roast_texts = [
-            "Ter life ek bakwas webseries ki tarah hai — 1 season mein flop 😂",
-            "Bhai teri personality ek sada hua pyaz jaisi hai 🧅",
-            "Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟",
-            "Teri maa ne bhi socha hoga — yaar galti ho gayi 😹",
-            "Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂",
-            "Teri iq level calculator mein error aata hai 🧮",
-            "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
-            "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
-            "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
-            "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂",
-            "Your life is a joke, and not even a funny one 😂",
-            "You're so irrelevant, even your shadow leaves you 🏃",
-            "Ter life ek bakwas webseries ki tarah hai — 1 season mein flop 😂",
-            "Bhai teri personality ek sada hua pyaz jaisi hai 🧅",
-            "Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟",
-            "Teri maa ne bhi socha hoga — yaar galti ho gayi 😹",
-            "Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂",
-            "Teri iq level calculator mein error aata hai 🧮",
-            "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
-            "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
-            "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
-            "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂",
-            "Your life is a joke, and not even a funny one 😂",
-            "You're so irrelevant, even your shadow leaves you 🏃",
-            "Your existence is a notification I always swipe away 📱",
-            "You're like a software update — always annoying and never useful 💻",
-            "Your brain is like a browser with 100 tabs open — all useless 🌐",
-            "You're the human equivalent of a loading screen ⏳",
-            "Your personality is like a broken pencil — pointless ✏️",
-            "You're not stupid, you just have bad luck thinking 🤔",
-            "You're the reason God created jokes 😂",
-            "Your life is a meme, and not a good one 🗿",
-            "Bhai teri zindagi ek bakwas webseries jaisi hai 📺",
-            "Teri personality ek sada hua pyaz jaisi hai — khole toh aansu aaye 🧅",
-            "Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟",
-            "Teri maa ne bhi socha hoga — yaar galti ho gayi 😹",
-            "Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂",
-            "Teri iq level calculator mein error aata hai 🧮",
-            "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
-            "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
-            "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
-            "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂",
-            "🔥 Teri zindagi ek bakwas webseries ki tarah hai — 1 season mein flop 😂📺",
-            "🤣 Bhai teri personality ek sada hua pyaz jaisi hai — khole toh aansu aaye 🧅💀",
-            "😹 Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟😂",
-            "🔥 Teri maa ne bhi socha hoga — yaar galti ho gayi 😹👶",
-            "🤣 Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂💀",
-            "😹 Beta tu Google Maps pe search kare toh bhi worthless aayega 🗺️😈",
-            "🔥 Teri iq level negative hai — calculator mein error aata hai 🧮😂",
-            "🤣 Tu chhata hua papad hai — touch karte hi toot gaya 😹🔥",
-            "😹 Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞😂",
-            "🔥 Teri personality dekh ke AI bhi depressed ho gaya hoga 🤖😹",
-            "🤣 Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂💀",
-            "😹 Bhai teri soch utni hi purani hai jitna tera Nokia phone 📱😂",
-            "🔥 Tera existence mere life mein irrelevant hai — bilkul sarkari kaam jaisa 📋😹",
-            "🤣 Tu itna boring hai ke neend khud aa jaaye tujhe dekh ke 😴😂",
-            "😹 Teri profile pic dekh ke emoji wale bhi sue kar sakte hain 😱🔥",
-            "🔥 Bhai tu aisa player hai jo kabhi goal nahi kar sakta apni hi team ke khilaf 😂⚽",
-            "🤣 Teri advice sunna waisa hai jaise sade kele se rasta poochna 🍌😹",
-            "😹 Tu garib nahi hai — but tujhe dekh ke gareebi ko takleef hoti hai 💰😂",
-            "🔥 Teri kismat itni kharab hai ke lottery ticket bhi teri traf nahi dekhti 🎫😹",
-            "🤣 Bhai tera sense of humor graveyard se udhaara liya hai kya 🪦😂",
-            "😹 Tu itna irrelevant hai ke khud Google bhi nahi jaanta tera naam 🔍🔥",
-            "🔥 Teri body language bolta hai — main hara hua insaan hoon 😂💀",
-            "🤣 Tu ek hi baar funny tha — jab tune mujhe seriously liya 😹⚡",
-            "😹 Bhai teri achievements list mein sirf ek cheez hai — exist karna 😂🔥",
-            "🔥 Tujhe dekh ke lagta hai — nature ne mistake ki thi 🌿😹",
-            "🤣 Teri skills dekh ke Thanos bhi bola hoga — yeh toh automatically wipe ho jaayega 💀😂",
-            "😹 Beta tera future itna dark hai ke sunglasses pehenne ki zaroorat nahi 🕶️🔥",
-            "🔥 Teri batting dekh ke khud pitch ne sorry bola 🏏😂",
-            "🤣 Bhai tu aisa idea hai jo meeting mein sab ignore karte hain 📊😹",
-            "😹 Teri zubaan aur dimag mein kabhi meetup nahi hota 🧠💬😂",
-            "🔥 Tu aisa hero hai jiska movie 3 minutes mein flop ho gayi 🎬😹",
-            "🤣 Teri gaali sunne ke baad dushmano ne mafi maang li 😂⚔️",
-            "😹 Bhai tera swag level Excel mein error hai — #NAME? 📊🔥",
-            "🔥 Tu itna dheema hai ke kachhua bhi race jeet gaya 🐢😂",
-            "🤣 Teri thinking 2G speed pe chal rahi hai duniya 5G mein hai 📡😹",
-            "😹 Beta tera ek message dekh ke aasman bhi sharma gaya ☁️😂",
-            "🔥 Bhai teri life ek loading screen hai — jo kabhi load nahi hoti ⏳😹",
-            "🤣 Tu aisa mirror hai jo galat reflection dikhata hai 🪞😂",
-            "😹 Teri maa ne tujhe chhoda nahi chhodni chahiye thi 😂🔥",
-            "🔥 Beta tera existence proof hai ke koi bhi internet use kar sakta hai 📶😹",
-            "🤣 Tujhe dekh ke lagta hai — maa baap ne education mein invest nahi kiya 📚😂",
-            "😹 Teri personality ek blank page hai — aur blank hi rahega 📄🔥",
-            "🔥 Tu sirf chat mein hero hai real duniya mein zero 💻😂",
-            "🤣 Bhai teri jawab dene ki speed se tortoise bhi impress nahi 🐢😹",
-            "😹 Teri soch itni outdated hai ke floppy disk bhi reject kar de 💾😂",
-            "🔥 Tu aisa WiFi password hai jo koi yaad nahi rakhta 🔑😹",
-            "🤣 Beta teri awaaz sunne ke baad mujhe silence zyada priceless laga 🤫😂",
-            "😹 Bhai tera roast karna waisa hai jaise sadi hui vegetable ko season karna 🥦🔥",
-            "🔥 Teri social skills dekh ke chatbot bhi impress ho ga",
-            "Your existence is a notification I always swipe away 📱",
-            "You're like a software update — always annoying and never useful 💻",
-            "Your brain is like a browser with 100 tabs open — all useless 🌐",
-            "You're the human equivalent of a loading screen ⏳",
-            "Your personality is like a broken pencil — pointless ✏️",
-            "You're not stupid, you just have bad luck thinking 🤔",
-            "You're the reason God created jokes 😂",
-            "Your life is a meme, and not a good one 🗿",
-            "Bhai teri zindagi ek bakwas webseries jaisi hai 📺",
-            "Teri personality ek sada hua pyaz jaisi hai — khole toh aansu aaye 🧅",
-            "Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟",
-            "Teri maa ne bhi socha hoga — yaar galti ho gayi 😹",
-            "Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂",
-            "Teri iq level calculator mein error aata hai 🧮",
-            "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
-            "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
-            "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
-            "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂"
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Vɪᴘᴇʀ Gʜᴜsᴀʏᴀ""",
+        """🦂➖🦂➖➖🦂➖🦂
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🦂             ✨
+                /    \\
+                ☠️    ☠️ 
 
-        # ─── NON-ABUSIVE RAID TEXTS (Menu9) ────────────────────────────────────
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sᴄᴏʀᴘɪᴏɴ Gʜᴜsᴀʏᴀ""",
+        """🐦‍⬛➖🐦‍⬛➖➖🐦‍⬛➖🐦‍⬛
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🖤             ✨
+                /    \\
+                🪶    🪶 
 
-        attack_texts = [
-            "🗡️ Tera baap aaya hai sunta nahi kya 👑😈",
-            "⚡ Mere saamne aake dikhao himmat hai toh 😎💪",
-            "🔥 Attack mode on — teri khair nahi aaj 😡⚔️",
-            "💀 Tujhe itna marunga ke teri maa bhi nahi pehchanegi 😂🔥",
-            "💥 Beta ye territory meri hai nikal yahan se 🏴‍☠️⚡",
-            "🗡️ Aukaat hai toh saamne aa nahi toh chup baith 😈💀",
-            "⚡ Tu keyboard warrior hai asli mard nahi 😂👊",
-            "🔥 Teri maa ne bhi bola tera baap chahiye 😹💔",
-            "💥 Chal hat yahan se chota baccha 🤣👋",
-            "⚔️ Mujhe gaali de ke dekh kya hoga teri life mein 😈⚡",
-            "💀 Bhai seedha bol de surrender karega ya maar khayega 😎🔥",
-            "🗡️ Attack karta hoon toh block nahi hoga tera 😡⚔️",
-            "⚡ Yeh game mein nahi real life mein bhi kaatenge tujhe 💪😤",
-            "🔥 Tera confidence dekh ke hansi aati hai yaar 😂💥",
-            "💥 Andha hai ya dikhta nahi kaun boss hai yahan 👑⚔️",
-            "⚔️ Teri har gaali pe 10 gaaliyan waapis aayengi 😈🔥",
-            "💀 Beta peeth nahi dikhana mujhe — coward 🏃‍♂️😂",
-            "🗡️ Lad le ek baar — guarantee hai rota hoga tu 😹⚡",
-            "⚡ Keyboard tod ke aa toh baat karte hain 💥👊",
-            "🔥 Teri bhasha se pata chalta hai ghar mein parhe nahi 😂🤣",
-            "⚔️ Main yahan hoon — tu kahan chhupta hai aaja 😎💀",
-            "💀 Teri har move ka jawab taiyaar hai mere paas 🎯🔥",
-            "🗡️ Tu sirf darta hai asli attack nahi kar sakta 😂⚡",
-            "⚡ Baahubali nahi hai tu yahan — chal nikal 👋💥",
-            "🔥 Teri aukaat utni hai jitni do takke ki 😹🗡️",
-            "💥 Attack aur reaction — dono mein haar jayega tu ⚔️😎",
-            "⚔️ Ek baar aake dekh kya hota hai tere saath 💀🔥",
-            "💀 Sher ke saamne bakra nahi ban — phir bhi ban raha 😂⚡",
-            "🗡️ Yeh teri territory nahi bhai — haath jod ke ja 🙏😈",
-            "⚡ Tu attack karega aur main finish karunga 💥⚔️",
-            "🔥 Teri himmat hai toh mujhse seedha baat kar 😤💀",
-            "💥 Keyboard pe hero ban raha hai — asli duniya mein zero 😂🗡️",
-            "⚔️ Maar kha aur phir rota mat — warning hai 😈⚡",
-            "💀 Teri speed se faster hoon main — bhaag nahi sakta 🔥💥",
-            "🗡️ Yaar teri life mein koi nahi kya isliye yahan ata hai 😂⚔️",
-            "⚡ Hero mat ban — yahan real khiladi baithe hain 👑💀",
-            "🔥 Attack kiya — ab lash uthane ki taiyaari kar 😹⚡",
-            "⚔️ Teri har galti ka hisaab hoga — ruk 😈🔥",
-            "💀 Bhai attack se pehle 1% dimag use kar 🧠💥",
-            "🗡️ Chal hat nahi toh main khud hataunga isko 😤⚡",
-            "⚡ Yeh war hai — aur tu already haar gaya 😎🔥",
-            "🔥 Teri maa bhi tera lecture sunke bore ho gayi hogi 😹💥",
-            "💥 Main attack mein vishwas nahi karta — main finish mein karta hoon ⚔️😈",
-            "⚔️ Chal randike ek baar try kar le — rona mat baad mein 😂💀",
-            "💀 Ab samjha kya hua? No? Toh phir ek aur attack 🔥⚡",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Rᴀᴠᴇɴ Gʜᴜsᴀʏᴀ""",
+        """🐺➖🐺➖➖🐺➖🐺
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🐺             ✨
+                /    \\
+                🩸    🩸 
 
-        war_texts = [
-            "⚔️ War shuru ho gayi — aur tu pehle hi haar gaya 😂🔥",
-            "💣 Bhai main war mein nahi aata — main war khatam karne aata hoon 😈⚡",
-            "🏴‍☠️ Tera jhanda uraya — apna wala lehraya 😎💀",
-            "⚔️ Tu lad raha hai mujhse — yeh teri sabse badi galti hai 🔥😂",
-            "💣 Main war nahi khelta — main result deliver karta hoon 👑⚡",
-            "🏴‍☠️ Battlefield pe aake to dekh — tera rank kya hai 😈⚔️",
-            "⚔️ Randike war declare kiya toh surrender ka option bhi rakh 😂💣",
-            "💣 Tu soldier nahi hai — tu sirf noise hai 🔊😂",
-            "🏴‍☠️ War mein strategy chahiye — tu sirf emotion se ladta hai 😹⚔️",
-            "⚔️ Beta yeh teri territory nahi — nikalja 👋💣",
-            "💣 Tera war cry sunke mujhe neend aati hai 😴😂",
-            "🏴‍☠️ Main akela kaafi hoon — teri poori army ke liye ⚔️😈",
-            "⚔️ War ghoshit kiya — white flag kahan hai tera 🏳️😂",
-            "💣 Bhai tu pehle khud ko toh jeet — phir mujhse lad 😎💀",
-            "🏴‍☠️ Tera war tactic: bolna aur bhaagna 😹⚔️",
-            "⚔️ Main chhoda nahi — tu chhoda baad mein roega 😂💣",
-            "💣 Battle field pe aate waqt socha — main jeet sakta hoon? Nahi 😈🏴‍☠️",
-            "⚔️ Tu ek round bhi nahi jeeta — aur war ki baat karta hai 😂💀",
-            "💣 Bhai surrender kar le — dignity bachegi thodi 🙏😹",
-            "🏴‍☠️ War mein aaye — aur pehli line mein fail ho gaye ⚔️😂",
-            "⚔️ Tera morale zero hai — teri army teri khud ki dushman hai 😂💣",
-            "💣 Main war expert hoon — tu war ka victim hai 😎🏴‍☠️",
-            "🏴‍☠️ Beta teri strategy ek broken compass jaisi hai ⚔️😂",
-            "⚔️ War mein seena taan ke aa — peeth dikha ke nahi 😹💣",
-            "💣 Bhai teri army mein sirf tu hai — aur tu kaafi nahi 😈🏴‍☠️",
-            "🏴‍☠️ Teri war cry sun ke dushman khud aa gaye — rescue karne ⚔️😂",
-            "⚔️ Beta teri territory war se pehle hi haari thi 💣😹",
-            "💣 Main war mein nahi — main tujhe personally destroy karne mein hoon 😈🏴‍☠️",
-            "🏴‍☠️ Tera war plan sunke GPS bhi confused hai ⚔️😂",
-            "⚔️ Tu war mein aaya — par weapons lana bhool gaya 💣😹",
-            "💣 Bhai yeh war nahi tujhe sirf reality check tha 😂🏴‍☠️",
-            "🏴‍☠️ Teri army tujhse zyada samajhdaar hai — unhone bandh kiya ⚔️😈",
-            "⚔️ War mein bhi excuse karta hai — aur life mein bhi 😂💣",
-            "💣 Tu jo war soch raha hai — woh meri morning routine hai 😎🏴‍☠️",
-            "🏴‍☠️ Bhai teri war itni slow hai ke climate change pehle ho jaayega ⚔️😹",
-            "⚔️ Main tujhse war karta hoon — aur tujhe pata bhi nahi chalta 💣😂",
-            "💣 War ghoshit kar ke tu pehla tha — haar ke bhi pehla hai 😹🏴‍☠️",
-            "🏴‍☠️ Teri war mein consistency hai — consistently losing ⚔️😂",
-            "⚔️ Bhai war mein bhagna galat hai — tu phir bhi karta hai 💣😈",
-            "💣 Tu war mein aaya — main pehle se tere base par tha 🏴‍☠️😂",
-            "🏴‍☠️ Teri war strategy mein sirf ek problem hai — sab kuch ⚔️😹",
-            "⚔️ Beta war ka matalab samjha nahi tujhe — sikhaunga abhi 💣😂",
-            "💣 War mein hero nahi bante — survivors bante hain — aur tu nahi banega 🏴‍☠️😈",
-            "🏴‍☠️ Teri war mein dum nahi — sirf dhool hai ⚔️😂",
-            "⚔️ Bhai war declare karna alag baat hai — jeetan alag 💣😹",
-            "💣 Tu war mein aaya sirf lose karne ke liye — congratulations 🏴‍☠️😂",
-            "🏴‍☠️ Main akele teri sab pe bhaari hoon — aur tujhe pata hai ⚔️😈",
-            "⚔️ Teri war ka sabse bura part — tu khud tha 💣😂",
-            "💣 War mein aaye — teri team ne hi tujhe chhod diya 🏴‍☠️😹",
-            "🏴‍☠️ Beta war khatam — teri taraf se surrender accepted ⚔️😎",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Wᴏʟғ Gʜᴜsᴀʏᴀ""",
+        """🔥➖🔥➖➖🔥➖🔥
+    🌟        \\         /          🌟
+    ⭐️          \\🦅/            ⭐️
+    ✨           🔥             ✨
+                /    \\
+                💫    💫 
 
-        savage_texts = [
-            "😈 Confidence is silent, insecurity is loud! 🔥",
-            "💀 You're not as important as you think! 🌪️",
-            "🔥 Reality check — you're not that special! 💥",
-            "😏 Your opinion is noted, but not needed! 📝",
-            "💀 Let's be honest — you're overrated! 🎭",
-            "🔥 The truth hurts, but it sets you free! 💪",
-            "😈 You're not the main character, sorry! 📺",
-            "💀 Your ego is writing checks your skills can't cash! 💰",
-            "🔥 Stay humble or get humbled! ⚡",
-            "😏 You're a classic example of overconfidence! 🎯",
-            "💀 Let your actions speak, not your mouth! 🔥",
-            "😈 Your presence is as useful as a screen door on a submarine! 🚪",
-            "🔥 Let's be real — you're not that impressive! 💥",
-            "💀 You're the CEO of overestimating yourself! 🏢",
-            "😏 Stay in your lane, champ! 🏎️",
-            "🔥 You're not as hot as you think! ❄️",
-            "💀 Confidence without skill is just delusion! 🎭",
-            "😈 Your reputation precedes you — and it's not good! 📉",
-            "🔥 Let's keep it real — you're average at best! ⭐",
-            "💀 You're a cautionary tale for others! ⚠️",
-            "😈 Main savage hoon — tujhe explanation nahi deta 🔥💀",
-            "💀 Teri feelings mere liye statistics hain — irrelevant 😂😈",
-            "🔥 Main woh nahi hoon jo tujhe comfortable feel karaaye 😎💀",
-            "😈 Beta teri baatein mujhe bore karti hain — next 😂🔥",
-            "💀 Teri opinion meri life mein footnote bhi nahi hai 😈😹",
-            "🔥 Main tujhe explain nahi karta — tujhse better logon ke paas time deta hoon 😎💀",
-            "😈 Tera attitude dekh ke mujhe apni nails file karni chahiye 💅😂",
-            "💀 Bhai tujhe reject karna meri hobby hai 🔥😈",
-            "🔥 Teri presence mujhe remind karaati hai — kuch logon ko mute karna chahiye 🔇😂",
-            "😈 Main bad vibes nahi leta — teri taraf bhi nahi 💀🔥",
-            "💀 Tu mere standard se neeche hai — elevator laga le 🛗😂",
-            "🔥 Teri baat sunna — option nahi habit nahi aur interest bhi nahi 😈💀",
-            "😈 Main ghanta samjhata hoon — samajh nahi aaya toh teri problem 😂🔥",
-            "💀 Teri ego itni badi hai — uske liye alag zip code chahiye 📮😂",
-            "🔥 Beta mujhe tujhse jealousy feel nahi hoti — pity hoti hai 😈💀",
-            "😈 Main woh insaan nahi hoon jis par tu waqt barbad kare — ya main karta hoon 😂🔥",
-            "💀 Teri life choices dekh ke main grateful hoon main tujhsa nahi hoon 😹😈",
-            "🔥 Bhai teri smartness ka level: WiFi password ignore karna 📶😂",
-            "😈 Teri mastiyan mujhe entertain nahi karti — bore karti hain 💀🔥",
-            "💀 Main savage nahi — main simply tujhse better hoon 😎😂",
-            "🔥 Teri personality ek blank meme format jaisi hai — kuch nahi 😈💀",
-            "😈 Beta apni journey pe focus kar — meri disturb mat kar 😂🔥",
-            "💀 Teri hard work ka result tera hi face hai — kaafi bura 😹😈",
-            "🔥 Main tujhe miss nahi karta — mujhe tujhse better cheezein miss hoti hain 😂💀",
-            "😈 Teri baatein sun ke laga — yeh real person hai ya chatbot glitch 🤖😂",
-            "💀 Bhai teri intelligence ke liye sorry feel hoti hai 🔥😈",
-            "🔥 Main tujhe block isliye nahi karta — kyunki tujhe exist karna pata hai 😂💀",
-            "😈 Teri struggles dekh ke mujhe motivation milti hai — teri tarah mat banna 😹🔥",
-            "💀 Tu jo effort lagate ho mujhpe — woh apni growth mein lagao 😎😂",
-            "🔥 Teri vibes mujhe 2G network se bhi slow lagti hain 📡😈",
-            "😈 Main tujhe pehle judge nahi karta — par tujhe pehle judge hota hoon 💀😂",
-            "💀 Bhai tera shadow bhi tujhse zyada interesting hai 🔥😂",
-            "🔥 Teri logic sun ke Albert Einstein ne resign kar diya hoga 🧪😈",
-            "😈 Tu mere jaisa ban sakta hai — agar try karta 10 saal toh bhi nahi 💀😂",
-            "💀 Teri taraf se koi bhi reaction — mujhe bored karta hai 🔥😹",
-            "🔥 Main respectful hoon — tere sath nahi 😈💀",
-            "😈 Beta teri vibe check: FAILED 😂🔥",
-            "💀 Teri har move predicted thi — boring player 😹😈",
-            "🔥 Main tujhe second chance nahi deta — teri pehli impression kafi thi 😂💀",
-            "😈 Teri friendship ke offer ko professionally decline karta hoon 😎😂",
-            "💀 Beta tu mujhe feel nahi karaata — tu sirf annoy karta hai 🔥😈",
-            "🔥 Teri dimagi capacity dekh ke solar calculator bhi sorry bol de 🔋😂",
-            "😈 Main uun logon mein nahi hoon jo tere liye time waste karein 💀🔥",
-            "💀 Teri life ka GPS tujhe wrong direction mein le ja raha hai 🗺️😂",
-            "🔥 Bhai teri alag identity bana — copier mat ban 😈💀",
-            "😈 Tu mere radar par bhi nahi aata — itna irrelevant hai 😂🔥",
-            "💀 Teri maa ne bhi socha hoga — yaar isko kuch aur karna chahiye tha 😹😈",
-            "🔥 Main woh hoon jo teri nightmares mein aata hai — as a reminder 😎💀",
-            "😈 Beta teri bakaiti mujhe filter nahi karti — automatically skip ho jaati hai 😂🔥",
-            "💀 Tu savage hone ki koshish karta hai — mujhe dekh savage ka example 😈😹",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Pʜᴏᴇɴɪx Gʜᴜsᴀʏᴀ""",
+        """🦁➖🦁➖➖🦁➖🦁
+    🌟        \\         /          🌟
+    ⭐️          \\👑/            ⭐️
+    ✨           🦁             ✨
+                /    \\
+                🩸    🩸 
 
-        ultra_texts = [
-            "🔥 ULTRA mode activated — time to dominate! 👑",
-            "🌪️ ULTRA MODE ACTIVATED — teri poori existence question mein hai 😈🔥",
-            "⚡ Ultra attack — pehle gaali sunna phir rona — sequence yaad kar 😂💀",
-            "🌪️ Beta ultra level pe aake dekh — yahan teri category nahi hai 👑🔥",
-            "⚡ ULTRA BLOW — teri soch se lekar attitude tak sab destroy 💥😈",
-            "🌪️ Yeh ultra mode hai — blocking nahi help karega 😂⚡",
-            "⚡ Ultra raid engaged — ab teri poori chat history history hai 📜😹",
-            "🌪️ Beta ultra speed mein aa — par seedha home le jaata hoon 💀🔥",
-            "⚡ Ultra fire — teri har defensive move kaam nahi karegi 😈🌪️",
-            "🌪️ Yeh ultra level fight hai — tu still bronze mein hai 😂⚡",
-            "⚡ ULTRA DAMAGE — teri reputation, teri aukaat, teri everything 💥😹",
-            "🌪️ Ultra mode mein poori teri army bhi kaafi nahi 😈🔥",
-            "⚡ Beta ultra attack sunne ke baad sun raha hai kya? Normal hai 😂🌪️",
-            "🌪️ ULTRA RANT incoming — tune jo kiya uska hisaab hoga 💀⚡",
-            "⚡ Yeh ultra version hai — tujhe pata bhi nahi kya aaya 😹🔥",
-            "🌪️ Ultra mode ON — timer chal raha hai teri destruction ka 😈⚡",
-            "⚡ Beta ultra strike pe tujhe sirf ek option hai — disappear 😂💀",
-            "🌪️ ULTRA COMBO — reply + react + roast + raid all at once 🔥⚡",
-            "⚡ Yeh ultra level rage hai — aur tujhe taste hoga 😈🌪️",
-            "🌪️ Ultra activated — pehle bol sorry phir ja 😹😂",
-            "⚡ Beta ULTRA message ka matlab — tu mere liye mission ban gaya 💀🔥",
-            "🌪️ ULTRA STORM — har cheez destroy ho rahi hai teri side pe 😈⚡",
-            "⚡ Yeh ultra nahi — tujhe sirf samjhane ki koshish thi 😂🌪️",
-            "🌪️ Ultra mode finish — teri team ne tera saath chhoda 💀🔥",
-            "⚡ Beta ULTRA = mera minimum effort on you 😈😂",
-            "🌪️ ULTRA RAIN — tune invite kiya tha — enjoy karna tha na? 😹⚡",
-            "⚡ Ultra mode mein ek hi rule — no mercy 💀🔥",
-            "🌪️ Beta ULTRA sabse pehle yeh — teri galti ka hisaab 😈⚡",
-            "⚡ Yeh ultra speed se aaya — aur teri samajh mein ultra slow aayega 😹🌪️",
-            "🌪️ ULTRA LOCK — ab yahan se nahi jayega tu 💀🔥",
-            "⚡ Beta ultra strike mein teri saari strategy fail hai 😂😈",
-            "🌪️ Ultra level pe chal — toh teri duniya hi badal jaayegi 🔥⚡",
-            "⚡ ULTRA — yeh word hi teri aukat se bada hai 😹💀",
-            "🌪️ Beta ultra mein main hoon — tujhe pata nahi tha kya 😈🔥",
-            "⚡ Yeh ultra raid hai — har message teri ek problem hai 😂🌪️",
-            "🌪️ ULTRA DONE — tu done kar le pehle 💀⚡",
-            "⚡ Beta ultra mein welcome — pehle bol kya karna hai 😹🔥",
-            "🌪️ Ultra mode — ab seedha point pe aata hoon — tu fail hai 😂😈",
-            "⚡ ULTRA BLAST — teri timeline pe aaya — nahi ruk sakta 💥🌪️",
-            "🌪️ Beta ultra mein aake teri baat karo — nahi aata toh seedha ja 💀🔥",
-            "⚡ Yeh ultra war hai — aur teri taraf se koi nahi 😂😈",
-            "🌪️ ULTRA FINAL — bas yahi hoga — accept kar 💀⚡",
-            "⚡ Beta ultra strike complete — check teri status 😹🔥",
-            "🌪️ Ultra mode mein log surrender karte hain — tujhe bhi karna hoga 😈⚡",
-            "⚡ Yeh ultra punishment nahi — tutorial hai teri life ka 😂💀",
-            "🌪️ ULTRA JUDGEMENT — teri har move judged ho rahi hai 🔥⚡",
-            "⚡ Beta ultra mein ek cheez — main hoon aur tu nahi rahe 😈🌪️",
-            "🌪️ Ultra mode completed — teri side destroyed 💀😂",
-            "⚡ Yeh ultra attack ka last wave hai — teri koi repair nahi 😹🔥",
-            "🌪️ ULTRA END — teri war khatam teri taraf se flag gira 😈⚡",
-            "⚡ Beta ultra mein aana tha — rona nahi tha — par dono kiye 😂💀",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Lɪᴏɴ Gʜᴜsᴀʏᴀ""",
+        """🐯➖🐯➖➖🐯➖🐯
+    🌟        \\         /          🌟
+    ⭐️          \\🐅/            ⭐️
+    ✨           🐯             ✨
+                /    \\
+                🩸    🩸 
 
-        # ─── NEW MENU9 RAID TEXTS ───────────────────────────────────────────────
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Tɪɢᴇʀ Gʜᴜsᴀʏᴀ""",
+        """🦈➖🦈➖➖🦈➖🦈
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🦈             ✨
+                /    \\
+                🩸    🩸 
 
-        shame_texts = [
-            "😤 Sharam kar — itna gira hua kaam karte kaise hain tum log 🔥💀",
-            "🙅 Bhai teri harkat dekh ke pura group sharam se doob gaya 😂😤",
-            "😤 Yeh sab karke tujhe pride feel hoti hai? Really? 💀🔥",
-            "🙅 Beta teri harkaten dekh ke maa baap sharmayenge 😂😤",
-            "😤 Sharam nahi hai tujhe bilkul — clearly 💀😹",
-            "🙅 Bhai itna gira hua kaam dekh ke log muh fer lete hain 😤🔥",
-            "😤 Tu itna neeche gira — zameen bhi neeche ho gayi 💀😂",
-            "🙅 Beta sharam bhi nahi aata aisa karte hue 😤😹",
-            "😤 Yeh harkat dekh ke lagta hai — tujhe value kisi ne nahi sikhaya 💀🔥",
-            "🙅 Bhai log tujhe dekh ke aankhein pher lete hain — soch kya kar raha hai 😤😂",
-            "😤 Teri galti nahi — environment ki galti — par ab waqt hai change ka 💀😹",
-            "🙅 Beta sharam isliye nahi aati kyunki sharam feel karna seekha nahi 😤🔥",
-            "😤 Yeh kaam karke tujhe khushi mili? Toh mujhe tujhse zyada chinta hai 💀😂",
-            "🙅 Bhai teri harkat pura record hai — aur yeh record kharab hai 😤😹",
-            "😤 Tu sochta hai koi dekh nahi raha — sab dekh rahe hain 💀🔥",
-            "🙅 Beta aisa behave karta hai — khud se bhi embarrassing lagta hai tu 😤😂",
-            "😤 Yeh sab dekh ke lagta hai — teri parwarish kahan gayi 💀😹",
-            "🙅 Bhai teri harkaton ka hisaab hoga — aaj nahi toh kal 😤🔥",
-            "😤 Tu sharminda nahi hai — woh most shameful cheez hai 💀😂",
-            "🙅 Beta logo ne tujhe judge kiya — kyunki tune judge hone wala kaam kiya 😤😹",
-            "😤 Yeh bura kaam karke tujhe kya mila — kuch nahi — bas naam barbad 💀🔥",
-            "🙅 Bhai sharam karo — itna toh haq hai tumhara 😤😂",
-            "😤 Tu yahan cool lagne ki koshish mein sharminda ho gaya 💀😹",
-            "🙅 Beta ghalat rasta chhod — vapas aa 😤🔥",
-            "😤 Yeh sab karke teri image bani hai — worst category mein 💀😂",
-            "🙅 Bhai teri harkat ka review — 0 stars — do not recommend 😤😹",
-            "😤 Tu itna neeche gira — recovery mushkil lagti hai 💀🔥",
-            "🙅 Beta tujhe samjhana waqt waste hai — par try kar raha hoon 😤😂",
-            "😤 Yeh sab dekh ke mujhe tujhse zyada tujhpe gussa nahi — hairaani hai 💀😹",
-            "🙅 Bhai sharam se doob — par us mein bhi tujhe help chahiye shayad 😤🔥",
-            "😤 Teri harkat ek lesson hai — dusron ke liye kya nahi karna chahiye 💀😂",
-            "🙅 Beta teri yeh sab dekh ke khud bhi tujhse door rehna chahta hoon 😤😹",
-            "😤 Yeh gaaliyaan nahi — sirf reality check hai 💀🔥",
-            "🙅 Bhai sharam tab aati hai jab insaan mein insaniyat hoti hai 😤😂",
-            "😤 Tu ek example bana diya khud ko — negative example 💀😹",
-            "🙅 Beta tujhe ek baar ruk ke soochna chahiye tha — nahi soocha 😤🔥",
-            "😤 Yeh sab karke tu yahan hai — aur sochta hai main galat hoon? 💀😂",
-            "🙅 Bhai itna toh bata — tujhe kaisa feel hota hai yeh sab karne ke baad 😤😹",
-            "😤 Tu sharminda nahi — tujhe sharminda feel karna chahiye 💀🔥",
-            "🙅 Beta yeh rasta galat hai — abhi bhi change ho sakta hai 😤😂",
-            "😤 Yeh sab khud se bura nahi tha — tu tha 💀😹",
-            "🙅 Bhai teri harkaton ka real world impact sun — sab tujhse dur hain 😤🔥",
-            "😤 Tu soch raha hai main overreact kar raha hoon — par tujhe hisaab hoga 💀😂",
-            "🙅 Beta tujhe pata hai tu kya kar raha hai — aur phir bhi kar raha hai 😤😹",
-            "😤 Yeh sharm ki baat hai — aur tujhe realize karna chahiye 💀🔥",
-            "🙅 Bhai tujhe mirror mein dekhna chahiye — ek baar 😤😂",
-            "😤 Tu itna bura nahi hai — par yeh kaam bura tha 💀😹",
-            "🙅 Beta sharam isliye nahi aati — kyunki tu sochta nahi consequences ke baare mein 😤🔥",
-            "😤 Yeh moment tera lowest point hai — aur abhi bhi jaag sakta hai 💀😂",
-            "🙅 Bhai aaj ek kaam kar — sharminda ho aur badal — bas itna chahiye 😤😎",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sʜᴀʀᴋ Gʜᴜsᴀʏᴀ""",
+        """🦅➖🦅➖➖🦅➖🦅
+    🌟        \\         /          🌟
+    ⭐️          \\🦅/            ⭐️
+    ✨           🦅             ✨
+                /    \\
+                🪶    🪶 
 
-        diss_texts = [
-            "🎤 Tera naam sun ke log mute kar dete hain khud ko 🔇😂",
-            "💀 Tu diss kar raha hai — khud ko diss kar pehle 🪞😹",
-            "🎙️ Teri rap jaisi hai — no flow no bars no future 🎵😂",
-            "💥 Bhai tera verse sun ke Eminem ne retire le liya 😹🎤",
-            "🔥 Teri diss itni kamzor hai ke whisper bhi zyada loud hai 🤫😂",
-            "💀 Tu sirf bolne mein mard hai karne mein? Zero 😈🎙️",
-            "🎤 Beta teri bars mein bar hi nahi — sirf khali string 🎸😂",
-            "💥 Tera diss track sunne ke baad logon ne earbuds tod diye 🎧😹",
-            "🔥 Bhai teri lyric likh ke dekha — autocorrect ne bhi reject kiya ✍️😂",
-            "💀 Tu diss karta hai aur log diss ko diss karte hain 😂🎤",
-            "🎙️ Teri voice aisi hai ke autotune bhi nahi bach sakta 🎶😹",
-            "💥 Beta freestyle kar le — ya phir stop the embarrassment 🛑😂",
-            "🔥 Tujhe sun ke DJ ne plug nikal diya 🔌😹",
-            "💀 Bhai tera flow aisa hai jaise jaam mein traffic — ruka hua 🚗😂",
-            "🎤 Teri soch itni slow hai ke beat ke saath nahi chalti 🥁😹",
-            "💥 Tera diss mujhe sula raha hai — better than sleeping pills 😴😂",
-            "🔥 Bhai asli diss toh tab hogi jab tu actually kuch achieve kare 🏆😹",
-            "💀 Teri lyrics Google Translate se better hain — bas 🌐😂",
-            "🎙️ Beta chal hat stage se — pehle walk-on music bana 🎵😹",
-            "💥 Tera punchline itna weak hai ke paper bhi survive kar le 📄😂",
-            "🔥 Bhai teri diss sun ke crowd ne baat karna shuru kar diya 🙄😹",
-            "💀 Tu verse likhta hai ya grocery list — same energy 🛒😂",
-            "🎤 Teri bars mein calories zyada hain — totally empty 😹🔥",
-            "💥 Bhai teri rhyme sunke chhote bacche bhi sharma jaate hain 😂💀",
-            "🔥 Teri diss aisi hai — sirf uski maa samjhi 😹🎙️",
-            "💀 Tu diss karta hai mujhe — main khud apni diss sunta hoon for fun 😂💥",
-            "🎤 Tera stage naam kya hai — Bakwas ke Raja? 👑😹",
-            "💥 Bhai teri microphone bhi teri awaaz se dara hua hai 🎙️😂",
-            "🔥 Tu diss mein expert hai — aur expert hone mein loser 😹💀",
-            "💀 Teri har line mein cringe hai — Olympic level 🥇😂",
-            "🎙️ Beta khud ki diss sun le — ek baar realise hoga 😹🔥",
-            "💥 Bhai tera diss itna slow hai ke mujhe neend aa gayi 😴😂",
-            "🔥 Teri creativity level: template pe naam likhna 💀😹",
-            "💀 Tu diss karne ke liye paida hua tha — aur fail ho gaya 😂🎤",
-            "🎙️ Tera rhyme scheme: aab aab aab — boring AF 📝😹",
-            "💥 Bhai teri diss response mein Soulja Boy beat use karta hun 😂🔥",
-            "🔥 Tu keyboard pe rap karta hai — phone pe nahi kaata 📱💀",
-            "💀 Teri diss sun ke mic khud neeche gir gaya 🎙️😂",
-            "🎤 Beta teri bars itni weak hain ke paper toh chodh kaagaz bhi nahi chhapega 📰😹",
-            "💥 Bhai tera flow paani mein nahi petrol mein hai — ab blast 🔥😂",
-            "🔥 Teri diss sunta hoon toh lagta hai sabne kaan band kar rakhe hain 🔇💀",
-            "💀 Tu diss mein ghusaa — tu diss tha diss 😹😂",
-            "🎙️ Bhai tera verse industry standard se neeche hai — ground floor bhi nahi 🏚️🔥",
-            "💥 Teri awaaz mein woh baat nahi jo diss mein chahiye — talent 😂💀",
-            "🔥 Beta teri diss itni pathetic hai ke pity vote mil sakta tha 🗳️😹",
-            "💀 Bhai teri rap career ek Instagram story jaisi hai — 24 ghante mein khatam 📸😂",
-            "🎤 Tu rapper nahi rapper ki copy ki copy ka knock-off hai 😹🔥",
-            "💥 Teri diss sun ke auto-generated ho sakti thi — aur better hoti 🤖😂",
-            "🔥 Bhai freestyle maar — aur phir sun khud ko — tujhe pata chalega 🎧💀",
-            "💀 Teri diss ka reply nahi deta — tujhe dignify karna time waste hai 😂🎙️",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Eᴀɢʟᴇ Gʜᴜsᴀʏᴀ""",
+        """🐂➖🐂➖➖🐂➖🐂
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🐂             ✨
+                /    \\
+                💥    💥 
 
-        devil_texts = [
-            "😈 DEVIL MODE — yahan woh aaya hai jo tujhe deserve karta hai 🔥💀",
-            "😈 Beta main devil nahi — main tera worst nightmare hoon 🔥⚡",
-            "😈 Devil raid activate — teri poori timeline disturbed 💀😂",
-            "😈 Bhai devil pe hath lagaya — ab bhog 🔥💥",
-            "😈 DEVIL FURY — teri sab cheez ek baar mein 💀⚡",
-            "😈 Beta devil ke saamne hum sab khiladi hain — tu beginner 🔥😂",
-            "😈 DEVIL ATTACK — teri defense devil ke touch se fail 💀😈",
-            "😈 Bhai devil mode mein koi safe nahi — tu bhi nahi 🔥⚡",
-            "😈 Teri galti — devil ko challenge karna 💀😂",
-            "😈 Beta devil ki bhasha — punishment aur reward — tu punishment mein hai 🔥😈",
-            "😈 DEVIL LEVEL RAGE — teri poori life on line 💀⚡",
-            "😈 Bhai devil se lad ke koi nahi jeeta — tu bhi nahi jeetega 🔥😂",
-            "😈 Devil mode — tera sab kuch noted — sab 💀😈",
-            "😈 Beta DEVIL FIRE — teri poori duniya burn 🔥⚡",
-            "😈 DEVIL RAID COMPLETE — tujhe koi nahi bachayega 💀😂",
-            "😈 Bhai devil teri har move pe already plan bana chuka 🔥😈",
-            "😈 Devil mode — tera future bleak — teri choice thi 💀⚡",
-            "😈 Beta devil ne tujhe select kiya — koi bada reason hoga 🔥😂",
-            "😈 DEVIL STORM — teri poori squad disbanded 💀😈",
-            "😈 Bhai devil ke game mein tera turn tha — abhi mera 🔥⚡",
-            "😈 Devil raid engage — now teri responsibility 💀😂",
-            "😈 Beta devil level punishment — tujhse tune karaya tha 🔥😈",
-            "😈 DEVIL ZONE — nikal ja nahi toh devil ka guest ban 💀⚡",
-            "😈 Bhai devil hamesha sunta hai — teri bhi sun li 🔥😂",
-            "😈 Devil mode ACTIVATED — teri poori timeline hijacked 💀😈",
-            "😈 Beta devil ke saamne sirf ek option — respect ya suffer 🔥⚡",
-            "😈 DEVIL FINAL BLOW — teri defense completely gone 💀😂",
-            "😈 Bhai devil ne decide kiya — teri loss is inevitable 🔥😈",
-            "😈 Devil mein aake dekha — tu deserving nahi tha challenge ka 💀⚡",
-            "😈 Beta DEVIL RAIN — teri har cheez soaked in fire 🔥😂",
-            "😈 DEVIL vs YOU — spoiler: devil wins 💀😈",
-            "😈 Bhai devil ke saamne teri prayers bhi kaam nahi aate 🔥⚡",
-            "😈 Devil mode — teri weak spots identified — attack 💀😂",
-            "😈 Beta devil ki nazar se tu nahi chhupta 🔥😈",
-            "😈 DEVIL JUDGMENT — teri poori history reviewed — verdict: guilty 💀⚡",
-            "😈 Bhai devil ki duniya mein tu tourist tha — time up 🔥😂",
-            "😈 Devil fury — tere steps already tracked hain 💀😈",
-            "😈 Beta DEVIL COUNTER — teri har move ka counter ready tha 🔥⚡",
-            "😈 DEVIL FINISH — teri game over — my game continues 💀😂",
-            "😈 Bhai devil mode se nikalna — tujhe option nahi 🔥😈",
-            "😈 Devil attack — teri soul targeted — figuratively 💀⚡",
-            "😈 Beta devil ne kaha — teri aukat nahi — aur devil galat nahi hota 🔥😂",
-            "😈 DEVIL STORM OVER — teri side: scorched earth 💀😈",
-            "😈 Bhai devil ke rules simple hain — tu follow nahi kiya 🔥⚡",
-            "😈 Devil raid — teri position compromised — retreat 💀😂",
-            "😈 Beta DEVIL mein aake rota mat — khud aaya tha 🔥😈",
-            "😈 DEVIL WAVE — teri har defence erased 💀⚡",
-            "😈 Bhai devil ka favorite — log jo khud ko smart samjhte hain — tu 🔥😂",
-            "😈 Devil mode DONE — check teri condition 💀😈",
-            "😈 Beta devil ne aaj tujhe yaadgaar bana diya — wrong reasons se 🔥⚡",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bᴜʟʟ Gʜᴜsᴀʏᴀ""",
+        """🦏➖🦏➖➖🦏➖🦏
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🦏             ✨
+                /    \\
+                💥    💥 
 
-        karma_texts = [
-            "☯️ Karma aaya — teri sab harkat ka hisaab ho raha hai 🔥💀",
-            "☯️ Beta karma kisi ki nahi sunta — teri bhi nahi 😂⚡",
-            "☯️ KARMA STRIKE — tune jo kiya woh teri taraf wapas aaya 🔥😈",
-            "☯️ Bhai karma judge nahi karta — deliver karta hai 💀😂",
-            "☯️ Karma mode activate — teri sab galtiyan wapas aa rahi hain 🔥⚡",
-            "☯️ Beta karma tujhe bhool nahi gaya — yaad rakha tha 😂💀",
-            "☯️ KARMA DELIVERY — teri harkat ka package arrive ho gaya 🔥😈",
-            "☯️ Bhai karma se koi nahi bachta — tu bhi nahi bachega 💀⚡",
-            "☯️ Karma tujhe dhundh raha tha — dhundh liya 🔥😂",
-            "☯️ Beta karma aata hai jab expect nahi karte — sun le 😂💀",
-            "☯️ KARMA HITS DIFFERENT — teri sab cheez wapas 🔥⚡",
-            "☯️ Bhai karma teri priority nahi thi — karma mein tu priority hai 😂💀",
-            "☯️ Karma cycle complete — tune jo kiya tune hi bhoga 🔥😈",
-            "☯️ Beta karma slow hota hai par sure hota hai — yeh sure tha 💀⚡",
-            "☯️ KARMA CALL — teri line pe aa gaya 🔥😂",
-            "☯️ Bhai karma mein koi error nahi — teri galti recorded thi 😂💀",
-            "☯️ Karma teri taraf waapis — enjoy 🔥⚡",
-            "☯️ Beta karma tera address jaanta tha 😂💀",
-            "☯️ KARMA FINAL — teri poori account balance zero 🔥😈",
-            "☯️ Bhai karma se lad nahi sakte — tu chhupa nahi karma se 💀⚡",
-            "☯️ Karma strike — tune deserve kiya — mila 🔥😂",
-            "☯️ Beta karma ko excuse nahi deta — sirf result deta hai 😂💀",
-            "☯️ KARMA STORM — teri sab beizzati aaj ekatha aayi 🔥⚡",
-            "☯️ Bhai karma tujhse behtar account maintain karta hai 😂💀",
-            "☯️ Karma mein tera account — overdraft mein hai 🔥😈",
-            "☯️ Beta karma ki speed teri speed se faster hai 💀⚡",
-            "☯️ KARMA BLAST — teri sab cheezon ka hisaab 🔥😂",
-            "☯️ Bhai karma ko pata tha tune kya kiya — sab record mein hai 😂💀",
-            "☯️ Karma kisi pe bhi nahi rulta — teri bhi nahi 🔥⚡",
-            "☯️ Beta karma tera future nahi — karma tera present hai 😂💀",
-            "☯️ KARMA INVOICE — teri sab galtiyon ka bill aa gaya 🔥😈",
-            "☯️ Bhai karma mein koi discount nahi milta — full price pay 💀⚡",
-            "☯️ Karma delivered — tune jo bheja wahi mila 🔥😂",
-            "☯️ Beta karma tujhse kisi ki nahi sunta — seedha deliver karta hai 😂💀",
-            "☯️ KARMA FULL CIRCLE — teri sab harkat ghumke teri hi taraf aayi 🔥⚡",
-            "☯️ Bhai karma teri taraf — aur tu prepared nahi tha 😂💀",
-            "☯️ Karma hit kiya — tujhe pata tha aayega — aaya 🔥😈",
-            "☯️ Beta karma mein interest bhi hota hai — tera compound ho gaya 💀⚡",
-            "☯️ KARMA COMPLETE — lesson mila? 🔥😂",
-            "☯️ Bhai karma ne tujhe select kiya — deservingly 😂💀",
-            "☯️ Karma tujhe yaad dila raha hai — tune kya kiya tha 🔥⚡",
-            "☯️ Beta karma ki awaaz nahi hoti — par result loud hota hai 😂💀",
-            "☯️ KARMA RESPONSE — teri har cheez ka seedha jawab 🔥😈",
-            "☯️ Bhai karma ki list mein tu first position pe tha 💀⚡",
-            "☯️ Karma tujhe bhool nahi gaya — teri galti note thi 🔥😂",
-            "☯️ Beta karma aur tu — aaj inka meetup schedule tha 😂💀",
-            "☯️ KARMA WRAP UP — teri life lesson: yeh tha 🔥⚡",
-            "☯️ Bhai karma ne apna kaam kiya — efficient tha 😂💀",
-            "☯️ Karma strike final — teri sab cheez balanced ho gayi — zero pe 🔥😈",
-            "☯️ Beta karma yaad rakhna — abhi bhi teri account open hai ☯️😂",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Rʜɪɴᴏ Gʜᴜsᴀʏᴀ""",
+        """🐘➖🐘➖➖🐘➖🐘
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🐘             ✨
+                /    \\
+                💥    💥 
 
-        doom_texts = [
-            "💀 DOOM activated — teri poori existence on countdown 🔥😈",
-            "💀 Beta doom aaya — tera timer start ho gaya 😂⚡",
-            "💀 DOOM STRIKE — teri poori defense wiped 🔥😈",
-            "💀 Bhai doom se koi nahi bachta — teri bhi date aane wali thi 😂💀",
-            "💀 Doom mode — teri sab cheez: scheduled for deletion 🔥⚡",
-            "💀 Beta doom tera waqt dekh ke aaya — perfect timing 😂😈",
-            "💀 DOOM RAID — teri poori squad: doomed 🔥💀",
-            "💀 Bhai doom pe haath lagaya — yeh result expect karna chahiye tha 😂⚡",
-            "💀 Doom finale — teri poori story: ended 🔥😈",
-            "💀 Beta doom ki awaaz sunna nahi chahte log — teri aa gayi 😂💀",
-            "💀 DOOM COMPLETE — teri sab cheez: finished 🔥⚡",
-            "💀 Bhai doom tujhse pehle plan kar ke aaya tha 😂😈",
-            "💀 Doom level CRITICAL — teri situation: hopeless 🔥💀",
-            "💀 Beta doom ne tujhe select kiya — teri achievement nahi 😂⚡",
-            "💀 DOOM COUNTDOWN — teri sab cheez: 3... 2... 1... done 🔥😈",
-            "💀 Bhai doom mein rasta ek hi hota hai — neeche 😂💀",
-            "💀 Doom activated — teri poori future: uncertain 🔥⚡",
-            "💀 Beta doom ki language — teri samajh nahi aati — result aata hai 😂😈",
-            "💀 DOOM FINAL — teri poori team: gone 🔥💀",
-            "💀 Bhai doom aur tu — aaj ka meetup tera worst tha 😂⚡",
-            "💀 Doom mode — tera har step: tracked 🔥😈",
-            "💀 Beta doom ne teri position: permanent zero confirm ki 😂💀",
-            "💀 DOOM RAIN — teri har cheez: destroyed 🔥⚡",
-            "💀 Bhai doom mein mercy nahi hoti — teri request: denied 😂😈",
-            "💀 Doom strike — teri sab galtiyan: collected 🔥💀",
-            "💀 Beta doom clock — teri ticking: started 😂⚡",
-            "💀 DOOM WAVE — teri poori defense: overwhelmed 🔥😈",
-            "💀 Bhai doom ki speed mein teri situation resolve ho gayi — badly 😂💀",
-            "💀 Doom verdict — teri case: closed — against you 🔥⚡",
-            "💀 Beta doom se pehle sun: teri galti — doom aaya 😂😈",
-            "💀 DOOM ARRIVAL — teri poori day ruined 🔥💀",
-            "💀 Bhai doom ne tujhe apna project bana liya 😂⚡",
-            "💀 Doom mode final — teri sab cheez: ash 🔥😈",
-            "💀 Beta doom ki ek khasiyat — woh aata zaroor hai 😂💀",
-            "💀 DOOM EXECUTION — teri poori plan: failed 🔥⚡",
-            "💀 Bhai doom tera number leke aaya tha — mila 😂😈",
-            "💀 Doom level MAX — teri recovery: impossible 🔥💀",
-            "💀 Beta doom ki taraf se ek gift — teri haari 😂⚡",
-            "💀 DOOM COMPLETE CYCLE — teri poori existence reset 🔥😈",
-            "💀 Bhai doom tujhse better hai — wait nahi karta 😂💀",
-            "💀 Doom mode — teri sab cheez: compromised 🔥⚡",
-            "💀 Beta DOOM aur tu — tujhe jeetna tha par doom ka hi naam hai 😂😈",
-            "💀 DOOM FINAL WAVE — teri sab: erased 🔥💀",
-            "💀 Bhai doom ne tujhe memorable bana diya — galat reasons se 😂⚡",
-            "💀 Doom activated final time — teri countdown: zero 🔥😈",
-            "💀 Beta DOOM se seekhna tha — tujhe nahi tha pata ab hai 😂💀",
-            "💀 DOOM OVER — teri side: collapsed — mine: standing 🔥⚡",
-            "💀 Bhai doom ne tera chapter likh diya — R.I.P. chapter 😂😈",
-            "💀 Doom final message — tujhe yaad rahega — sahi reasons se nahi 🔥💀",
-            "💀 Beta DOOM complete — check teri condition — yahi tha 😂⚡",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Eʟᴇᴘʜᴀɴᴛ Gʜᴜsᴀʏᴀ""",
+        """🦛➖🦛➖➖🦛➖🦛
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🦛             ✨
+                /    \\
+                💥    💥 
 
-        # ─── GAME TEXTS (Menu10) ──────────────────────────────────────────────
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Hɪᴘᴘᴏ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  💣  💣  █  █  █
+        █  █  █  💣  💣  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bᴏᴍʙ Pʜᴏᴅᴜɴɢᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  💀  💀  █  █  █
+        █  █  █  💀  💀  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴀʀ Gᴀʏɪ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  ☢️  ☢️  █  █  █
+        █  █  █  ☢️  ☢️  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Nᴜᴄʟᴇᴀʀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  🐉  🐉  █  █  █
+        █  █  █  🐉  🐉  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Dʀᴀɢᴏɴ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  🔫  🔫  █  █  █
+        █  █  █  🔫  🔫  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Tᴀɴᴋ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  🐍  🐍  █  █  █
+        █  █  █  🐍  🐍  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sᴀᴀᴘ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  👿  👿  █  █  █
+        █  █  █  👿  👿  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Dᴇᴍᴏɴ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  🦈  🦈  █  █  █
+        █  █  █  🦈  🦈  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sʜᴀʀᴋ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  🦂  🦂  █  █  █
+        █  █  █  🦂  🦂  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bɪᴄʜʜᴜ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  👻  👻  █  █  █
+        █  █  █  👻  👻  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bʜᴏᴏᴛ Gʜᴜsᴀʏᴀ""",
+    ]
 
-        truth_texts = [
-            "Tumhara sabse bada secret kya hai jo kisi ko nahi pata? 🤫",
-            "Kisi pe crush tha jo ab dost hai? 😳",
-            "Kabhi kisi ki baat repeat ki thi jo confidence mein batai gayi thi? 😬",
-            "Woh kaun hai jis par sabse zyada trust karte ho? ❤️",
-            "Life mein sabse bada regret kya hai? 💭",
-            "Kabhi class ya office se bina bataye bhaage ho? 😂",
-            "Tumhari sabse embarrassing memory kya hai? 😳",
-            "Kabhi kisi ko jhooth bol ke escape kiya hai? 🤥",
-            "Tumhara sabse bada fear kya hai? 😨",
-            "Kabhi kisi se pyaar kiya hai jo tumhe pata nahi? 💔",
-            "Tumhari life ka best decision kya tha? ✅",
-            "Kabhi kisi ko ghost kiya hai? 👻",
-            "Tumhara sabse bada achievement kya hai? 🏆",
-            "Kabhi kisi ko 'I love you' bola hai jhooth mein? 💀",
-            "Tumhari sabse badi weakness kya hai? 😅",
-            "Kabhi kisi ka trust todna pada hai? 💔",
-            "Tumhari favourite memory kya hai? 📸",
-            "Kabhi kisi ko dekh ke jealous feel kiya hai? 😤",
-            "Tumhara sabse bada dream kya hai? 🌟",
-            "Kabhi kisi ki feelings hurt kari hai? 😢",
-            "Tumhari sabse badi strength kya hai? 💪",
-            "Kabhi kisi ko forgive kiya hai jo worth nahi tha? 🙏",
-            "Tumhara worst date experience kya tha? 😬",
-            "Kabhi kisi ko block kiya hai without reason? 🚫",
-            "Tumhari guilty pleasure kya hai? 🍫",
-            "Kabhi kisi se jealous hoke galat kiya hai? 😤",
-            "Tumhara favourite childhood memory kya hai? 🧸",
-            "Kabhi kisi ko sacrifice kiya hai apne liye? 🥺",
-            "Tumhari life ki best advice kya hai? 💡",
-            "Kabhi apne best friend se jhooth bola hai? 🤥"
-        ]
+            # ─── PREMIUM SPAM TEXT LISTS ──────────────────────────────────────────
+            ms_texts = [
+                "TTTTTTT🍷EEEEEE💊RRRRR🔘OOOOO🎲BBBBB🤍EEEEEE💊GGGGGG🖤EEEEEE💊JJJJJJ👅 CCCCCC⚔️OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 CCCCCC⚔️OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊OOOOO🎲 AAAAAA👿AAAAAA👿AAAAAA👿MMMMM🚀MMMMM🚀AAAAAA👿 CCCCCC⚔️OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘OOOOO🎲 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 LLLLLL🔨AAAAAA👿 BBBBB🤍UUUUU💣RRRRR🔘",
+        "OOOOOO👅YYYYYYEEEEEE💊 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA👿CCCCCC⚔️CCCCCC⚔️EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜 BBBBB🤍JJJJJJ👅OOOOO🎲SSSSS⚒️RRRRR🔘WWWWW🥰",
+        "TTTTTTT🍷EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜 FFFFFF🔥AAAAAA👿NNNNNN🤣RRRRR🔘",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣MMMMM🚀MMMMM🚀YYYYYY",
+        "RRRRRR⚔️AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷RRRRR🔘",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿KKKKKK💜IIIIII🍷 GGGGGG🖤EEEEEE💊TTTTT🚭IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜EEEEEE💊 MMMMM🚀UUUUU💣HHHHH🖤",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜OOOOO🎲 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 CCCCCC⚔️HHHHH🖤IIIIII🍷NNNNNN🤣AAAAAA👿LLLLLL🔨",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 MMMMM🚀AAAAAA👿RRRRR🔘 GGGGGG🖤AAAAAA👿YYYYYYIIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣TTTTT🚭IIIIII🍷 RRRRR🔘AAAAAA👿DDDDD👿IIIIII🍷 KKKKKK💜IIIIII🍷 HHHHH🖤EEEEEE💊TTTTT🚭",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 CCCCCC⚔️OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿IIIIII🍷YYYYYYAAAAAA👿 CCCCCC⚔️IIIIII🍷OOOOO🎲DDDDD👿AAAAAA👿 AAAAAA👿AAAAAA👿AAAAAA👿AAAAAA👿KKKKKK💜 MMMMM🚀",
+        "OOOOOO👅YYYYYYEEEEEE💊 KKKKKK💜IIIIII🍷NNNNNN🤣NNNNNN🤣AAAAAA👿RRRRR🔘 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA??CCCCCC⚔️CCCCCC⚔️GGGGGG🖤EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII?? MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍IIIIII🍷OOOOO🎲AAAAAA👿RRRRR🔘SSSSS⚒️",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜OOOOO🎲 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿 MMMMM🚀AAAAAA👿RRRRR🔘AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿OOOOO🎲UUUUU💣AAAAAA👿 JJJJJJ👅AAAAAA👿AAAAAA👿NNNNNN🤣 CCCCCC⚔️JJJJJJ👅OOOOO🎲DDDDD👿YYYYYYAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜EEEEEE💊 BBBBB🤍HHHHH🖤OOOOO🎲AAAAAA👿DDDDD👿AAAAAA👿 CCCCCC⚔️OOOOO🎲DDDDD👿AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜OOOOO🎲 CCCCCC⚔️HHHHH🖤UUUUU💣TTTTT??EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿.    KKKKKK📌AAAAAA👿AAAAAA👿 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍RRRRR🔘HHHHH🖤EEEEEE💊NNNNNN🤣 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣MMMMM🚀MMMMM🚀YYYYYY KKKKKK💜UUUUU💣TTTTT🚭IIIIII🍷YYYYYYAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍AAAAAA👿HHHHH🖤IIIIII🍷 KKKKKK💜AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍UUUUU💣RRRRR🔘",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 CCCCCC⚔️GGGGGG🖤OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿IIIIII🍷YYYYYYAAAAAA👿 CCCCCC⚔️GGGGGG🖤OOOOO🎲DDDDD👿UUUUU💣",
+        "OOOOOO??YYYYYYEEEEEE💊 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA👿CCCCCC⚔️CCCCCC⚔️HHHHH🖤EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷 CCCCCC⚔️HHHHH🖤UUUUU💣CCCCCC⚔️HHHHH🖤OOOOO🎲 KKKKKK💜AAAAAA👿TTTTT🚭YYYYYY",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍AAAAAA👿HHHHH🖤IIIIII🍷 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿IIIIII🍷YYYYYYAAAAAA👿 CCCCCC⚔️GGGGGG🖤OOOOO🎲DDDDD👿YYYYYY",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣MMMMM🚀MMMMM🚀YYYYYY RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣MMMMM🚀YYYYYY CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍AAAAAA👿JJJJJJ👅IIIIII🍷 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜IIIIII🍷 LLLLLL🔨AAAAAA👿DDDDD👿KKKKKK💜IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿IIIIII🍷YYYYYYAAAAAA👿 JJJJJJ👅AAAAAA👿AAAAAA👿NNNNNN🤣 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE??RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍UUUUU💣RRRRR🔘 FFFFFF🔥AAAAAA👿DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 BBBBB🤍AAAAAA👿NNNNNN🤣AAAAAA👿 DDDDD👿UUUUU💣NNNNNN🤣GGGGGG🖤AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿KKKKKK💜EEEEEE💊 FFFFFF🔥EEEEEE💊KKKKKK💜UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜EEEEEE💊 MMMMM🚀UUUUU💣HHHHH🖤 MMMMM🚀EEEEEE💊IIIIII🍷 PPPPPP📌AAAAAA👿KKKKKK💜IIIIII🍷SSSSS⚒️TTTTT🚭AAAAAA👿NNNNNN🤣IIIIII🍷 LLLLLL🔨AAAAAA👿VVVVDDDDD👿AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 PPPPPP📌KKKKKK💜AAAAAA👿OOOOO🎲SSSSS⚒️TTTTT🚭AAAAAA👿NNNNNN🤣IIIIII🍷 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷",
+        "RRRRRR⚔️AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊 BBBBB🤍EEEEEE💊TTTTT🚭",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘UUUUU💣 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍UUUUU💣TTTTT🚭",
+        "OOOOOO👅YYYYYYEEEEEE💊 TTTTT🚭AAAAAA👿TTTTT🚭TTTTT🚭TTTTT🚭EEEEEE💊 UUUUU💣TTTTT🚭HHHHH🖤",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣MMMMM🚀MMMMM🚀YYYYYY CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 CCCCCC⚔️UUUUU💣UUUUU💣DDDDD👿VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿IIIIII🍷YYYYYYAAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿AAAAAA👿 DDDDD👿EEEEEE💊DDDDD👿EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘OOOOO🎲 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 KKKKKK💜OOOOO🎲 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 KKKKKK💜EEEEEE💊 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿EEEEEE💊 PPPPPP📌EEEEEE💊 LLLLLL🔨OOOOO🎲LLLLLL🔨LLLLLL🔨AAAAAA👿",
+        "LLLLLLL🎲OOOOO🎲LLLLLL🔨LLLLLL🔨EEEEEE💊 HHHHH🖤OOOOO🎲 LLLLLL🔨OOOOO🎲LLLLLL🔨LLLLLL🔨EEEEEE💊 TTTTT🚭EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜OOOOO🎲 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿 PPPPPP📌EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 DDDDD👿EEEEEE💊 MMMMM🚀UUUUU💣JJJJJJ👅GGGGGG🖤EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀UUUUU💣MMMMM🚀YYYYYY CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜 BBBBB🤍UUUUU💣RRRRR🔘 CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 VVVVEEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 AAAAAA👿MMMMM🚀MMMMM🚀AAAAAA👿 CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷 FFFFFF🔥AAAAAA👿BBBBB🤍DDDDD👿 MMMMM🚀AAAAAA👿RRRRR🔘VVVVAAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍UUUUU💣RRRRR🔘  MMMMM🚀AAAAAA👿RRRRR🔘VVVVAAAAAA👿",
+        "IIIIIIII⚒️DDDDD👿GGGGGG🖤AAAAAA👿RRRRR🔘 AAAAAA👿JJJJJJ👅AAAAAA👿AAAAAA👿 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜AAAAAA👿 LLLLLL🔨AAAAAA👿DDDDD👿KKKKKK💜AAAAAA👿",
+        "IIIIIIII⚒️DDDDD👿HHHHH🖤AAAAAA👿 TTTTT🚭EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿AAAAAA👿 DDDDD👿EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿 DDDDD👿EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊NNNNNN🤣 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 HHHHH🖤AAAAAA👿IIIIII🍷",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜YYYYYYTTTTT🚭TTTTT🚭OOOOO🎲 HHHHH🖤AAAAAA👿IIIIII🍷",
+        "YYYYYY🤍EEEEEE💊 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA👿CCCCCC⚔️CCCCCC⚔️HHHHH🖤EEEEEE💊",
+        "MMMMM💥AAAAAA👿RRRRR🔘 GGGGGG🖤AAAAAA👿YYYYYYAAAAAA👿 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿 AAAAAA👿 DDDDD👿EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊. KKKKKK📌 PPPPPP📌EEEEEE💊LLLLLL🔨UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 KKKKKK💜OOOOO🎲 LLLLLL🔨EEEEEE💊UUUUU💣 LLLLLL🔨UUUUU💣NNNNNN🤣DDDDD👿 PPPPPP📌EEEEEE💊 AAAAAA👿PPPPPP📌NNNNNN🤣EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿 MMMMM🚀AAAAAA👿RRRRR🔘AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿 KKKKKK💜AAAAAA👿 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿AAAAAA👿 MMMMM🚀AAAAAA👿RRRRR🔘AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍AAAAAA👿JJJJJJ👅IIIIII🍷 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿AAAAAA👿",
+        "OOOOOO👅YYYYYYEEEEEE💊 TTTTT🚭AAAAAA👿TTTTT🚭TTTTT🚭EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 AAAAAA👿CCCCCC⚔️UUUUU💣DDDDD👿AAAAAA👿. AAAAAA👿BBBBB🤍",
+        "MMMMM💥AAAAAA👿RRRRR🔘NNNNNN??AAAAAA👿 MMMMM🚀AAAAAA👿NNNNNN🤣AAAAAA👿 HHHHH🖤AAAAAA👿IIIIII🍷 RRRRR🔘AAAAAA👿 DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊",
+        "MMMMM💥AAAAAA👿RRRRR🔘 MMMMM🚀AAAAAA👿RRRRR🔘 KKKKKK💜EEEEEE💊 LLLLLL🔨IIIIII🍷MMMMM🚀HHHHH🖤EEEEEE💊AAAAAA👿 TTTTT🚭EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿HHHHH🖤",
+        "OOOOOO👅YYYYYYEEEEEE💊 KKKKKK💜IIIIII🍷NNNNNN🤣AAAAAA👿AAAAAA👿RRRRR🔘 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA??CCCCCC⚔️CCCCCC⚔️HHHHH🖤EEEEEE💊 UUUUU💣TTTTT🚭HHHHH🖤",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿 CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿VVVVAAAAAA👿 OOOOO🎲YYYYYYEEEEEE💊 TTTTT🚭AAAAAA👿TTTTT🚭TTTTT🚭EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 BBBBB🤍EEEEEE💊HHHHH🖤EEEEEE💊 CCCCCC⚔️BBBBB🤍UUUUU💣DDDDD👿VVVVAAAAAA👿 LLLLLL🔨EEEEEE💊",
+        "GGGGGG🌿EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷 FFFFFF🔥AAAAAA👿NNNNNN🤣DDDDD👿 OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 BBBBB🤍AAAAAA👿JJJJJJ👅IIIIII🍷 KKKKKK💜AAAAAA👿AAAAAA👿AAAAAA👿 BBBBB🤍UUUUU💣RRRRR🔘 TTTTT🚭OOOOO🎲DDDDD👿UUUUU💣",
+        "TTTTTTT🍷AAAAAA👿TTTTT🚭TTTTT🚭TTTTT🚭EEEEEE💊 TTTTT🚭EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜EEEEEE💊 MMMMM🚀UUUUU💣HHHHH🖤 PPPPPP📌EEEEEE💊 LLLLLL🔨OOOOO🎲DDDDD👿AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿 PPPPPP📌EEEEEE💊 LLLLLL🔨OOOOO🎲DDDDD👿AAAAAA👿",
+        "OOOOOO👅YYYYYYEEEEEE💊 RRRRR🔘AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 SSSSS⚒️AAAAAA👿MMMMM🚀JJJJJJ👿 WWWWW??AAAAAA👿LLLLLL🔨EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 KKKKKK💜IIIIII🍷.GGGGGG🖤AAAAAA👿 DDDDD👿 SSSSS⚒️AAAAAA👿MMMMM🚀BBBBB🤍HHHHH🖤AAAAAA👿LLLLLL🔨AAAAAA👿 KKKKKK💜EEEEEE💊 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿UUUUU💣",
+        "RRRRRR⚔️AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 IIIIII🍷EEEEEE💊 BBBBB🤍EEEEEE💊YYYYYY",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 GGGGGG🖤AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 CCCCCC⚔️HHHHH🖤UUUUU💣TTTTT🚭EEEEEE💊 WWWWW🥰AAAAAA👿LLLLLL🔨IIIIII🍷 RRRRR🔘AAAAAA👿 DDDDD👿IIIIII🍷",
+        "MMMMM💥AAAAAA👿AAAAAA👿AAAAAA👿AAAAAA👿AAAAAA👿AAAAAA👿",
+        "KKKKKK📌WWWWW🥰EEEEEE💊EEEEEE💊EEEEEE💊 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿EEEEEE💊 DDDDD👿EEEEEE💊",
+        "OOOOOO👅YYYYYYEEEEEE💊 BBBBB🤍HHHHH🖤AAAAAA👿NNNNNN🤣GGGGGG🖤IIIIII🍷 TTTTT🚭AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊",
+        "RRRRRR⚔️AAAAAA👿NNNNNN🤣DDDDD👿IIIIII🍷 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA👿CCCCCC⚔️CCCCCC⚔️HHHHH🖤EEEEEE💊",
+        "KKKKKK📌IIIIII🍷NNNNNN🤣NNNNNN🤣AAAAAA👿RRRRR🔘 KKKKKK💜EEEEEE💊 BBBBB🤍AAAAAA👿CCCCCC⚔️CCCCCC⚔️HHHHH🖤EEEEEE💊",
+        "TTTTTTT🍷EEEEEE💊RRRRR🔘IIIIII🍷 MMMMM🚀AAAAAA👿AAAAAA👿AAAAAA👿 NNNNNN🤣AAAAAA👿 CCCCCC⚔️HHHHH🖤UUUUU💣DDDDD👿BBBBB🤍YYYYYYEEEEEE💊GGGGGG🖤AAAAAA👿",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 BBBBB🤍AAAAAA👿JJJJJJ👅IIIIII🍷 KKKKKK💜AAAAAA👿AAAAAA👿AAAAAA👿 BBBBB🤍HHHHH🖤OOOOO🎲SSSSS⚒️DDDDD👿SSSSS⚒️ DDDDD👿EEEEEE💊DDDDD👿EEEEEE💊",
+        "AAAAAA👿BBBBB🤍 CCCCCC⚔️HHHHH🖤AAAAAA??LLLLLL🔨 LLLLLL🔨UUUUU💣NNNNNN🤣DDDDD👿 KKKKKK💜EEEEEE💊 CCCCCC⚔️HHHHH🖤UUUUU💣PPPPPP📌PPPPPP📌EEEEEE💊 KKKKKK💜AAAAAA👿RRRRR🔘",
+        "TTTTTTT🍷EEEEEE💊EEEEEE💊IIIIII🍷 BBBBB🤍AAAAAA👿JJJJJJ👅IIIIII🍷 CCCCCC⚔️HHHHH🖤OOOOO🎲DDDDD👿UUUUU💣 OOOOO🎲YYYYYYEEEEEE💊"
+    ]
 
-        dare_texts = [
-            "Apni maa ko call kar ke bol — 'Main tujhse pyaar karta hoon' 📞❤️",
-            "Apni sabse embarrassing photo share kar group mein 📸😹",
-            "Kisi bhi friend ko abhi message kar — 'Bhai mujhe pata chal gaya' — aur reaction dekho 😈",
-            "10 seconds ke liye khud se hi baat karo — loud 🗣️",
-            "Abhi ek push-up kar aur photo bhejo 💪",
-            "Apne crush ko 'Hi' bol — screenshot bhejo 😳",
-            "Khud ki roast karo ek paragraph mein — seriously 😂",
-            "Apna phone wallpaper change karo kisi funny photo mein 📱",
-            "5 random logo ko 'I love you' message karo 💌",
-            "Apni last seen status pe kuch funny likho 📝",
-            "Kisi bhi group mein 'Main pagal hoon' bolo 🤪",
-            "Apna profile pic change karo kisi meme se 🖼️",
-            "Apne best friend ko call karo aur kuch funny bolo 📞",
-            "Apni gallery se koi embarrassing photo share karo 📸",
-            "Kisi random person ko compliment do 🌹",
-            "Apne parents ko 'I love you' bolo ❤️",
-            "Kisi bhi chat mein 'I am the best' bolo 😎",
-            "Apna phone number kisi stranger ko do 📱",
-            "Kisi ko 'You are amazing' bol kar photo bhejo 💖",
-            "Apni life ka sabse embarrassing story share karo 📖",
-            "Kisi ko 'Mujhe tumse pyaar hai' bol kar block karo 💀",
-            "Apni bio mein kuch weird likho 📝",
-            "Kisi bhi group mein 'Main aaj gussa hoon' bolo 😤",
-            "Apne crush ko 'Hi' bol kar screenshot bhejo 😳",
-            "Kisi ko 'You are my hero' bolo 🦸",
-            "Apni last seen story mein kuch funny daalo 📱",
-            "Kisi bhi chat mein 'Main bhagwan hoon' bolo 😂",
-            "Apne best friend ko 'Main teri maa hoon' bolo 🤣",
-            "Kisi random person ko 'You are beautiful' bolo 💕",
-            "Apni life ki best memory share karo 📸"
-        ]
+            
+            ms2_texts = [
+                "B⃠a⃠a⃠p⃠ b⃠h⃠i⃠ b⃠n⃠a⃠l⃠e⃠ m⃠u⃠j⃠e⃠ r⃠n⃠d⃠i⃠k⃠e⃠",
+        "T⃠e⃠r⃠a⃠ b⃠a⃠a⃠p⃠ r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ e⃠y⃠ y⃠a⃠a⃠d⃠ e⃠y⃠ t⃠u⃠j⃠h⃠e⃠",
+        "T⃠u⃠ a⃠p⃠n⃠i⃠ M⃠a⃠a⃠ c⃠u⃠d⃠a⃠ n⃠a⃠ t⃠y⃠m⃠p⃠a⃠s⃠s⃠",
+        "O⃠y⃠e⃠ u⃠n⃠f⃠u⃠n⃠n⃠y⃠ s⃠w⃠i⃠p⃠e⃠ m⃠t⃠t⃠ k⃠r⃠",
+        "O⃠h⃠ h⃠e⃠l⃠l⃠o⃠ b⃠i⃠h⃠a⃠r⃠i⃠ t⃠e⃠r⃠a⃠ b⃠a⃠a⃠p⃠ b⃠i⃠h⃠a⃠r⃠i⃠ o⃠r⃠ t⃠u⃠ v⃠ b⃠i⃠h⃠a⃠r⃠i⃠ a⃠a⃠u⃠k⃠a⃠t⃠ m⃠e⃠ r⃠h⃠a⃠ k⃠r⃠.",
+        "O⃠y⃠y⃠ k⃠i⃠n⃠n⃠e⃠r⃠ t⃠u⃠j⃠h⃠e⃠ g⃠c⃠ m⃠e⃠ a⃠a⃠n⃠e⃠ k⃠i⃠ p⃠e⃠r⃠m⃠i⃠s⃠s⃠i⃠o⃠n⃠ k⃠i⃠s⃠n⃠e⃠ d⃠i⃠.",
+        "C⃠u⃠d⃠k⃠e⃠ d⃠i⃠k⃠h⃠a⃠",
+        "C⃠u⃠d⃠k⃠e⃠ d⃠i⃠k⃠h⃠a⃠ e⃠k⃠ b⃠a⃠a⃠r⃠.",
+        "S⃠u⃠n⃠ s⃠u⃠n⃠ m⃠a⃠ c⃠u⃠d⃠a⃠.",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠c⃠a⃠ b⃠h⃠o⃠s⃠d⃠a⃠.",
+        "O⃠y⃠e⃠ c⃠h⃠o⃠t⃠i⃠ j⃠a⃠t⃠i⃠ k⃠e⃠ t⃠m⃠r⃠.",
+        "K⃠y⃠? j⃠l⃠d⃠i⃠ l⃠i⃠k⃠h⃠ k⃠i⃠d⃠d⃠e⃠.",
+        "B⃠i⃠h⃠a⃠r⃠i⃠ c⃠o⃠m⃠ g⃠a⃠n⃠g⃠ k⃠e⃠ b⃠a⃠a⃠p⃠ k⃠o⃠ t⃠a⃠g⃠ c⃠r⃠e⃠g⃠a⃠ t⃠u⃠",
+        "M⃠u⃠j⃠h⃠e⃠ c⃠y⃠a⃠ t⃠u⃠ b⃠i⃠h⃠a⃠r⃠i⃠ e⃠y⃠ t⃠m⃠k⃠c⃠ b⃠s⃠",
+        "J⃠a⃠l⃠d⃠i⃠ s⃠e⃠ r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ p⃠a⃠p⃠a⃠ b⃠o⃠l⃠",
+        "S⃠i⃠d⃠e⃠ h⃠o⃠j⃠a⃠ b⃠i⃠h⃠a⃠r⃠i⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ a⃠b⃠",
+        "H⃠y⃠e⃠ p⃠g⃠l⃠ b⃠h⃠g⃠ m⃠a⃠t⃠ a⃠c⃠h⃠e⃠ s⃠e⃠ c⃠u⃠d⃠",
+        "b⃠h⃠g⃠ n⃠y⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ t⃠u⃠ a⃠j⃠j⃠",
+        "H⃠y⃠e⃠ p⃠g⃠l⃠ k⃠e⃠ b⃠c⃠h⃠e⃠ b⃠h⃠a⃠g⃠ m⃠a⃠t⃠",
+        "H⃠y⃠e⃠ d⃠u⃠r⃠ h⃠a⃠t⃠t⃠ m⃠a⃠d⃠h⃠c⃠h⃠o⃠d⃠ k⃠e⃠ b⃠a⃠c⃠h⃠e⃠",
+        "k⃠o⃠i⃠ b⃠a⃠t⃠ n⃠y⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠ e⃠s⃠l⃠i⃠y⃠e⃠ m⃠a⃠f⃠ c⃠r⃠ r⃠h⃠a⃠ h⃠u⃠ t⃠u⃠j⃠h⃠e⃠",
+        "k⃠o⃠i⃠ b⃠a⃠a⃠t⃠ n⃠y⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ a⃠p⃠n⃠i⃠ t⃠u⃠ m⃠a⃠f⃠i⃠ d⃠e⃠ d⃠u⃠n⃠g⃠a⃠",
+        "A⃠c⃠h⃠e⃠ s⃠e⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ a⃠p⃠n⃠i⃠ t⃠u⃠ m⃠a⃠f⃠i⃠ m⃠i⃠l⃠ j⃠a⃠y⃠e⃠g⃠i⃠ t⃠u⃠j⃠h⃠e⃠",
+        "a⃠p⃠n⃠i⃠ m⃠a⃠ m⃠a⃠t⃠ c⃠h⃠u⃠d⃠a⃠ m⃠u⃠j⃠e⃠ s⃠w⃠i⃠p⃠e⃠ c⃠r⃠k⃠e⃠",
+        "A⃠c⃠h⃠e⃠ s⃠e⃠ a⃠p⃠n⃠i⃠ m⃠a⃠ c⃠u⃠d⃠w⃠a⃠ t⃠u⃠ s⃠w⃠i⃠p⃠e⃠ c⃠r⃠k⃠e⃠",
+        "F⃠r⃠ b⃠o⃠l⃠n⃠a⃠ n⃠a⃠ k⃠i⃠ c⃠u⃠d⃠w⃠a⃠ l⃠e⃠ a⃠p⃠n⃠i⃠ m⃠a⃠ s⃠w⃠i⃠p⃠e⃠ c⃠r⃠k⃠e⃠",
+        "C⃠y⃠a⃠ h⃠u⃠a⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ t⃠e⃠r⃠y⃠",
+        "p⃠r⃠ k⃠e⃠s⃠e⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ t⃠e⃠r⃠y⃠ m⃠a⃠",
+        "m⃠u⃠j⃠h⃠e⃠ p⃠t⃠a⃠ t⃠h⃠a⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "m⃠e⃠y⃠ n⃠y⃠ m⃠a⃠n⃠t⃠a⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ t⃠e⃠r⃠y⃠",
+        "t⃠e⃠r⃠i⃠ m⃠a⃠ r⃠n⃠d⃠y⃠",
+        "l⃠o⃠d⃠e⃠ s⃠e⃠ u⃠t⃠r⃠ m⃠c⃠",
+        "l⃠u⃠n⃠ m⃠t⃠ c⃠h⃠u⃠s⃠ m⃠e⃠r⃠a⃠",
+        "n⃠i⃠k⃠a⃠l⃠ m⃠a⃠d⃠a⃠r⃠c⃠h⃠d⃠",
+        "c⃠h⃠u⃠p⃠ o⃠y⃠e⃠ g⃠a⃠s⃠h⃠t⃠i⃠ k⃠ b⃠a⃠c⃠h⃠e⃠",
+        "m⃠a⃠k⃠i⃠c⃠h⃠u⃠t⃠ t⃠e⃠r⃠i⃠",
+        "c⃠h⃠u⃠p⃠ r⃠n⃠d⃠y⃠k⃠e⃠",
+        "m⃠a⃠ r⃠n⃠d⃠y⃠ t⃠e⃠r⃠i⃠",
+        "t⃠e⃠r⃠i⃠ m⃠a⃠ k⃠ h⃠a⃠t⃠h⃠ t⃠o⃠d⃠h⃠ k⃠ t⃠e⃠r⃠e⃠ b⃠a⃠a⃠p⃠ k⃠ m⃠u⃠h⃠ m⃠e⃠ f⃠a⃠s⃠a⃠d⃠u⃠n⃠g⃠a⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "l⃠e⃠a⃠v⃠e⃠ l⃠e⃠ t⃠u⃠ r⃠n⃠d⃠y⃠k⃠e⃠ p⃠a⃠s⃠a⃠n⃠d⃠ n⃠a⃠i⃠ a⃠y⃠a⃠ m⃠e⃠k⃠o⃠",
+        "l⃠e⃠a⃠v⃠e⃠ l⃠e⃠ t⃠u⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ i⃠d⃠e⃠r⃠ s⃠e⃠",
+        "L⃠e⃠a⃠v⃠e⃠ l⃠e⃠ j⃠l⃠d⃠i⃠ s⃠e⃠ w⃠r⃠n⃠a⃠ m⃠a⃠ c⃠h⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "L⃠e⃠a⃠v⃠e⃠ n⃠y⃠ l⃠e⃠g⃠a⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "S⃠m⃠j⃠h⃠ b⃠a⃠t⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠ t⃠e⃠r⃠y⃠ l⃠e⃠a⃠v⃠e⃠ l⃠e⃠",
+        "f⃠a⃠s⃠t⃠ l⃠e⃠a⃠v⃠e⃠ l⃠e⃠ k⃠a⃠m⃠j⃠o⃠r⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "t⃠u⃠t⃠o⃠ c⃠h⃠u⃠p⃠ r⃠n⃠d⃠y⃠k⃠",
+        "o⃠y⃠ h⃠i⃠j⃠d⃠e⃠ k⃠h⃠a⃠n⃠a⃠ k⃠h⃠a⃠ k⃠e⃠ a⃠a⃠ k⃠a⃠m⃠z⃠o⃠r⃠",
+        "t⃠e⃠r⃠i⃠ m⃠a⃠k⃠o⃠ i⃠l⃠y⃠ r⃠e⃠y⃠🌚😂",
+        "c⃠h⃠u⃠p⃠ c⃠h⃠a⃠p⃠ c⃠h⃠u⃠d⃠ t⃠m⃠k⃠c⃠",
+        "c⃠h⃠u⃠p⃠c⃠h⃠a⃠p⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ a⃠p⃠n⃠i⃠ t⃠u⃠",
+        "s⃠h⃠i⃠ s⃠e⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ a⃠p⃠n⃠i⃠ t⃠u⃠ c⃠h⃠u⃠p⃠c⃠h⃠a⃠p⃠",
+        "f⃠r⃠ s⃠e⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ t⃠u⃠ a⃠p⃠n⃠i⃠ c⃠h⃠u⃠p⃠c⃠h⃠a⃠p⃠",
+        "s⃠h⃠i⃠ s⃠e⃠ l⃠i⃠k⃠h⃠ w⃠r⃠n⃠a⃠ m⃠a⃠ c⃠h⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "m⃠a⃠ c⃠y⃠u⃠ c⃠h⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠ c⃠h⃠u⃠p⃠c⃠h⃠a⃠p⃠",
+        "p⃠r⃠o⃠o⃠f⃠ c⃠r⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠ g⃠y⃠i⃠ t⃠e⃠r⃠y⃠",
+        "p⃠r⃠o⃠o⃠f⃠ e⃠y⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "p⃠r⃠o⃠o⃠f⃠ h⃠o⃠ c⃠h⃠u⃠k⃠a⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "C⃠h⃠u⃠p⃠ c⃠h⃠i⃠l⃠l⃠a⃠r⃠",
+        "c⃠h⃠u⃠p⃠ c⃠h⃠u⃠p⃠ m⃠a⃠a⃠ k⃠ b⃠o⃠s⃠d⃠a⃠ t⃠e⃠r⃠y⃠",
+        "o⃠y⃠ h⃠i⃠j⃠d⃠e⃠ k⃠h⃠a⃠n⃠a⃠ k⃠h⃠a⃠ k⃠e⃠ a⃠a⃠ k⃠a⃠m⃠z⃠o⃠r⃠",
+        "c⃠h⃠u⃠p⃠ m⃠a⃠d⃠a⃠r⃠c⃠h⃠o⃠d⃠ ?",
+        "A⃠b⃠ t⃠k⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ h⃠o⃠g⃠i⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ ?",
+        "n⃠y⃠ n⃠y⃠ m⃠e⃠ k⃠u⃠c⃠h⃠ n⃠y⃠ j⃠a⃠n⃠t⃠a⃠ b⃠s⃠ t⃠e⃠r⃠i⃠ m⃠a⃠ r⃠n⃠d⃠y⃠ e⃠y⃠",
+        "S⃠b⃠s⃠e⃠ p⃠h⃠e⃠l⃠e⃠ a⃠p⃠n⃠i⃠ m⃠a⃠a⃠ k⃠o⃠ b⃠o⃠l⃠ c⃠h⃠u⃠d⃠n⃠a⃠ k⃠a⃠a⃠m⃠ k⃠r⃠e⃠",
+        "Y⃠a⃠h⃠a⃠ b⃠h⃠i⃠ c⃠h⃠u⃠d⃠a⃠ t⃠u⃠ r⃠n⃠d⃠y⃠c⃠e⃠ p⃠i⃠l⃠l⃠e⃠",
+        "t⃠e⃠r⃠i⃠m⃠a⃠k⃠a⃠b⃠o⃠s⃠d⃠a⃠",
+        "t⃠e⃠r⃠i⃠ t⃠o⃠ b⃠h⃠e⃠n⃠ c⃠u⃠d⃠e⃠g⃠i⃠",
+        "c⃠h⃠u⃠p⃠ r⃠n⃠d⃠y⃠k⃠e⃠ t⃠o⃠m⃠m⃠y⃠",
+        "n⃠i⃠k⃠a⃠l⃠ m⃠a⃠d⃠a⃠r⃠c⃠h⃠d⃠ c⃠u⃠d⃠k⃠e⃠ y⃠h⃠a⃠ s⃠e⃠",
+        "c⃠o⃠z⃠ t⃠e⃠r⃠i⃠ m⃠a⃠ a⃠n⃠d⃠h⃠i⃠ r⃠a⃠n⃠d⃠i⃠ h⃠e⃠",
+        "n⃠y⃠t⃠o⃠ b⃠a⃠a⃠p⃠ b⃠o⃠l⃠ m⃠u⃠j⃠h⃠e⃠",
+        "n⃠y⃠n⃠y⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ h⃠o⃠g⃠i⃠ r⃠n⃠d⃠i⃠i⃠ j⃠o⃠ c⃠h⃠u⃠d⃠w⃠a⃠t⃠i⃠ j⃠o⃠g⃠i⃠",
+        "t⃠r⃠y⃠ a⃠m⃠m⃠i⃠ c⃠e⃠ b⃠h⃠o⃠s⃠d⃠e⃠ m⃠e⃠ e⃠m⃠o⃠j⃠i⃠ d⃠a⃠l⃠ m⃠c⃠",
+        "c⃠y⃠a⃠ ? c⃠h⃠m⃠r⃠ c⃠h⃠u⃠d⃠ g⃠y⃠a⃠ c⃠y⃠a⃠ ?",
+        "t⃠m⃠ c⃠h⃠u⃠d⃠r⃠i⃠ h⃠o⃠g⃠i⃠ f⃠r⃠r⃠t⃠o⃠",
+        "c⃠y⃠a⃠ ? k⃠b⃠ ? p⃠g⃠l⃠ e⃠y⃠ c⃠y⃠a⃠ r⃠n⃠d⃠k⃠e⃠k⃠",
+        "c⃠y⃠a⃠ s⃠c⃠h⃠ m⃠e⃠y⃠ p⃠g⃠l⃠ e⃠y⃠ c⃠y⃠a⃠ t⃠u⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ c⃠u⃠d⃠w⃠a⃠ l⃠i⃠ t⃠u⃠n⃠e⃠ a⃠p⃠n⃠i⃠ m⃠a⃠",
+        "i⃠t⃠n⃠a⃠ s⃠c⃠h⃠ n⃠y⃠ b⃠o⃠l⃠ m⃠a⃠ c⃠h⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "s⃠c⃠h⃠ m⃠e⃠y⃠ p⃠g⃠l⃠ e⃠y⃠ t⃠u⃠ a⃠p⃠n⃠i⃠ m⃠a⃠ c⃠u⃠d⃠w⃠a⃠ l⃠i⃠a⃠ m⃠e⃠r⃠e⃠ s⃠t⃠h⃠",
+        "m⃠t⃠l⃠b⃠ t⃠m⃠r⃠",
+        "n⃠y⃠t⃠o⃠",
+        "p⃠u⃠r⃠a⃠ l⃠i⃠k⃠h⃠ m⃠c⃠",
+        "t⃠m⃠r⃠ f⃠r⃠r⃠t⃠o⃠",
+        "o⃠h⃠ o⃠k⃠ c⃠u⃠d⃠l⃠e⃠ f⃠i⃠r⃠",
+        "t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ k⃠a⃠ d⃠a⃠m⃠a⃠d⃠",
+        "c⃠y⃠a⃠ ? a⃠c⃠h⃠e⃠ s⃠e⃠ l⃠i⃠k⃠h⃠e⃠ p⃠e⃠h⃠l⃠e⃠ r⃠n⃠d⃠i⃠k⃠e⃠b⃠a⃠c⃠h⃠e⃠",
+        "n⃠y⃠t⃠o⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠o⃠d⃠n⃠e⃠ m⃠e⃠ v⃠y⃠a⃠s⃠t⃠ h⃠u⃠",
+        "n⃠y⃠t⃠o⃠ p⃠g⃠l⃠ e⃠y⃠ c⃠y⃠a⃠ k⃠u⃠c⃠h⃠ b⃠i⃠",
+        "o⃠y⃠e⃠e⃠ c⃠y⃠a⃠ ? c⃠h⃠u⃠d⃠ g⃠y⃠a⃠ ?",
+        "c⃠h⃠u⃠d⃠ m⃠t⃠ h⃠s⃠s⃠",
+        "y⃠u⃠r⃠ r⃠n⃠d⃠i⃠i⃠ m⃠o⃠m⃠",
+        "a⃠r⃠e⃠ s⃠b⃠k⃠i⃠ m⃠a⃠a⃠ r⃠n⃠d⃠i⃠i⃠ o⃠r⃠ t⃠e⃠r⃠i⃠ b⃠i⃠",
+        "a⃠r⃠e⃠ i⃠d⃠a⃠r⃠ c⃠u⃠d⃠l⃠e⃠ e⃠k⃠ b⃠a⃠a⃠r⃠",
+        "t⃠r⃠i⃠ m⃠a⃠a⃠ c⃠i⃠ t⃠r⃠h⃠",
+        "e⃠k⃠ l⃠i⃠n⃠e⃠ m⃠e⃠ t⃠m⃠r⃠",
+        "Q⃠",
+        "o⃠c⃠y⃠ a⃠b⃠ c⃠h⃠u⃠d⃠l⃠e⃠",
+        "p⃠e⃠h⃠e⃠l⃠e⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠o⃠d⃠u⃠",
+        "n⃠y⃠t⃠o⃠",
+        "q⃠ ?",
+        "h⃠y⃠y⃠y⃠ c⃠h⃠u⃠d⃠ k⃠e⃠ d⃠i⃠k⃠a⃠ e⃠k⃠ b⃠a⃠a⃠r⃠",
+        "o⃠y⃠e⃠e⃠ s⃠u⃠n⃠ d⃠o⃠s⃠t⃠ t⃠m⃠r⃠",
+        "b⃠h⃠a⃠g⃠ j⃠a⃠ r⃠a⃠a⃠n⃠d⃠ m⃠a⃠a⃠f⃠ c⃠r⃠r⃠ d⃠u⃠n⃠g⃠a⃠",
+        "o⃠y⃠e⃠e⃠ p⃠g⃠l⃠ r⃠n⃠d⃠i⃠i⃠ i⃠d⃠a⃠r⃠ a⃠a⃠",
+        "c⃠y⃠a⃠ t⃠m⃠r⃠ f⃠r⃠r⃠t⃠o⃠",
+        "o⃠y⃠e⃠e⃠ i⃠d⃠a⃠r⃠ a⃠a⃠k⃠e⃠ c⃠h⃠u⃠d⃠ l⃠e⃠ c⃠h⃠m⃠r⃠",
+        "n⃠y⃠t⃠o⃠ a⃠e⃠s⃠e⃠ h⃠i⃠ c⃠u⃠d⃠",
+        "o⃠y⃠e⃠e⃠ h⃠y⃠y⃠ a⃠i⃠s⃠e⃠ h⃠i⃠ c⃠u⃠d⃠ l⃠e⃠n⃠a⃠",
+        "o⃠r⃠ c⃠h⃠u⃠d⃠ l⃠e⃠",
+        "c⃠h⃠u⃠d⃠ k⃠e⃠ d⃠i⃠k⃠a⃠ o⃠r⃠",
+        "h⃠y⃠y⃠ c⃠h⃠u⃠d⃠o⃠ n⃠a⃠",
+        "c⃠h⃠u⃠d⃠o⃠ m⃠t⃠ b⃠h⃠a⃠g⃠ j⃠a⃠o⃠",
+        "b⃠y⃠y⃠e⃠e⃠ h⃠y⃠y⃠ c⃠y⃠a⃠ ?",
+        "Q⃠c⃠h⃠u⃠d⃠ q⃠ r⃠h⃠e⃠ h⃠o⃠ ?",
+        "p⃠g⃠l⃠ e⃠y⃠ c⃠y⃠a⃠ m⃠c⃠",
+        "c⃠h⃠u⃠d⃠ m⃠t⃠",
+        "c⃠y⃠a⃠ p⃠g⃠l⃠ r⃠n⃠d⃠i⃠i⃠ i⃠d⃠a⃠r⃠ a⃠a⃠",
+        "t⃠e⃠r⃠i⃠ a⃠m⃠m⃠i⃠ c⃠e⃠ b⃠h⃠o⃠s⃠d⃠e⃠ m⃠e⃠ c⃠h⃠a⃠p⃠p⃠a⃠l⃠",
+        "o⃠y⃠e⃠e⃠ i⃠d⃠a⃠r⃠ a⃠a⃠ m⃠c⃠",
+        "k⃠m⃠z⃠r⃠o⃠r⃠ e⃠y⃠ c⃠y⃠a⃠ r⃠n⃠d⃠i⃠e⃠k⃠",
+        "c⃠y⃠a⃠ l⃠i⃠k⃠h⃠ r⃠h⃠a⃠ ?",
+        "c⃠h⃠u⃠d⃠ t⃠h⃠a⃠ c⃠y⃠a⃠ ?",
+        "o⃠y⃠e⃠e⃠ s⃠l⃠i⃠d⃠e⃠ l⃠e⃠k⃠e⃠ b⃠a⃠a⃠t⃠ c⃠r⃠m⃠c⃠",
+        "i⃠d⃠a⃠r⃠ a⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠o⃠d⃠u⃠",
+        "o⃠y⃠e⃠e⃠ c⃠p⃠ m⃠t⃠ c⃠r⃠r⃠ c⃠h⃠u⃠d⃠l⃠e⃠",
+        "o⃠y⃠e⃠e⃠ h⃠y⃠y⃠ c⃠h⃠u⃠d⃠ k⃠e⃠ d⃠i⃠k⃠a⃠",
+        "i⃠d⃠a⃠r⃠ a⃠a⃠ t⃠r⃠y⃠ m⃠a⃠ s⃠c⃠h⃠o⃠f⃠u⃠ k⃠h⃠a⃠c⃠h⃠a⃠r⃠ k⃠h⃠a⃠c⃠h⃠a⃠r⃠",
+        "i⃠d⃠a⃠r⃠ a⃠a⃠ j⃠a⃠ m⃠c⃠",
+        "h⃠y⃠y⃠ i⃠d⃠a⃠r⃠ a⃠a⃠k⃠e⃠ c⃠h⃠u⃠d⃠l⃠e⃠",
+        "o⃠y⃠e⃠e⃠ k⃠m⃠z⃠o⃠r⃠ m⃠c⃠ i⃠d⃠a⃠r⃠ a⃠a⃠",
+        "y⃠e⃠ c⃠y⃠a⃠ t⃠m⃠r⃠",
+        "o⃠y⃠e⃠e⃠ n⃠y⃠ c⃠p⃠ n⃠y⃠ c⃠r⃠r⃠",
+        "o⃠y⃠e⃠e⃠ p⃠g⃠l⃠ m⃠t⃠ c⃠r⃠r⃠",
+        "c⃠u⃠d⃠l⃠e⃠ a⃠r⃠a⃠m⃠ s⃠e⃠ m⃠c⃠",
+        "p⃠g⃠l⃠ e⃠y⃠ c⃠y⃠a⃠ r⃠n⃠d⃠i⃠e⃠k⃠",
+        "c⃠p⃠ c⃠r⃠c⃠e⃠ c⃠h⃠u⃠d⃠e⃠g⃠a⃠ !",
+        "b⃠a⃠a⃠p⃠ ? m⃠c⃠ m⃠e⃠r⃠a⃠ c⃠o⃠i⃠ m⃠a⃠ b⃠a⃠a⃠p⃠ n⃠y⃠ e⃠y⃠ m⃠a⃠i⃠ u⃠p⃠a⃠r⃠ s⃠e⃠ r⃠o⃠c⃠k⃠e⃠t⃠ p⃠e⃠ b⃠e⃠t⃠h⃠ c⃠e⃠ b⃠s⃠s⃠ t⃠e⃠r⃠i⃠ m⃠a⃠ c⃠h⃠o⃠d⃠n⃠e⃠ a⃠y⃠a⃠ h⃠u⃠",
+        "C⃠h⃠o⃠t⃠a⃠ l⃠i⃠k⃠h⃠ r⃠n⃠d⃠i⃠ k⃠ b⃠a⃠c⃠h⃠e⃠",
+        "C⃠h⃠o⃠t⃠a⃠ l⃠i⃠k⃠h⃠a⃠ w⃠r⃠n⃠a⃠ t⃠r⃠y⃠ m⃠a⃠ r⃠n⃠d⃠y⃠",
+        "T⃠r⃠y⃠ m⃠a⃠ b⃠a⃠k⃠a⃠ c⃠o⃠d⃠e⃠g⃠a⃠",
+        "T⃠m⃠k⃠c⃠ m⃠a⃠i⃠n⃠ b⃠u⃠r⃠f⃠",
+        "B⃠h⃠i⃠k⃠a⃠r⃠i⃠ k⃠i⃠ j⃠h⃠a⃠t⃠ m⃠a⃠ c⃠u⃠d⃠a⃠ l⃠e⃠",
+        "C⃠h⃠o⃠d⃠k⃠e⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ m⃠a⃠r⃠j⃠a⃠y⃠e⃠g⃠i⃠",
+        "T⃠m⃠k⃠c⃠ m⃠a⃠i⃠n⃠ M⃠o⃠u⃠n⃠t⃠ E⃠v⃠e⃠r⃠e⃠s⃠t⃠",
+        "M⃠u⃠h⃠ m⃠e⃠y⃠ l⃠e⃠g⃠a⃠ l⃠u⃠n⃠d⃠ m⃠e⃠r⃠a⃠",
+        "H⃠i⃠j⃠d⃠e⃠ k⃠i⃠ j⃠h⃠a⃠t⃠ c⃠h⃠u⃠p⃠ w⃠r⃠n⃠a⃠ t⃠r⃠y⃠ m⃠a⃠ r⃠n⃠d⃠i⃠",
+        "M⃠e⃠n⃠u⃠ n⃠y⃠ p⃠t⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ r⃠a⃠n⃠d⃠y⃠",
+        "M⃠e⃠n⃠u⃠ k⃠i⃠ p⃠t⃠a⃠ m⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "M⃠e⃠n⃠u⃠ p⃠t⃠a⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "M⃠e⃠n⃠u⃠ s⃠b⃠ p⃠t⃠a⃠ m⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠ t⃠e⃠r⃠y⃠",
+        "M⃠e⃠n⃠u⃠ p⃠r⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ r⃠a⃠n⃠d⃠y⃠",
+        "R⃠a⃠n⃠d⃠y⃠ m⃠a⃠a⃠ t⃠e⃠r⃠y⃠ m⃠e⃠n⃠u⃠ p⃠t⃠a⃠",
+        "T⃠e⃠n⃠u⃠ o⃠r⃠ m⃠e⃠n⃠u⃠ p⃠t⃠a⃠ e⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "B⃠s⃠ b⃠s⃠ m⃠a⃠a⃠ c⃠u⃠d⃠w⃠a⃠ a⃠p⃠n⃠i⃠",
+        "B⃠s⃠ b⃠s⃠ m⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠ t⃠h⃠n⃠k⃠s⃠s⃠",
+        "B⃠s⃠ b⃠s⃠ c⃠h⃠u⃠d⃠w⃠a⃠ l⃠i⃠a⃠ t⃠u⃠ a⃠p⃠n⃠i⃠ m⃠a⃠a⃠",
+        "B⃠s⃠ b⃠s⃠ k⃠a⃠m⃠j⃠o⃠r⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "S⃠m⃠j⃠h⃠ g⃠y⃠a⃠ a⃠p⃠n⃠i⃠ m⃠a⃠ c⃠u⃠d⃠w⃠a⃠ l⃠e⃠ a⃠b⃠",
+        "s⃠m⃠j⃠h⃠ g⃠y⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "s⃠m⃠j⃠h⃠ g⃠y⃠a⃠ t⃠u⃠ s⃠a⃠b⃠i⃠t⃠ k⃠r⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "C⃠y⃠a⃠ h⃠u⃠a⃠ m⃠a⃠ c⃠u⃠d⃠w⃠a⃠ t⃠u⃠ a⃠p⃠n⃠i⃠",
+        "E⃠a⃠s⃠y⃠ m⃠a⃠a⃠ c⃠u⃠d⃠w⃠a⃠ l⃠e⃠ a⃠p⃠n⃠i⃠ t⃠u⃠",
+        "E⃠a⃠s⃠y⃠ w⃠8⃠ m⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ l⃠e⃠ a⃠p⃠n⃠i⃠ a⃠b⃠",
+        "S⃠a⃠n⃠s⃠ a⃠r⃠i⃠ h⃠a⃠ k⃠y⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠g⃠i⃠ a⃠j⃠j⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠ k⃠o⃠ b⃠i⃠n⃠a⃠ s⃠a⃠n⃠s⃠s⃠ l⃠e⃠t⃠e⃠ h⃠u⃠e⃠ c⃠h⃠o⃠d⃠u⃠n⃠g⃠a⃠",
+        "c⃠h⃠u⃠p⃠ r⃠a⃠n⃠d⃠i⃠k⃠e⃠ k⃠a⃠m⃠j⃠o⃠r⃠",
+        "a⃠p⃠n⃠i⃠ m⃠a⃠ n⃠o⃠r⃠m⃠i⃠e⃠ c⃠u⃠d⃠w⃠a⃠ l⃠e⃠ t⃠u⃠",
+        "f⃠r⃠ c⃠y⃠a⃠ n⃠o⃠r⃠m⃠i⃠e⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "b⃠a⃠s⃠ t⃠h⃠e⃠k⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ r⃠a⃠n⃠d⃠y⃠",
+        "b⃠a⃠s⃠ t⃠h⃠e⃠k⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠y⃠i⃠",
+        "k⃠a⃠m⃠j⃠o⃠r⃠ t⃠h⃠i⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ e⃠s⃠l⃠i⃠y⃠e⃠ c⃠u⃠d⃠ g⃠a⃠i⃠",
+        "M⃠a⃠i⃠ s⃠b⃠ j⃠a⃠n⃠t⃠a⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "c⃠h⃠l⃠ c⃠h⃠l⃠ h⃠t⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠y⃠i⃠",
+        "f⃠r⃠ k⃠a⃠i⃠s⃠e⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ m⃠a⃠a⃠ t⃠e⃠r⃠y⃠",
+        "m⃠a⃠a⃠ t⃠e⃠r⃠y⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "b⃠a⃠s⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "f⃠r⃠ r⃠a⃠n⃠d⃠y⃠ m⃠a⃠ t⃠e⃠r⃠y⃠ e⃠y⃠",
+        "K⃠a⃠m⃠j⃠o⃠r⃠ m⃠a⃠ k⃠a⃠ b⃠c⃠h⃠a⃠ t⃠u⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "b⃠h⃠o⃠t⃠ g⃠n⃠d⃠i⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ m⃠a⃠a⃠ t⃠e⃠r⃠y⃠",
+        "p⃠r⃠ k⃠a⃠i⃠s⃠e⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠ i⃠t⃠n⃠a⃠ g⃠n⃠d⃠a⃠",
+        "m⃠u⃠j⃠h⃠e⃠ c⃠y⃠a⃠ b⃠t⃠a⃠ r⃠h⃠a⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "m⃠u⃠j⃠h⃠e⃠ c⃠y⃠a⃠ p⃠t⃠a⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ t⃠e⃠r⃠y⃠",
+        "f⃠i⃠r⃠ m⃠u⃠j⃠h⃠e⃠ n⃠y⃠ p⃠t⃠a⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "p⃠t⃠a⃠ n⃠y⃠ k⃠o⃠n⃠ c⃠o⃠d⃠ d⃠i⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ k⃠o⃠",
+        "r⃠u⃠k⃠ a⃠a⃠y⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠o⃠d⃠k⃠e⃠",
+        "w⃠a⃠i⃠t⃠ c⃠r⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠o⃠d⃠ r⃠h⃠a⃠ h⃠u⃠",
+        "w⃠a⃠i⃠t⃠ c⃠r⃠ r⃠a⃠b⃠d⃠y⃠k⃠e⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ r⃠h⃠i⃠ e⃠y⃠ t⃠e⃠r⃠y⃠",
+        "w⃠a⃠i⃠t⃠ k⃠r⃠ s⃠m⃠j⃠h⃠ r⃠h⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠o⃠d⃠k⃠e⃠",
+        "w⃠a⃠i⃠t⃠ l⃠e⃠ t⃠h⃠o⃠d⃠a⃠ c⃠h⃠o⃠d⃠n⃠e⃠ d⃠e⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠",
+        "r⃠u⃠k⃠ j⃠a⃠ a⃠a⃠n⃠d⃠ r⃠k⃠h⃠ d⃠u⃠n⃠g⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠e⃠ l⃠i⃠y⃠e⃠",
+        "t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ f⃠a⃠m⃠o⃠u⃠s⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "m⃠a⃠a⃠n⃠ l⃠i⃠a⃠ m⃠e⃠n⃠e⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ s⃠a⃠l⃠i⃠ t⃠e⃠r⃠y⃠",
+        "m⃠a⃠a⃠n⃠ l⃠i⃠a⃠ m⃠a⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "s⃠h⃠a⃠n⃠t⃠ b⃠e⃠t⃠h⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠w⃠a⃠ t⃠u⃠ a⃠p⃠n⃠i⃠",
+        "s⃠h⃠a⃠n⃠t⃠ b⃠e⃠t⃠h⃠k⃠e⃠ c⃠h⃠u⃠d⃠w⃠a⃠ l⃠e⃠ a⃠p⃠n⃠i⃠ m⃠a⃠k⃠o⃠ t⃠u⃠",
+        "f⃠r⃠ s⃠e⃠ s⃠h⃠a⃠n⃠t⃠ B⃠e⃠t⃠h⃠ t⃠u⃠ c⃠u⃠d⃠ a⃠b⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ y⃠h⃠a⃠",
+        "m⃠e⃠r⃠e⃠ s⃠m⃠j⃠h⃠ n⃠y⃠ a⃠y⃠a⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ t⃠e⃠r⃠y⃠",
+        "L⃠e⃠ k⃠e⃠l⃠a⃠ K⃠h⃠a⃠ t⃠u⃠ m⃠a⃠d⃠a⃠r⃠c⃠h⃠o⃠d⃠",
+        "H⃠y⃠e⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠y⃠i⃠ c⃠y⃠a⃠",
+        "h⃠y⃠e⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ m⃠a⃠r⃠ g⃠a⃠i⃠ c⃠y⃠a⃠",
+        "H⃠y⃠e⃠ s⃠c⃠h⃠ b⃠t⃠a⃠ c⃠o⃠m⃠ c⃠o⃠d⃠ d⃠i⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠",
+        "C⃠h⃠l⃠ c⃠h⃠o⃠d⃠ d⃠i⃠a⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ k⃠o⃠ s⃠m⃠j⃠h⃠l⃠e⃠",
+        "B⃠a⃠k⃠i⃠ k⃠o⃠i⃠ d⃠i⃠k⃠k⃠a⃠t⃠ n⃠y⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "b⃠a⃠k⃠i⃠ s⃠b⃠ j⃠a⃠n⃠t⃠e⃠ e⃠y⃠ k⃠i⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠d⃠k⃠a⃠d⃠ e⃠y⃠ t⃠e⃠r⃠y⃠",
+        "m⃠u⃠j⃠h⃠e⃠ c⃠y⃠a⃠ p⃠t⃠a⃠ t⃠h⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠u⃠d⃠n⃠e⃠ w⃠l⃠i⃠ e⃠y⃠",
+        "p⃠r⃠ m⃠e⃠i⃠ k⃠a⃠i⃠s⃠e⃠ j⃠n⃠t⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ k⃠o⃠ k⃠o⃠i⃠ c⃠h⃠o⃠d⃠ d⃠i⃠a⃠",
+        "p⃠r⃠ m⃠e⃠r⃠a⃠ v⃠i⃠ m⃠a⃠n⃠n⃠a⃠ s⃠h⃠i⃠ t⃠h⃠a⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "p⃠r⃠ w⃠o⃠ g⃠l⃠t⃠ n⃠y⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠",
+        "p⃠r⃠ w⃠o⃠ s⃠h⃠i⃠ e⃠y⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠d⃠k⃠a⃠d⃠ e⃠y⃠",
+        "p⃠r⃠ k⃠a⃠i⃠s⃠e⃠ k⃠i⃠a⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠ o⃠m⃠f⃠o⃠o⃠",
+        "b⃠u⃠r⃠ c⃠h⃠e⃠e⃠r⃠ d⃠u⃠n⃠g⃠a⃠ t⃠r⃠i⃠ m⃠a⃠ k⃠a⃠",
+        "t⃠e⃠r⃠i⃠ m⃠a⃠ k⃠e⃠ d⃠i⃠l⃠ m⃠e⃠ l⃠o⃠d⃠a⃠ m⃠a⃠r⃠k⃠e⃠ u⃠s⃠k⃠i⃠ d⃠h⃠a⃠d⃠k⃠a⃠n⃠ r⃠o⃠k⃠ d⃠u⃠n⃠g⃠a⃠",
+        "l⃠u⃠l⃠l⃠e⃠ k⃠h⃠a⃠ t⃠r⃠i⃠ m⃠a⃠k⃠a⃠b⃠h⃠o⃠s⃠d⃠a⃠",
+        "t⃠r⃠i⃠ b⃠h⃠n⃠ k⃠i⃠ b⃠h⃠o⃠s⃠d⃠i⃠ b⃠e⃠t⃠a⃠",
+        "t⃠r⃠i⃠ m⃠a⃠ r⃠n⃠d⃠i⃠ b⃠a⃠a⃠t⃠ k⃠h⃠t⃠m⃠",
+        "S⃠u⃠n⃠ e⃠k⃠ m⃠a⃠z⃠e⃠ k⃠i⃠ b⃠a⃠a⃠t⃠ b⃠a⃠t⃠a⃠o⃠ k⃠y⃠a⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠y⃠ e⃠y⃠"
+        "c⃠o⃠d⃠u⃠ c⃠o⃠d⃠u⃠ m⃠a⃠k⃠o⃠ t⃠e⃠r⃠y⃠",
+        "a⃠j⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ o⃠y⃠e⃠",
+        "s⃠u⃠n⃠ s⃠u⃠n⃠ r⃠a⃠n⃠d⃠y⃠ m⃠a⃠k⃠e⃠ b⃠a⃠c⃠h⃠e⃠ t⃠u⃠",
+        "k⃠i⃠l⃠a⃠s⃠ n⃠y⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "m⃠u⃠j⃠h⃠e⃠ c⃠y⃠a⃠ p⃠t⃠a⃠ t⃠e⃠r⃠y⃠ b⃠h⃠e⃠n⃠ c⃠u⃠d⃠ g⃠a⃠i⃠",
+        "p⃠r⃠ p⃠r⃠ c⃠y⃠a⃠ h⃠o⃠t⃠e⃠ e⃠y⃠ t⃠m⃠k⃠c⃠",
+        "t⃠m⃠c⃠l⃠ s⃠u⃠n⃠l⃠e⃠",
+        "m⃠o⃠o⃠t⃠ d⃠u⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠i⃠ c⃠h⃠u⃠t⃠ m⃠e⃠y⃠",
+        "b⃠h⃠g⃠n⃠y⃠ c⃠u⃠d⃠k⃠e⃠ d⃠i⃠k⃠h⃠a⃠ f⃠r⃠",
+        "f⃠r⃠ s⃠e⃠ c⃠u⃠d⃠l⃠e⃠ t⃠u⃠",
+        "y⃠e⃠ v⃠i⃠ s⃠h⃠i⃠ e⃠y⃠ t⃠e⃠r⃠y⃠ m⃠k⃠c⃠ b⃠s⃠",
+        "a⃠j⃠ k⃠u⃠c⃠h⃠ n⃠y⃠ m⃠a⃠ c⃠u⃠d⃠w⃠a⃠ t⃠u⃠ a⃠p⃠n⃠i⃠",
+        "t⃠r⃠y⃠ k⃠r⃠ m⃠e⃠r⃠a⃠ l⃠u⃠n⃠d⃠ c⃠h⃠u⃠s⃠k⃠e⃠",
+        "t⃠o⃠r⃠m⃠a⃠k⃠i⃠b⃠u⃠r⃠ s⃠u⃠n⃠",
+        "t⃠o⃠r⃠ m⃠a⃠k⃠i⃠ f⃠u⃠d⃠d⃠i⃠ o⃠y⃠e⃠",
+        "H⃠a⃠y⃠e⃠ H⃠a⃠y⃠e⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠",
+        "o⃠y⃠e⃠ l⃠u⃠n⃠d⃠k⃠e⃠ p⃠a⃠s⃠i⃠n⃠e⃠..",
+        "k⃠u⃠t⃠t⃠e⃠ k⃠e⃠ t⃠a⃠t⃠t⃠e⃠ s⃠u⃠n⃠",
+        "k⃠u⃠t⃠t⃠a⃠ j⃠a⃠i⃠s⃠a⃠ c⃠u⃠d⃠ r⃠h⃠a⃠ t⃠u⃠",
+        "M⃠u⃠h⃠ m⃠e⃠i⃠ l⃠e⃠ m⃠e⃠r⃠a⃠..",
+        "j⃠h⃠a⃠a⃠t⃠ k⃠e⃠ p⃠i⃠s⃠s⃠u⃠ s⃠u⃠n⃠ t⃠m⃠k⃠c⃠",
+        "H⃠a⃠h⃠a⃠h⃠h⃠a⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠",
+        "w⃠e⃠a⃠k⃠ t⃠a⃠t⃠t⃠e⃠ u⃠t⃠h⃠",
+        "w⃠e⃠a⃠k⃠ e⃠y⃠ t⃠u⃠ c⃠u⃠d⃠ r⃠h⃠a⃠",
+        "w⃠e⃠a⃠k⃠ a⃠c⃠h⃠e⃠ s⃠e⃠ c⃠u⃠d⃠ t⃠u⃠",
+        "w⃠e⃠a⃠k⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠u⃠d⃠ r⃠h⃠i⃠ d⃠e⃠k⃠h⃠",
+        "w⃠e⃠e⃠k⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ a⃠b⃠",
+        "m⃠u⃠j⃠h⃠e⃠ n⃠y⃠ r⃠o⃠k⃠ t⃠u⃠ w⃠e⃠a⃠k⃠ e⃠y⃠",
+        "c⃠h⃠u⃠p⃠ h⃠i⃠z⃠d⃠e⃠",
+        "o⃠k⃠a⃠t⃠ n⃠y⃠ m⃠e⃠r⃠i⃠ m⃠a⃠ c⃠u⃠d⃠w⃠a⃠ t⃠u⃠ a⃠p⃠n⃠i⃠",
+        "l⃠u⃠n⃠ l⃠e⃠g⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠i⃠ g⃠a⃠n⃠d⃠ m⃠e⃠i⃠ ?",
+        "t⃠e⃠r⃠y⃠ m⃠a⃠k⃠i⃠ b⃠a⃠c⃠h⃠i⃠ c⃠o⃠d⃠u⃠..",
+        "t⃠e⃠r⃠y⃠ b⃠h⃠e⃠n⃠ k⃠i⃠ c⃠h⃠u⃠t⃠ a⃠j⃠ f⃠a⃠d⃠ d⃠u⃠",
+        "s⃠p⃠e⃠e⃠d⃠ l⃠e⃠k⃠r⃠ a⃠a⃠ c⃠u⃠d⃠k⃠e⃠ d⃠i⃠k⃠h⃠a⃠",
+        "s⃠p⃠e⃠e⃠d⃠ n⃠y⃠ t⃠e⃠r⃠e⃠ a⃠n⃠d⃠r⃠ w⃠e⃠a⃠k⃠ p⃠r⃠o⃠s⃠n⃠",
+        "u⃠g⃠l⃠y⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ c⃠h⃠u⃠p⃠",
+        "m⃠a⃠k⃠a⃠f⃠u⃠d⃠d⃠a⃠t⃠e⃠r⃠y⃠",
+        "t⃠e⃠r⃠a⃠ b⃠a⃠a⃠p⃠ k⃠o⃠ t⃠a⃠g⃠ k⃠r⃠..?",
+        "a⃠c⃠h⃠e⃠ s⃠e⃠ t⃠a⃠g⃠ k⃠r⃠ r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ b⃠h⃠a⃠g⃠w⃠n⃠ k⃠o⃠..",
+        "c⃠u⃠d⃠k⃠e⃠ p⃠g⃠l⃠ n⃠y⃠ h⃠o⃠ t⃠u⃠",
+        "c⃠u⃠d⃠k⃠e⃠ p⃠g⃠l⃠ h⃠o⃠ r⃠h⃠a⃠ t⃠u⃠ k⃠i⃠d⃠",
+        "m⃠a⃠ t⃠o⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠ h⃠a⃠w⃠a⃠b⃠z⃠i⃠ c⃠r⃠..",
+        "b⃠s⃠ m⃠a⃠ c⃠o⃠d⃠n⃠i⃠ e⃠y⃠ t⃠e⃠r⃠y⃠",
+        "t⃠o⃠w⃠n⃠ m⃠e⃠i⃠ c⃠u⃠d⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠ l⃠e⃠k⃠r⃠",
+        "t⃠e⃠r⃠y⃠ m⃠a⃠ s⃠e⃠x⃠y⃠ k⃠o⃠ b⃠e⃠j⃠ - r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ b⃠h⃠g⃠w⃠n⃠ p⃠e⃠",
+        "s⃠p⃠e⃠e⃠d⃠ p⃠k⃠d⃠ c⃠p⃠ n⃠y⃠ k⃠r⃠",
+        "T⃠r⃠y⃠ m⃠a⃠ r⃠e⃠n⃠d⃠y⃠",
+        "B⃠h⃠k⃠k⃠ c⃠u⃠d⃠",
+        "t⃠e⃠y⃠ m⃠a⃠a⃠ r⃠n⃠d⃠i⃠",
+        "t⃠e⃠r⃠y⃠ b⃠e⃠h⃠e⃠n⃠ r⃠a⃠n⃠d⃠i⃠",
+        "C⃠u⃠d⃠ j⃠a⃠",
+        "t⃠e⃠r⃠y⃠ d⃠i⃠d⃠i⃠ r⃠n⃠d⃠i⃠",
+        "S⃠l⃠o⃠w⃠",
+        "t⃠e⃠r⃠i⃠ M⃠a⃠i⃠y⃠a⃠ c⃠i⃠o⃠d⃠u⃠",
+        "B⃠h⃠a⃠g⃠?",
+        "B⃠h⃠a⃠k⃠ c⃠u⃠d⃠",
+        "T⃠m⃠a⃠ c⃠o⃠d⃠u⃠",
+        "S⃠l⃠o⃠w⃠",
+        "S⃠l⃠o⃠w⃠ f⃠i⃠r⃠s⃠e⃠",
+        "C⃠u⃠d⃠g⃠r⃠i⃠b⃠",
+        "T⃠r⃠y⃠ m⃠a⃠ d⃠o⃠u⃠",
+        "t⃠b⃠k⃠c⃠ c⃠o⃠d⃠u⃠",
+        "N⃠e⃠t⃠ o⃠n⃠ o⃠f⃠f⃠ w⃠a⃠l⃠i⃠ r⃠n⃠d⃠y⃠",
+        "O⃠y⃠e⃠ t⃠r⃠y⃠ m⃠a⃠ c⃠o⃠d⃠u⃠",
+        "I⃠d⃠h⃠a⃠r⃠ a⃠a⃠k⃠e⃠ c⃠u⃠d⃠ c⃠h⃠u⃠p⃠ c⃠h⃠a⃠a⃠p⃠",
+        "t⃠b⃠k⃠c⃠ m⃠r⃠d⃠u⃠",
+        "o⃠i⃠ m⃠a⃠a⃠k⃠e⃠ l⃠o⃠d⃠e⃠e⃠",
+        "r⃠a⃠n⃠d⃠y⃠k⃠e⃠ b⃠e⃠e⃠j⃠",
+        "t⃠m⃠k⃠c⃠ c⃠h⃠o⃠d⃠u⃠",
+        "s⃠u⃠a⃠r⃠ k⃠e⃠ b⃠e⃠e⃠j⃠",
+        "n⃠e⃠t⃠ o⃠f⃠f⃠ o⃠n⃠ k⃠r⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ l⃠a⃠d⃠k⃠e⃠",
+        "T⃠r⃠y⃠ m⃠a⃠ c⃠u⃠d⃠i⃠ k⃠e⃠s⃠e⃠",
+        "C⃠h⃠u⃠p⃠ s⃠l⃠o⃠w⃠ m⃠a⃠d⃠h⃠a⃠r⃠c⃠o⃠d⃠",
+        "t⃠b⃠k⃠c⃠ c⃠o⃠d⃠u⃠ k⃠r⃠ m⃠s⃠g⃠ d⃠e⃠l⃠e⃠t⃠e⃠",
+        "o⃠i⃠ s⃠u⃠a⃠r⃠ k⃠e⃠ l⃠a⃠d⃠k⃠e⃠",
+        "t⃠m⃠k⃠c⃠ f⃠u⃠f⃠i⃠",
+        "t⃠e⃠r⃠y⃠ d⃠i⃠d⃠i⃠ c⃠h⃠u⃠d⃠i⃠",
+        "t⃠m⃠k⃠c⃠ d⃠i⃠k⃠h⃠a⃠",
+        "C⃠u⃠d⃠ a⃠b⃠",
+        "r⃠a⃠n⃠d⃠y⃠k⃠e⃠ c⃠u⃠d⃠",
+        "B⃠h⃠a⃠k⃠ c⃠u⃠d⃠",
+        "c⃠u⃠d⃠l⃠e⃠ t⃠b⃠k⃠c⃠ m⃠r⃠u⃠",
+        "t⃠m⃠k⃠l⃠ c⃠u⃠d⃠l⃠e⃠ g⃠r⃠i⃠b⃠",
+        "t⃠e⃠r⃠y⃠ b⃠e⃠h⃠e⃠n⃠ v⃠e⃠s⃠i⃠y⃠a⃠a⃠ r⃠n⃠d⃠i⃠",
+        "I⃠t⃠n⃠a⃠ g⃠n⃠d⃠a⃠ c⃠h⃠u⃠d⃠a⃠ t⃠u⃠ f⃠i⃠r⃠s⃠e⃠ n⃠e⃠t⃠ o⃠n⃠ o⃠f⃠f⃠",
+        "g⃠r⃠i⃠b⃠ k⃠e⃠ b⃠e⃠t⃠e⃠",
+        "B⃠h⃠a⃠g⃠ j⃠a⃠ l⃠o⃠d⃠e⃠ t⃠m⃠k⃠c⃠ m⃠a⃠r⃠u⃠ d⃠u⃠n⃠g⃠a⃠",
+        "t⃠b⃠k⃠c⃠ m⃠r⃠d⃠u⃠n⃠g⃠a⃠a⃠",
+        "b⃠h⃠a⃠g⃠ t⃠m⃠k⃠c⃠",
+        "b⃠h⃠a⃠g⃠ t⃠b⃠k⃠c⃠",
+        "t⃠b⃠k⃠c⃠ m⃠e⃠y⃠ c⃠p⃠",
+        "c⃠p⃠ t⃠b⃠k⃠c⃠ m⃠e⃠h⃠h⃠",
+        "c⃠p⃠ t⃠m⃠k⃠l⃠ m⃠e⃠h⃠",
+        "c⃠p⃠ b⃠o⃠l⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "A⃠b⃠e⃠ c⃠p⃠ b⃠o⃠l⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "d⃠o⃠u⃠b⃠l⃠e⃠ s⃠e⃠n⃠d⃠ k⃠o⃠ c⃠p⃠ t⃠m⃠k⃠c⃠ c⃠o⃠d⃠u⃠",
+        "t⃠b⃠k⃠c⃠ m⃠e⃠ c⃠p⃠ c⃠o⃠d⃠ d⃠u⃠n⃠g⃠a⃠ A⃠a⃠j⃠ m⃠e⃠h⃠h⃠",
+        "h⃠t⃠ t⃠b⃠k⃠c⃠ d⃠a⃠l⃠a⃠l⃠ k⃠e⃠ b⃠e⃠t⃠e⃠.",
+        "R⃠n⃠d⃠y⃠ j⃠l⃠d⃠i⃠ j⃠l⃠d⃠i⃠ c⃠u⃠d⃠q⃠ t⃠r⃠y⃠m⃠a⃠",
+        "P⃠a⃠r⃠a⃠ l⃠i⃠k⃠h⃠e⃠g⃠a⃠..",
+        "T⃠r⃠a⃠ r⃠n⃠d⃠h⃠b⃠h⃠a⃠k⃠",
+        "L⃠a⃠g⃠d⃠i⃠ k⃠e⃠ l⃠a⃠d⃠c⃠e⃠ c⃠p⃠ b⃠o⃠l⃠",
+        "c⃠p⃠ b⃠o⃠l⃠ l⃠a⃠g⃠d⃠i⃠ k⃠e⃠ b⃠e⃠t⃠e⃠..",
+        "c⃠u⃠d⃠k⃠e⃠ c⃠p⃠ b⃠o⃠l⃠",
+        "b⃠h⃠i⃠k⃠a⃠r⃠i⃠ l⃠u⃠n⃠d⃠ c⃠h⃠u⃠s⃠ m⃠e⃠r⃠a⃠.",
+        "L⃠o⃠w⃠ l⃠e⃠v⃠e⃠l⃠ c⃠p⃠ c⃠r⃠",
+        "c⃠p⃠ b⃠o⃠l⃠ l⃠o⃠w⃠ l⃠e⃠v⃠e⃠l⃠ w⃠e⃠a⃠k⃠",
+        "m⃠e⃠r⃠e⃠ l⃠u⃠n⃠d⃠ p⃠e⃠ e⃠y⃠ t⃠u⃠ h⃠i⃠j⃠d⃠e⃠",
+        "f⃠r⃠e⃠e⃠ c⃠u⃠d⃠w⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠",
+        "F⃠r⃠e⃠e⃠ m⃠e⃠y⃠ c⃠u⃠d⃠ t⃠u⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠"
+        "s⃠p⃠e⃠e⃠d⃠ n⃠y⃠ w⃠e⃠a⃠k⃠ t⃠a⃠t⃠t⃠e⃠ t⃠e⃠r⃠m⃠e⃠",
+        "k⃠i⃠t⃠n⃠i⃠ b⃠r⃠ c⃠u⃠d⃠w⃠a⃠y⃠e⃠g⃠a⃠ t⃠e⃠r⃠y⃠m⃠a⃠k⃠o⃠",
+        "l⃠u⃠n⃠d⃠ l⃠e⃠ r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ b⃠a⃠p⃠k⃠a⃠",
+        "l⃠u⃠n⃠ c⃠u⃠s⃠ j⃠a⃠l⃠d⃠i⃠ s⃠e⃠ r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ b⃠a⃠p⃠k⃠a⃠",
+        "k⃠o⃠i⃠ n⃠y⃠ d⃠e⃠k⃠h⃠ r⃠h⃠a⃠ c⃠u⃠d⃠l⃠e⃠ t⃠u⃠",
+        "c⃠u⃠d⃠l⃠e⃠ b⃠e⃠t⃠i⃠c⃠h⃠o⃠d⃠ a⃠c⃠h⃠e⃠ s⃠e⃠",
+        "m⃠a⃠k⃠i⃠ c⃠h⃠u⃠t⃠ t⃠e⃠r⃠y⃠ b⃠s⃠ y⃠e⃠h⃠i⃠ j⃠a⃠n⃠t⃠a⃠ m⃠e⃠y⃠",
+        "c⃠p⃠ b⃠o⃠l⃠e⃠g⃠a⃠ t⃠o⃠ t⃠m⃠k⃠c⃠",
+        "w⃠r⃠n⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ c⃠u⃠d⃠ j⃠a⃠y⃠e⃠g⃠i⃠",
+        "s⃠l⃠o⃠w⃠ e⃠y⃠ t⃠u⃠ k⃠i⃠d⃠",
+        "j⃠l⃠d⃠i⃠ l⃠i⃠k⃠h⃠..t⃠m⃠k⃠c⃠",
+        "j⃠l⃠d⃠i⃠ l⃠i⃠k⃠h⃠..r⃠a⃠n⃠d⃠c⃠e⃠ t⃠u⃠",
+        "t⃠y⃠m⃠ s⃠e⃠ p⃠h⃠l⃠e⃠ c⃠u⃠d⃠k⃠e⃠ d⃠i⃠k⃠h⃠a⃠",
+        "t⃠y⃠m⃠ h⃠o⃠g⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ c⃠u⃠d⃠w⃠a⃠",
+        "m⃠a⃠ c⃠u⃠d⃠ g⃠a⃠i⃠ t⃠e⃠r⃠y⃠ t⃠y⃠m⃠ s⃠e⃠ p⃠h⃠l⃠e⃠",
+        "u⃠t⃠h⃠ r⃠a⃠n⃠d⃠c⃠e⃠ k⃠e⃠ l⃠d⃠k⃠e⃠",
+        "m⃠a⃠c⃠a⃠b⃠o⃠s⃠d⃠a⃠t⃠e⃠r⃠y⃠",
+        "c⃠o⃠n⃠ k⃠b⃠ c⃠o⃠d⃠ d⃠i⃠a⃠ m⃠a⃠k⃠o⃠ t⃠e⃠r⃠y⃠",
+        "k⃠o⃠i⃠ h⃠o⃠g⃠a⃠ t⃠m⃠l⃠",
+        "m⃠a⃠c⃠h⃠a⃠r⃠ c⃠u⃠d⃠l⃠e⃠ t⃠u⃠",
+        "m⃠e⃠n⃠u⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠ c⃠o⃠d⃠n⃠a⃠ s⃠e⃠",
+        "t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠ b⃠o⃠l⃠ m⃠u⃠j⃠h⃠e⃠ c⃠o⃠d⃠ d⃠e⃠",
+        "b⃠s⃠ m⃠e⃠y⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ s⃠e⃠ c⃠u⃠d⃠n⃠a⃠ c⃠h⃠t⃠a⃠ h⃠u⃠",
+        "E⃠w⃠w⃠ m⃠a⃠k⃠a⃠ l⃠o⃠d⃠e⃠ u⃠t⃠h⃠",
+        "M⃠e⃠o⃠w⃠ c⃠r⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠ c⃠o⃠d⃠u⃠",
+        "l⃠u⃠n⃠d⃠ r⃠k⃠h⃠ d⃠i⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠e⃠ f⃠u⃠d⃠e⃠ p⃠e⃠",
+        "m⃠e⃠r⃠a⃠ l⃠u⃠n⃠d⃠ k⃠e⃠ b⃠a⃠l⃠ u⃠t⃠h⃠",
+        "k⃠i⃠d⃠e⃠e⃠ Z⃠i⃠n⃠d⃠a⃠ h⃠o⃠",
+        "m⃠a⃠r⃠ n⃠y⃠ k⃠i⃠d⃠d⃠e⃠ t⃠y⃠p⃠e⃠ k⃠r⃠",
+        "c⃠h⃠u⃠p⃠ b⃠k⃠l⃠",
+        "b⃠c⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠i⃠ c⃠h⃠u⃠t⃠",
+        "m⃠c⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ l⃠i⃠k⃠h⃠ f⃠a⃠s⃠t⃠",
+        "f⃠a⃠s⃠t⃠ l⃠i⃠k⃠h⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠",
+        "f⃠a⃠s⃠t⃠ l⃠i⃠k⃠h⃠ k⃠a⃠m⃠z⃠o⃠r⃠"
+        "t⃠e⃠r⃠y⃠ m⃠a⃠k⃠i⃠ c⃠h⃠u⃠t⃠ c⃠l⃠a⃠i⃠m⃠ c⃠r⃠w⃠a⃠",
+        "a⃠w⃠z⃠ n⃠i⃠c⃠h⃠e⃠ r⃠a⃠n⃠d⃠c⃠e⃠ k⃠e⃠ b⃠c⃠h⃠e⃠",
+        "s⃠a⃠w⃠a⃠l⃠ n⃠y⃠ p⃠u⃠c⃠h⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠a⃠b⃠o⃠s⃠d⃠a⃠",
+        "f⃠y⃠t⃠e⃠r⃠ b⃠n⃠e⃠g⃠a⃠ l⃠a⃠g⃠d⃠e⃠ m⃠a⃠d⃠r⃠c⃠h⃠o⃠d⃠",
+        "o⃠y⃠e⃠ k⃠a⃠a⃠l⃠e⃠ r⃠o⃠ k⃠e⃠ d⃠i⃠k⃠h⃠a⃠",
+        "o⃠y⃠e⃠ k⃠a⃠a⃠l⃠e⃠ r⃠o⃠o⃠ n⃠y⃠",
+        "s⃠h⃠o⃠r⃠t⃠ n⃠y⃠ c⃠u⃠d⃠ t⃠u⃠ b⃠i⃠n⃠a⃠ r⃠u⃠k⃠e⃠",
+        "s⃠h⃠o⃠r⃠t⃠ n⃠y⃠ c⃠u⃠d⃠ t⃠u⃠ a⃠p⃠n⃠i⃠ m⃠a⃠k⃠o⃠ l⃠e⃠k⃠r⃠",
+        "t⃠e⃠r⃠y⃠ m⃠a⃠k⃠e⃠ s⃠t⃠h⃠ t⃠e⃠r⃠y⃠ b⃠h⃠e⃠n⃠ v⃠i⃠ c⃠u⃠d⃠w⃠a⃠ l⃠e⃠",
+        "t⃠e⃠r⃠y⃠ m⃠a⃠k⃠e⃠ s⃠t⃠h⃠ t⃠e⃠r⃠y⃠ d⃠i⃠d⃠i⃠ v⃠i⃠ c⃠u⃠d⃠ g⃠a⃠i⃠",
+        "C⃠h⃠a⃠t⃠ f⃠y⃠t⃠e⃠r⃠ b⃠n⃠e⃠g⃠a⃠ r⃠a⃠n⃠d⃠c⃠e⃠ c⃠o⃠d⃠u⃠ t⃠e⃠r⃠y⃠ m⃠a⃠k⃠o⃠",
+        "b⃠o⃠l⃠ r⃠a⃠n⃠d⃠i⃠b⃠a⃠a⃠z⃠ d⃠a⃠d⃠d⃠y⃠ e⃠y⃠",
+        "b⃠u⃠l⃠l⃠y⃠x⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ u⃠t⃠h⃠",
+        "m⃠a⃠r⃠ m⃠a⃠r⃠k⃠e⃠ c⃠u⃠d⃠ r⃠h⃠a⃠ t⃠u⃠",
+        "o⃠r⃠ t⃠e⃠r⃠y⃠ m⃠a⃠ m⃠a⃠r⃠k⃠e⃠ c⃠u⃠d⃠ g⃠a⃠i⃠"
+        "J⃠a⃠l⃠d⃠i⃠ l⃠i⃠k⃠h⃠ r⃠n⃠d⃠y⃠k⃠e⃠ b⃠e⃠j⃠",
+        "O⃠r⃠ b⃠d⃠a⃠ l⃠i⃠k⃠h⃠ t⃠m⃠c⃠",
+        "O⃠r⃠ b⃠d⃠a⃠ 2⃠ l⃠i⃠n⃠e⃠ w⃠l⃠a⃠ l⃠i⃠k⃠h⃠ t⃠m⃠k⃠c⃠",
+        "O⃠r⃠ b⃠d⃠a⃠ o⃠y⃠e⃠ l⃠i⃠k⃠h⃠ t⃠m⃠l⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠ k⃠a⃠ b⃠u⃠r⃠",
+        "O⃠y⃠e⃠ k⃠e⃠e⃠d⃠e⃠",
+        "R⃠a⃠n⃠d⃠i⃠ k⃠e⃠ l⃠a⃠d⃠k⃠e⃠",
+        "J⃠a⃠l⃠d⃠i⃠ l⃠i⃠k⃠h⃠ t⃠e⃠r⃠i⃠ b⃠e⃠h⃠e⃠n⃠ c⃠h⃠o⃠d⃠u⃠",
+        "M⃠k⃠l⃠ u⃠t⃠h⃠ r⃠a⃠n⃠d⃠i⃠ k⃠e⃠ b⃠a⃠c⃠c⃠h⃠e⃠",
+        "T⃠e⃠r⃠i⃠ n⃠a⃠n⃠i⃠ m⃠e⃠r⃠i⃠ m⃠a⃠a⃠l⃠",
+        "T⃠e⃠j⃠ l⃠i⃠k⃠h⃠ r⃠a⃠n⃠d⃠c⃠e⃠",
+        "O⃠y⃠e⃠ m⃠a⃠a⃠k⃠e⃠ l⃠o⃠d⃠e⃠ m⃠r⃠e⃠n⃠g⃠a⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠o⃠d⃠y⃠",
+        "T⃠e⃠r⃠i⃠ M⃠a⃠i⃠y⃠a⃠ k⃠i⃠ g⃠a⃠n⃠d⃠",
+        "T⃠e⃠r⃠y⃠ d⃠a⃠d⃠i⃠ k⃠a⃠ f⃠u⃠d⃠d⃠a⃠",
+        "M⃠k⃠l⃠ u⃠t⃠h⃠ b⃠e⃠h⃠e⃠n⃠c⃠o⃠d⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠ k⃠i⃠ b⃠u⃠r⃠ d⃠e⃠",
+        "T⃠e⃠r⃠y⃠ m⃠a⃠a⃠ k⃠a⃠ f⃠u⃠d⃠d⃠a⃠ m⃠e⃠ l⃠a⃠u⃠d⃠a⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠u⃠d⃠v⃠a⃠",
+        "R⃠a⃠n⃠d⃠i⃠ k⃠e⃠ b⃠e⃠t⃠e⃠ m⃠a⃠r⃠ g⃠a⃠y⃠a⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠ k⃠i⃠ c⃠h⃠u⃠t⃠ m⃠r⃠u⃠",
+        "J⃠a⃠l⃠i⃠d⃠ k⃠r⃠ s⃠p⃠a⃠m⃠",
+        "M⃠c⃠ s⃠p⃠a⃠m⃠ r⃠o⃠k⃠e⃠n⃠g⃠a⃠",
+        "T⃠e⃠r⃠i⃠ m⃠a⃠a⃠k⃠i⃠ c⃠h⃠u⃠t⃠ s⃠p⃠a⃠m⃠ k⃠r⃠",
+        "s⃠p⃠a⃠m⃠ k⃠r⃠.⃠m⃠a⃠a⃠k⃠e⃠ l⃠o⃠d⃠e⃠",
+        "R⃠a⃠n⃠d⃠y⃠k⃠e⃠ c⃠h⃠o⃠d⃠e⃠ s⃠p⃠a⃠m⃠ k⃠r⃠ w⃠r⃠n⃠a⃠ c⃠u⃠d⃠ t⃠u⃠",
+        "S⃠p⃠a⃠m⃠ k⃠r⃠ k⃠i⃠d⃠",
+        "N⃠o⃠o⃠b⃠ t⃠e⃠r⃠i⃠ m⃠a⃠a⃠ c⃠h⃠o⃠d⃠u⃠",
+        "R⃠n⃠d⃠y⃠k⃠e⃠ b⃠e⃠t⃠e⃠ m⃠a⃠r⃠ m⃠a⃠t⃠ t⃠u⃠",
+        "N⃠o⃠o⃠b⃠ j⃠a⃠l⃠d⃠i⃠ l⃠i⃠k⃠h⃠ w⃠r⃠n⃠a⃠ t⃠e⃠r⃠y⃠ m⃠a⃠a⃠ r⃠a⃠n⃠d⃠",
+        "c⃠u⃠d⃠ g⃠a⃠i⃠ m⃠a⃠a⃠ t⃠e⃠r⃠y⃠ n⃠o⃠o⃠b⃠",
+        "u⃠t⃠h⃠ r⃠a⃠n⃠d⃠y⃠k⃠e⃠ n⃠o⃠o⃠b⃠",
+        "c⃠h⃠l⃠ c⃠u⃠d⃠k⃠e⃠ d⃠i⃠k⃠h⃠a⃠ n⃠o⃠o⃠b⃠",
+        "j⃠l⃠d⃠i⃠ t⃠y⃠p⃠ c⃠r⃠ n⃠o⃠o⃠b⃠ h⃠a⃠l⃠k⃠e⃠",
+        "c⃠u⃠d⃠ k⃠e⃠ p⃠g⃠l⃠ n⃠y⃠ h⃠o⃠ n⃠o⃠o⃠b⃠",
+        "c⃠u⃠d⃠ c⃠u⃠d⃠ k⃠e⃠ r⃠a⃠n⃠d⃠ b⃠n⃠j⃠a⃠ t⃠u⃠ n⃠o⃠o⃠b⃠",
+        "m⃠a⃠k⃠i⃠c⃠h⃠u⃠t⃠ t⃠e⃠r⃠y⃠ n⃠o⃠o⃠b⃠",
+        "g⃠a⃠n⃠d⃠a⃠ c⃠y⃠u⃠ c⃠u⃠d⃠ r⃠h⃠a⃠ t⃠u⃠ ?",
+        "i⃠t⃠n⃠a⃠ g⃠n⃠d⃠a⃠ n⃠y⃠ c⃠u⃠d⃠ a⃠c⃠h⃠e⃠ s⃠e⃠ c⃠u⃠d⃠",
+        "M⃠a⃠a⃠n⃠ l⃠e⃠ c⃠u⃠d⃠ g⃠y⃠a⃠ t⃠u⃠ s⃠u⃠n⃠ b⃠a⃠t⃠ a⃠b⃠",
+        "m⃠a⃠k⃠a⃠f⃠u⃠d⃠d⃠a⃠ f⃠a⃠t⃠ g⃠y⃠a⃠ t⃠e⃠r⃠y⃠ r⃠u⃠k⃠",
+            ]
+            bs_texts = [
+            "ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝒷ᕗᕙ𝓃ᕗᕙ𝒶ᕗᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝑒ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒯ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓏ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓎ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝒹ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒯ᕗᕙ𝓊ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙℳᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝒶ᕗ ᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓎ᕗᕙ𝓂ᕗᕙ𝓅ᕗᕙ𝒶ᕗᕙ𝓈ᕗᕙ𝓈ᕗ",
+        "ᕙ𝒪ᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙ𝓊ᕗᕙ𝓃ᕗᕙ𝒻ᕗᕙ𝓊ᕗᕙ𝓃ᕗᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓈ᕗᕙ𝓌ᕗᕙ𝒾ᕗᕙ𝓅ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝓉ᕗᕙ𝓉ᕗ ᕙ𝓀ᕗᕙ𝓇ᕗ",
+        "ᕙ𝒪ᕗᕙ𝒽ᕗ ᕙ𝒽ᕗᕙ𝑒ᕗᕙ𝓁ᕗᕙ𝓁ᕗᕙ𝑜ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝑜ᕗᕙ𝓇ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓋ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝒶ᕗᕙ𝓊ᕗᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓉ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝓇ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝓇ᕗ.",
+        "ᕙ𝒪ᕗᕙ𝓎ᕗᕙ𝓎ᕗ ᕙ𝓀ᕗᕙ𝒾ᕗᕙ𝓃ᕗᕙ𝓃ᕗᕙ𝑒ᕗᕙ𝓇ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙℊᕗᕙ𝒸ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝑒ᕗ ᕙ𝓀ᕗᕙ𝒾ᕗ ᕙ𝓅ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓂ᕗᕙ𝒾ᕗᕙ𝓈ᕗᕙ𝓈ᕗᕙ𝒾ᕗᕙ𝑜ᕗᕙ𝓃ᕗ ᕙ𝓀ᕗᕙ𝒾ᕗᕙ𝓈ᕗᕙ𝓃ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝒾ᕗ.",
+        "ᕙ𝒞ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝒶ᕗ",
+        "ᕙ𝒞ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝑒ᕗᕙ𝓀ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓇ᕗ.",
+        "ᕙ𝒮ᕗᕙ𝓊ᕗᕙ𝓃ᕗ ᕙ𝒮ᕗᕙ𝓊ᕗᕙ𝓃ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝒶ᕗ.",
+        "ᕙ𝒯ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒸ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝓈ᕗᕙ𝒹ᕗᕙ𝒶ᕗ.",
+        "ᕙ𝒪ᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝓉ᕗᕙ𝒾ᕗ ᕙ𝒿ᕗᕙ𝒶ᕗᕙ𝓉ᕗᕙ𝒾ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓇ᕗ.",
+        "ᕙ𝒦ᕗᕙ𝓎ᕗ? ᕙ𝒿ᕗᕙ𝓁ᕗᕙ𝒹ᕗᕙ𝒾ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒽ᕗ ᕙ𝓀ᕗᕙ𝒾ᕗᕙ𝒹ᕗᕙ𝒹ᕗᕙ𝑒ᕗ.",
+        "ᕙℬᕗᕙ𝒾ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝒸ᕗᕙ𝑜ᕗᕙ𝓂ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙℊᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝓀ᕗᕙ𝑜ᕗ ᕙ𝓉ᕗᕙ𝒶ᕗᕙℊᕗ ᕙ𝒸ᕗᕙ𝓇ᕗᕙ𝑒ᕗᕙℊᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ",
+        "ᕙℳᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓀ᕗᕙ𝒸ᕗ ᕙ𝒷ᕗᕙ𝓈ᕗ",
+        "ᕙ𝒥ᕗᕙ𝒶ᕗᕙ𝓁ᕗᕙ𝒹ᕗᕙ𝒾ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓏ᕗ ᕙ𝓅ᕗᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓁ᕗ",
+        "ᕙ𝒮ᕗᕙ𝒾ᕗᕙ𝒹ᕗᕙ𝑒ᕗ ᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝒿ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝒶ᕗᕙ𝒷ᕗ",
+        "ᕙℋᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙℊᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓉ᕗ ᕙ𝒶ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ",
+        "ᕙ𝒷ᕗᕙ𝒽ᕗᕙℊᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝒶ᕗᕙ𝒿ᕗᕙ𝒿ᕗ",
+        "ᕙℋᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒷ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙℊᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓉ᕗ",
+        "ᕙℋᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝓊ᕗᕙ𝓇ᕗ ᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓉ᕗᕙ𝓉ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒹ᕗᕙ𝒽ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝒹ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓀ᕗᕙ𝑜ᕗᕙ𝒾ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝓉ᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝑒ᕗᕙ𝓈ᕗᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒻ᕗ ᕙ𝒸ᕗᕙ𝓇ᕗ ᕙ𝓇ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝒽ᕗᕙ𝓊ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓀ᕗᕙ𝑜ᕗᕙ𝒾ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓉ᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒻ᕗᕙ𝒾ᕗ ᕙ𝒹ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝓊ᕗᕙ𝓃ᕗᕙℊᕗᕙ𝒶ᕗ",
+        "ᕙ𝒜ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ??ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒻ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒾ᕗᕙ𝓁ᕗ ᕙ𝒿ᕗᕙ𝒶ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙℊᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓉ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝓌ᕗᕙ𝒾ᕗᕙ𝓅ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓇ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒜ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓈ᕗᕙ𝓌ᕗᕙ𝒾ᕗᕙ𝓅ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓇ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙℱᕗᕙ𝓇ᕗ ᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓁ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒾ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝓈ᕗᕙ𝓌ᕗᕙ𝒾ᕗᕙ𝓅ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓇ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒞ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓅ᕗᕙ𝓇ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ",
+        "ᕙ𝓂ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙ𝓉ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓂ᕗᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝓉ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓁ᕗᕙ𝑜ᕗᕙ𝒹ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓊ᕗᕙ𝓉ᕗᕙ𝓇ᕗ ᕙ𝓂ᕗᕙ𝒸ᕗ",
+        "ᕙ𝓁ᕗᕙ𝓊ᕗᕙ𝓃ᕗ ᕙ𝓂ᕗᕙ𝓉ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓈ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒶ᕗ",
+        "ᕙ𝓃ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓁ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒹ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝑜ᕗᕙ𝓎ᕗᕙ𝑒ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝓈ᕗᕙ𝒽ᕗᕙ𝓉ᕗᕙ𝒾ᕗ ᕙ𝓀ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓀ᕗᕙ𝒾ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓉ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ",
+        "ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗ ᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓉ᕗᕙ𝒽ᕗ ᕙ𝓉ᕗᕙ𝑜ᕗᕙ𝒹ᕗᕙ𝒽ᕗ ᕙ𝓀ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝑒ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝓀ᕗ ᕙ𝓂ᕗᕙ𝓊ᕗᕙ𝒽ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝒻ᕗᕙ𝒶ᕗᕙ𝓈ᕗᕙ𝒶ᕗᕙ𝒹ᕗᕙ𝓊ᕗᕙ𝓃ᕗᕙℊᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝒶ᕗᕙ𝓋ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙ𝒶ᕗᕙ𝓈ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗ ᕙ𝓃ᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝒶ᕗᕙ??ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗᕙ𝓀ᕗᕙ𝑜ᕗ",
+        "ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝒶ᕗᕙ𝓋ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒾ᕗᕙ𝒹ᕗᕙ𝑒ᕗᕙ𝓇ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝒶ᕗᕙ𝓋ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝒿ᕗᕙ𝓁ᕗᕙ𝒹ᕗᕙ𝒾ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓌ᕗᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝒶ᕗᕙ𝓋ᕗᕙ𝑒ᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗᕙℊᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝒮ᕗᕙ𝓂ᕗᕙ𝒿ᕗᕙ𝒽ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝓉ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝒶ᕗᕙ𝓋ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒻ᕗᕙ𝒶ᕗᕙ𝓈ᕗᕙ𝓉ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝒶ᕗᕙ𝓋ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓂ᕗᕙ𝒿ᕗᕙ𝑜ᕗᕙ𝓇ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓉ᕗᕙ𝓊ᕗᕙ𝓉ᕗᕙ𝑜ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓎ᕗ ᕙ𝒽ᕗᕙ𝒾ᕗᕙ𝒿ᕗᕙ𝒹ᕗᕙ𝑒ᕗ ᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓂ᕗᕙ𝓏ᕗᕙ𝑜ᕗᕙ𝓇ᕗ",
+        "ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓀ᕗᕙ𝑜ᕗ ᕙ𝒾ᕗᕙ𝓁ᕗᕙ𝓎ᕗ ᕙ𝓇ᕗᕙ𝑒ᕗᕙ𝓎ᕗ 🌚😂",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓀ᕗᕙ𝒸ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ",
+        "ᕙ𝓈ᕗᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓅ᕗ",
+        "ᕙ𝒻ᕗᕙ𝓇ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ??ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓅ᕗ",
+        "ᕙ𝓈ᕗᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒽ᕗ ᕙ𝓌ᕗᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝓊ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓅ᕗ",
+        "ᕙ𝓅ᕗᕙ𝓇ᕗᕙ𝑜ᕗᕙ𝑜ᕗᕙ𝒻ᕗ ᕙ𝒸ᕗᕙ𝓇ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓅ᕗᕙ𝓇ᕗᕙ𝑜ᕗᕙ𝑜ᕗᕙ𝒻ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓅ᕗᕙ𝓇ᕗᕙ𝑜ᕗᕙ𝑜ᕗᕙ𝒻ᕗ ᕙ𝒽ᕗᕙ𝑜ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓀ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒾ᕗᕙ𝓁ᕗᕙ𝓁ᕗᕙ𝒶ᕗᕙ𝓇ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗ ᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓈ᕗᕙ𝒹ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ??ᕗᕙ𝓎ᕗ ᕙ𝒽ᕗᕙ𝒾ᕗᕙ𝒿ᕗᕙ𝒹ᕗᕙ𝑒ᕗ ᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓂ᕗᕙ𝓏ᕗᕙ𝑜ᕗᕙ𝓇ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒹ᕗᕙ𝓇ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝒹ᕗ ?",
+        "ᕙ𝒶ᕗᕙ𝒷ᕗ ᕙ𝓉ᕗᕙ𝓀ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒾ᕗ ᕙ𝒽ᕗᕙ𝑜ᕗᕙℊᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ?",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝓀ᕗᕙ𝓊ᕗᕙ𝒸ᕗᕙ𝒽ᕗ ᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝒿ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝓉ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝓈ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ",
+        "ᕙ𝒮ᕗᕙ𝒷ᕗᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙ𝒽ᕗᕙ𝑒ᕗᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝑜ᕗ ᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓁ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓂ᕗ ᕙ𝓀ᕗᕙ𝓇ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓎ᕗᕙ𝒶ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝒸ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙ𝒾ᕗᕙ𝓁ᕗᕙ𝓁ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓈ᕗᕙ𝒹ᕗᕙ𝒶ᕗ",
+        "ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑜ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝑒ᕗᕙ𝓃ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝑒ᕗᕙℊᕗᕙ𝒾ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝓅ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝑜ᕗᕙ𝓂ᕗᕙ𝓂ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓃ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒶ᕗᕙ𝓁ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝒹ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝓎ᕗᕙ𝒽ᕗᕙ𝒶ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒸ᕗᕙ𝑜ᕗᕙ𝓏ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗ ᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓉ᕗᕙ𝑜ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓅ᕗ ᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓁ᕗ ᕙ𝓂ᕗᕙ𝓊ᕗᕙ𝒿ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓃ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒽ᕗᕙ𝑜ᕗᕙℊᕗᕙ𝒾ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝒾ᕗ ᕙ𝒿ᕗᕙ𝑜ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗᕙ𝓉ᕗᕙ𝒾ᕗ ᕙ𝒿ᕗᕙ𝑜ᕗᕙℊᕗᕙ𝒾ᕗ",
+        "ᕙ𝓉ᕗᕙ𝓇ᕗᕙ𝓎ᕗ ᕙ𝒶ᕗᕙ𝓂ᕗᕙ𝓂ᕗᕙ𝒾ᕗ ᕙ𝒸ᕗᕙ𝑒ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝓈ᕗᕙ𝒹ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝑒ᕗᕙ𝓂ᕗᕙ𝑜ᕗᕙ𝒿ᕗᕙ𝒾ᕗ ᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓁ᕗ ᕙ𝓂ᕗᕙ𝒸ᕗ",
+        "ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ? ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓂ᕗᕙ𝓇ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ?",
+        "ᕙ𝓉ᕗᕙ𝓂ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝒽ᕗᕙ𝑜ᕗᕙℊᕗᕙ𝒾ᕗ ᕙ𝒻ᕗᕙ𝓇ᕗᕙ𝓇ᕗᕙ𝓉ᕗᕙ𝑜ᕗ",
+        "ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ? ᕙ𝓀ᕗᕙ𝒷ᕗ ? ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓀ᕗᕙ𝑒ᕗᕙ𝓀ᕗ",
+        "ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓈ᕗᕙ𝒸ᕗᕙ𝒽ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝓎ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗᕙ𝓃ᕗᕙ𝑒ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ",
+        "ᕙ𝒾ᕗᕙ𝓉ᕗᕙ𝓃ᕗᕙ𝒶ᕗ ᕙ𝓈ᕗᕙ𝒸ᕗᕙ𝒽ᕗ ᕙ𝓃ᕗᕙ??ᕗ ᕙ𝒷ᕗᕙ𝑜ᕗᕙ𝓁ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝒶ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝓎ᕗ",
+        "ᕙ𝓈ᕗᕙ𝒸ᕗᕙ𝒽ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝓉ᕗᕙ𝓊ᕗ ᕙ𝒶ᕗᕙ𝓅ᕗᕙ𝓃ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓌ᕗᕙ𝒶ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝓉ᕗᕙ𝒽ᕗ",
+        "ᕙ𝓂ᕗᕙ𝓉ᕗᕙ𝓁ᕗᕙ𝒷ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓇ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓉ᕗᕙ𝑜ᕗ",
+        "ᕙ𝓅ᕗᕙ𝓊ᕗᕙ𝓇ᕗᕙ𝒶ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒽ᕗ ᕙ𝓂ᕗᕙ𝒸ᕗ",
+        "ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓇ᕗ ᕙ𝒻ᕗᕙ𝓇ᕗᕙ𝓇ᕗᕙ𝓉ᕗᕙ𝑜ᕗ",
+        "ᕙ𝑜ᕗᕙ𝒽ᕗ ᕙ𝑜ᕗᕙ𝓀ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝒻ᕗᕙ𝒾ᕗᕙ𝓇ᕗ",
+        "ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝒶ᕗ ᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒹ᕗ",
+        "ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ? ᕙ𝒶ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙ𝑒ᕗᕙ𝒽ᕗᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝑒ᕗᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓉ᕗᕙ𝑜ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝒹ᕗᕙ𝓃ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝓋ᕗᕙ𝓎ᕗᕙ𝒶ᕗᕙ𝓈ᕗᕙ𝓉ᕗ ᕙ𝒽ᕗᕙ𝓊ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓉ᕗᕙ𝑜ᕗ ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓀ᕗᕙ𝓊ᕗᕙ𝒸ᕗᕙ𝒽ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ? ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙℊᕗᕙ𝓎ᕗᕙ𝒶ᕗ ?",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓂ᕗᕙ𝓉ᕗ ᕙ𝒽ᕗᕙ𝓈ᕗᕙ𝓈ᕗ",
+        "ᕙ𝓎ᕗᕙ𝓊ᕗᕙ𝓇ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝑜ᕗᕙ𝓂ᕗ",
+        "ᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝒷ᕗᕙ𝓀ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝒾ᕗ ᕙ𝑜ᕗᕙ𝓇ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝒷ᕗᕙ𝒾ᕗ",
+        "ᕙ𝒶ᕗᕙ𝓇ᕗᕙ𝑒ᕗ ᕙ𝒾ᕗᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓇ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝑒ᕗᕙ𝓀ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓇ᕗ",
+        "ᕙ𝓉ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒾ᕗ ᕙ𝓉ᕗᕙ𝓇ᕗᕙ𝒽ᕗ",
+        "ᕙ𝑒ᕗᕙ𝓀ᕗ ᕙ𝓁ᕗᕙ𝒾ᕗᕙ𝓃ᕗᕙ𝑒ᕗ ᕙ𝓂ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓇ᕗ",
+        "ᕙ𝒬ᕗ",
+        "ᕙ𝑜ᕗᕙ𝒸ᕗᕙ𝓎ᕗ ᕙ𝒶ᕗᕙ𝒷ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝓁ᕗᕙ𝑒ᕗ",
+        "ᕙ𝓅ᕗᕙ𝑒ᕗᕙ𝒽ᕗᕙ𝑒ᕗᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝓉ᕗᕙ𝑒ᕗᕙ𝓇ᕗᕙ𝒾ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝑜ᕗᕙ𝒹ᕗᕙ𝓊ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓉ᕗᕙ𝑜ᕗ",
+        "ᕙ𝓆ᕗ ?",
+        "ᕙ𝒽ᕗᕙ𝓎ᕗᕙ𝓎ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒶ᕗ ᕙ𝑒ᕗᕙ𝓀ᕗ ᕙ𝒷ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓇ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙ𝑒ᕗ ᕙ𝓈ᕗᕙ𝓊ᕗᕙ𝓃ᕗ ᕙ𝒹ᕗᕙ𝑜ᕗᕙ𝓈ᕗᕙ𝓉ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓇ᕗ",
+        "ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙℊᕗ ᕙ𝒿ᕗᕙ𝒶ᕗ ᕙ𝓇ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓃ᕗᕙ𝒹ᕗ ᕙ𝓂ᕗᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝒻ᕗ ᕙ𝒸ᕗᕙ𝓇ᕗᕙ𝓇ᕗ ᕙ𝒹ᕗᕙ𝓊ᕗᕙ𝓃ᕗᕙℊᕗᕙ𝒶ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙ𝑒ᕗ ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝓇ᕗᕙ𝓃ᕗᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝒾ᕗ ᕙ𝒾ᕗᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓇ᕗ ᕙ𝒶ᕗᕙ𝒶ᕗ",
+        "ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓉ᕗᕙ𝓂ᕗᕙ𝓇ᕗ ᕙ𝒻ᕗᕙ𝓇ᕗᕙ𝓇ᕗᕙ𝓉ᕗᕙ𝑜ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙ𝑒ᕗ ᕙ𝒾ᕗᕙ𝒹ᕗᕙ𝒶ᕗᕙ𝓇ᕗ ᕙ𝒶ᕗᕙ𝒶ᕗᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓂ᕗᕙ𝓇ᕗ",
+        "ᕙ𝓃ᕗᕙ𝓎ᕗᕙ𝓉ᕗᕙ𝑜ᕗ ᕙ𝒶ᕗᕙ𝑒ᕗᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙ𝑒ᕗ ᕙ𝒽ᕗᕙ𝓎ᕗᕙ𝓎ᕗ ᕙ𝒶ᕗᕙ𝒾ᕗᕙ𝓈ᕗᕙ𝑒ᕗ ᕙ𝒽ᕗᕙ𝒾ᕗ ᕙ𝒸ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗᕙ𝓃ᕗᕙ𝒶ᕗ",
+        "ᕙ𝑜ᕗᕙ𝓇ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓁ᕗᕙ𝑒ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓀ᕗᕙ𝑒ᕗ ᕙ𝒹ᕗᕙ𝒾ᕗᕙ𝓀ᕗᕙ𝒶ᕗ ᕙ𝑜ᕗᕙ𝓇ᕗ",
+        "ᕙ𝒽ᕗᕙ𝓎ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝑜ᕗ ᕙ𝓃ᕗᕙ𝒶ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗᕙ𝑜ᕗ ᕙ𝓂ᕗᕙ𝓉ᕗ ᕙ𝒷ᕗᕙ𝒽ᕗᕙ𝒶ᕗᕙℊᕗ ᕙ𝒿ᕗᕙ𝒶ᕗᕙ𝑜ᕗ",
+        "ᕙ𝒷ᕗᕙ𝓎ᕗᕙ𝓎ᕗᕙ𝑒ᕗᕙ𝑒ᕗ ᕙ𝒽ᕗᕙ𝓎ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ?",
+        "ᕙ𝒬ᕗᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝒬ᕗ ᕙ𝓇ᕗᕙ𝒽ᕗᕙ𝑒ᕗ ᕙ𝒽ᕗᕙ𝑜ᕗ ?",
+        "ᕙ𝓅ᕗᕙℊᕗᕙ𝓁ᕗ ᕙ𝑒ᕗᕙ𝓎ᕗ ᕙ𝒸ᕗᕙ𝓎ᕗᕙ𝒶ᕗ ᕙ𝓂ᕗᕙ𝒸ᕗ",
+        "ᕙ𝒸ᕗᕙ𝒽ᕗᕙ𝓊ᕗᕙ𝒹ᕗ ᕙ𝓂ᕗᕙ𝓉ᕗ",
+            ]
+            bs2_texts = [
+                "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰⋰🇮​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇦​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇸​⋰⋰🇪​⋰⋰🇼​⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰⋰🇰​⋰⋰🇪​⋰⋰🇧​⋰⋰🇦​⋰⋰🇨​⋰⋰🇭​⋰⋰🇪​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇮​⋰⋰🇸​⋰⋰🇸​⋰⋰🇦​⋰⋰🇬​⋰⋰🇦​⋰",
+    "⋰🇦​⋰⋰🇦​⋰⋰🇯​⋰ ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇹​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇭​⋰⋰🇦​⋰⋰🇮​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇩​⋰⋰🇷​⋰⋰🇨​⋰⋰🇭​⋰⋰🇴​⋰⋰🇩​⋰, ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇹​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇪​⋰⋰🇳​⋰ ⋰🇰​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇹​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰",
+    "⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇯​⋰⋰🇦​⋰, ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇩​⋰⋰🇮​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰",
+    "⋰🇸​⋰⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰, ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇮​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇮​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇸​⋰⋰🇰​⋰⋰🇹​⋰⋰🇦​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇰​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰, ⋰🇹​⋰⋰🇲​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰",
+    "⋰🇸​⋰⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰ ⋰🇫​⋰⋰🇮​⋰⋰🇷​⋰⋰🇸​⋰⋰🇪​⋰, ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇹​⋰",
+    "⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇬​⋰⋰🇷​⋰⋰🇮​⋰⋰🇧​⋰, ⋰🇹​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇲​⋰⋰🇦​⋰ ⋰🇩​⋰⋰🇴​⋰⋰🇺​⋰",
+    "⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰, ⋰🇳​⋰⋰🇪​⋰⋰🇹​⋰ ⋰🇴​⋰⋰🇳​⋰ ⋰🇴​⋰⋰🇫​⋰⋰🇫​⋰ ⋰🇼​⋰⋰🇦​⋰⋰🇱​⋰⋰🇮​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰",
+    "⋰🇴​⋰⋰🇾​⋰⋰🇪​⋰ ⋰🇹​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇲​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰, ⋰🇮​⋰⋰🇩​⋰⋰🇭​⋰⋰🇦​⋰⋰🇷​⋰ ⋰🇦​⋰⋰🇦​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰",
+    "⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇷​⋰⋰🇩​⋰⋰🇺​⋰, ⋰🇴​⋰⋰🇮​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇦​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇴​⋰⋰🇩​⋰⋰🇪​⋰⋰🇪​⋰",
+    "⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇪​⋰⋰🇯​⋰, ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰",
+    "⋰🇸​⋰⋰🇺​⋰⋰🇦​⋰⋰🇷​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇪​⋰⋰🇯​⋰, ⋰🇳​⋰⋰🇪​⋰⋰🇹​⋰ ⋰🇴​⋰⋰🇫​⋰⋰🇫​⋰ ⋰🇴​⋰⋰🇳​⋰ ⋰🇰​⋰⋰🇷​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇦​⋰⋰🇩​⋰⋰🇰​⋰⋰🇪​⋰",
+    "⋰🇹​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇲​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇪​⋰⋰🇸​⋰⋰🇪​⋰, ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇵​⋰ ⋰🇸​⋰⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇩​⋰⋰🇭​⋰⋰🇦​⋰⋰🇷​⋰⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰",
+    "⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇷​⋰ ⋰🇲​⋰⋰🇸​⋰⋰🇬​⋰ ⋰🇩​⋰⋰🇪​⋰⋰🇱​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰, ⋰🇴​⋰⋰🇮​⋰ ⋰🇸​⋰⋰🇺​⋰⋰🇦​⋰⋰🇷​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇦​⋰⋰🇩​⋰⋰🇰​⋰⋰🇪​⋰",
+    "⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇫​⋰⋰🇺​⋰⋰🇫​⋰⋰🇮​⋰, ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇩​⋰⋰🇮​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰⋰🇮​⋰",
+    "⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇩​⋰⋰🇮​⋰⋰🇰​⋰⋰🇭​⋰⋰🇦​⋰, ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇦​⋰⋰🇧​⋰",
+    "⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰, ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇰​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰",
+    "⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇱​⋰⋰🇪​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇷​⋰⋰🇺​⋰, ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇱​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇱​⋰⋰🇪​⋰ ⋰🇬​⋰⋰🇷​⋰⋰🇮​⋰⋰🇧​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇭​⋰⋰🇪​⋰⋰🇳​⋰ ⋰🇻​⋰⋰🇪​⋰⋰🇸​⋰⋰🇮​⋰⋰🇾​⋰⋰🇦​⋰⋰🇦​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰, ⋰🇮​⋰⋰🇹​⋰⋰🇳​⋰⋰🇦​⋰ ⋰🇬​⋰⋰🇳​⋰⋰🇩​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰⋰🇦​⋰ ⋰🇹​⋰⋰🇺​⋰ ⋰🇫​⋰⋰🇮​⋰⋰🇷​⋰⋰🇸​⋰⋰🇪​⋰ ⋰🇳​⋰⋰🇪​⋰⋰🇹​⋰ ⋰🇴​⋰⋰🇳​⋰ ⋰🇴​⋰⋰🇫​⋰⋰🇫​⋰",
+    "⋰🇬​⋰⋰🇷​⋰⋰🇮​⋰⋰🇧​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰, ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇯​⋰⋰🇦​⋰ ⋰🇱​⋰⋰🇴​⋰⋰🇩​⋰⋰🇪​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇷​⋰⋰🇺​⋰ ⋰🇩​⋰⋰🇺​⋰⋰??​⋰⋰🇬​⋰⋰🇦​⋰",
+    "⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇷​⋰⋰🇩​⋰⋰🇺​⋰⋰🇳​⋰⋰🇬​⋰⋰🇦​⋰⋰🇦​⋰, ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰, ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇾​⋰ ⋰🇨​⋰⋰🇵​⋰",
+    "⋰🇨​⋰⋰🇵​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇭​⋰⋰🇭​⋰, ⋰🇨​⋰⋰🇵​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇱​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇭​⋰",
+    "⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰, ⋰🇦​⋰⋰🇧​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰",
+    "⋰🇩​⋰⋰🇴​⋰⋰🇺​⋰⋰🇧​⋰⋰🇱​⋰⋰🇪​⋰ ⋰🇸​⋰⋰🇪​⋰⋰🇳​⋰⋰🇩​⋰ ⋰🇰​⋰⋰🇴​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰, ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰ ⋰🇩​⋰⋰🇺​⋰⋰🇳​⋰⋰🇬​⋰⋰🇦​⋰ ⋰🇦​⋰⋰🇦​⋰⋰🇯​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇭​⋰⋰🇭​⋰",
+    "⋰🇭​⋰⋰🇹​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇩​⋰⋰🇦​⋰⋰🇱​⋰⋰🇦​⋰⋰🇱​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰., ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰ ⋰🇯​⋰⋰🇱​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇯​⋰⋰🇱​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇶​⋰ ⋰🇹​⋰⋰??​⋰⋰🇾​⋰⋰🇲​⋰⋰🇦​⋰",
+    "⋰🇵​⋰⋰🇦​⋰⋰🇷​⋰⋰🇦​⋰ ⋰🇱​⋰⋰🇮​⋰⋰🇰​⋰⋰🇭​⋰⋰🇪​⋰⋰🇬​⋰⋰🇦​⋰.., ⋰🇹​⋰⋰🇷​⋰⋰🇦​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇭​⋰⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇰​⋰",
+    "⋰🇱​⋰⋰🇦​⋰⋰🇬​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇦​⋰⋰🇩​⋰⋰🇨​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰, ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇱​⋰⋰🇦​⋰⋰🇬​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰..",
+    "⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰, ⋰🇧​⋰⋰🇭​⋰⋰🇮​⋰⋰🇰​⋰⋰🇦​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇱​⋰⋰🇺​⋰⋰🇳​⋰⋰🇩​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇸​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇷​⋰⋰🇦​⋰.",
+    "⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰ ⋰🇱​⋰⋰🇪​⋰⋰🇻​⋰⋰🇪​⋰⋰🇱​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇨​⋰⋰🇷​⋰, ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰ ⋰🇱​⋰⋰🇪​⋰⋰🇻​⋰⋰🇪​⋰⋰🇱​⋰ ⋰🇼​⋰⋰🇪​⋰⋰🇦​⋰⋰🇰​⋰",
+    "⋰🇲​⋰⋰🇪​⋰⋰🇷​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇺​⋰⋰🇳​⋰⋰🇩​⋰ ⋰🇵​⋰⋰🇪​⋰ ⋰🇪​⋰⋰🇾​⋰ ⋰🇹​⋰⋰🇺​⋰ ⋰🇭​⋰⋰🇮​⋰⋰🇯​⋰⋰🇩​⋰⋰🇪​⋰, ⋰🇫​⋰⋰🇷​⋰⋰🇪​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇼​⋰⋰🇦​⋰ ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇴​⋰",
+    "⋰🇫​⋰⋰🇷​⋰⋰🇪​⋰⋰🇪​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇾​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇹​⋰⋰🇺​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇭​⋰⋰🇦​⋰⋰🇮​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇹​⋰ ⋰🇨​⋰⋰🇱​⋰⋰🇦​⋰⋰🇮​⋰⋰🇲​⋰ ⋰🇨​⋰⋰🇷​⋰⋰🇼​⋰⋰🇦​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇮​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇸​⋰⋰🇰​⋰⋰🇹​⋰⋰🇦​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇪​⋰⋰🇳​⋰ ⋰🇻​⋰⋰🇪​⋰⋰🇸​⋰⋰🇮​⋰⋰🇾​⋰⋰🇦​⋰⋰🇦​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇯​⋰⋰🇦​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇩​⋰⋰🇮​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰⋰🇮​⋰, ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇩​⋰⋰🇮​⋰⋰🇰​⋰⋰🇭​⋰⋰🇦​⋰",
+    "⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇦​⋰⋰🇧​⋰, ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇰​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰, ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇱​⋰⋰🇪​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇷​⋰⋰🇺​⋰",
+    "⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇱​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇱​⋰⋰🇪​⋰ ⋰🇬​⋰⋰🇷​⋰⋰??​⋰⋰🇧​⋰, ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇭​⋰⋰🇪​⋰⋰🇳​⋰ ⋰🇻​⋰⋰🇪​⋰⋰🇸​⋰⋰🇮​⋰⋰🇾​⋰⋰🇦​⋰⋰🇦​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰",
+    "⋰🇮​⋰⋰🇹​⋰⋰🇳​⋰⋰🇦​⋰ ⋰🇬​⋰⋰🇳​⋰⋰🇩​⋰⋰??​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰⋰🇦​⋰ ⋰🇹​⋰⋰🇺​⋰ ⋰🇫​⋰⋰🇮​⋰⋰🇷​⋰⋰🇸​⋰⋰🇪​⋰ ⋰🇳​⋰⋰🇪​⋰⋰🇹​⋰ ⋰🇴​⋰⋰🇳​⋰ ⋰🇴​⋰⋰🇫​⋰⋰🇫​⋰, ⋰🇬​⋰⋰🇷​⋰⋰🇮​⋰⋰🇧​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇯​⋰⋰🇦​⋰ ⋰🇱​⋰⋰🇴​⋰⋰🇩​⋰⋰🇪​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇷​⋰⋰🇺​⋰ ⋰🇩​⋰⋰🇺​⋰⋰🇳​⋰⋰🇬​⋰⋰🇦​⋰, ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇷​⋰⋰🇩​⋰⋰🇺​⋰⋰🇳​⋰⋰🇬​⋰⋰🇦​⋰⋰🇦​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰, ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰",
+    "⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇾​⋰ ⋰🇨​⋰⋰🇵​⋰, ⋰🇨​⋰⋰🇵​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇭​⋰⋰🇭​⋰",
+    "⋰🇨​⋰⋰🇵​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇱​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇭​⋰, ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰",
+    "⋰🇦​⋰⋰🇧​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰, ⋰🇩​⋰⋰🇴​⋰⋰🇺​⋰⋰🇧​⋰⋰🇱​⋰⋰🇪​⋰ ⋰🇸​⋰⋰🇪​⋰⋰🇳​⋰⋰🇩​⋰ ⋰🇰​⋰⋰🇴​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇹​⋰⋰🇲​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰⋰🇺​⋰",
+    "⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇲​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇨​⋰⋰🇴​⋰⋰🇩​⋰ ⋰🇩​⋰⋰🇺​⋰⋰🇳​⋰⋰🇬​⋰⋰🇦​⋰ ⋰🇦​⋰⋰🇦​⋰⋰🇯​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇭​⋰⋰🇭​⋰, ⋰🇭​⋰⋰🇹​⋰ ⋰🇹​⋰⋰🇧​⋰⋰🇰​⋰⋰🇨​⋰ ⋰🇩​⋰⋰🇦​⋰⋰🇱​⋰⋰🇦​⋰⋰🇱​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰.",
+    "⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰ ⋰🇯​⋰⋰🇱​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇯​⋰⋰🇱​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇶​⋰ ⋰🇹​⋰⋰🇷​⋰⋰🇾​⋰⋰🇲​⋰⋰🇦​⋰, ⋰🇵​⋰⋰🇦​⋰⋰🇷​⋰⋰🇦​⋰ ⋰🇱​⋰⋰🇮​⋰⋰🇰​⋰⋰🇭​⋰⋰🇪​⋰⋰🇬​⋰⋰🇦​⋰..",
+    "⋰🇹​⋰⋰🇷​⋰⋰🇦​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇭​⋰⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇰​⋰, ⋰🇱​⋰⋰🇦​⋰⋰🇬​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇦​⋰⋰🇩​⋰⋰🇨​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰",
+    "⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇱​⋰⋰🇦​⋰⋰🇬​⋰⋰🇩​⋰⋰🇮​⋰ ⋰🇰​⋰⋰🇪​⋰ ⋰🇧​⋰⋰🇪​⋰⋰🇹​⋰⋰🇪​⋰.., ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇰​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰",
+    "⋰🇧​⋰⋰🇭​⋰⋰🇮​⋰⋰🇰​⋰⋰🇦​⋰⋰🇷​⋰⋰🇮​⋰ ⋰🇱​⋰⋰🇺​⋰⋰🇳​⋰⋰🇩​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇸​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇷​⋰⋰🇦​⋰., ⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰ ⋰🇱​⋰⋰🇪​⋰⋰🇻​⋰⋰🇪​⋰⋰🇱​⋰ ⋰🇨​⋰⋰🇵​⋰ ⋰🇨​⋰⋰🇷​⋰",
+    "⋰🇨​⋰⋰🇵​⋰ ⋰🇧​⋰⋰🇴​⋰⋰🇱​⋰ ⋰🇱​⋰⋰🇴​⋰⋰🇼​⋰ ⋰🇱​⋰⋰🇪​⋰⋰🇻​⋰⋰🇪​⋰⋰🇱​⋰ ⋰🇼​⋰⋰🇪​⋰⋰🇦​⋰⋰🇰​⋰, ⋰🇲​⋰⋰🇪​⋰⋰🇷​⋰⋰🇪​⋰ ⋰🇱​⋰⋰🇺​⋰⋰🇳​⋰⋰🇩​⋰ ⋰🇵​⋰⋰🇪​⋰ ⋰🇪​⋰⋰🇾​⋰ ⋰🇹​⋰⋰🇺​⋰ ⋰🇭​⋰⋰🇮​⋰⋰🇯​⋰⋰🇩​⋰⋰🇪​⋰",
+    "⋰🇫​⋰⋰🇷​⋰⋰🇪​⋰⋰🇪​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰⋰🇼​⋰⋰🇦​⋰ ⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰??​⋰⋰🇦​⋰⋰🇰​⋰⋰🇴​⋰, ⋰🇫​⋰⋰🇷​⋰⋰🇪​⋰⋰🇪​⋰ ⋰🇲​⋰⋰🇪​⋰⋰🇾​⋰ ⋰🇨​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇹​⋰⋰🇺​⋰ ⋰🇷​⋰⋰🇦​⋰⋰🇳​⋰⋰🇩​⋰⋰🇾​⋰⋰🇰​⋰⋰🇪​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇰​⋰⋰🇮​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇹​⋰ ⋰🇨​⋰⋰🇱​⋰⋰🇦​⋰⋰🇮​⋰⋰🇲​⋰ ⋰🇨​⋰⋰🇷​⋰⋰🇼​⋰⋰🇦​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇮​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇦​⋰⋰🇬​⋰ ⋰🇸​⋰⋰🇰​⋰⋰🇹​⋰⋰🇦​⋰",
+    "⋰🇹​⋰⋰🇪​⋰⋰🇷​⋰⋰🇾​⋰ ⋰🇧​⋰⋰🇭​⋰⋰🇪​⋰⋰🇳​⋰ ⋰🇻​⋰⋰🇪​⋰⋰🇸​⋰⋰🇮​⋰⋰🇾​⋰⋰🇦​⋰⋰🇦​⋰ ⋰🇷​⋰⋰🇳​⋰⋰🇩​⋰⋰🇮​⋰, ⋰🇹​⋰⋰🇺​⋰ ⋰🇰​⋰⋰🇾​⋰⋰🇦​⋰ ⋰🇨​⋰⋰🇭​⋰⋰🇺​⋰⋰🇩​⋰ ⋰🇯​⋰⋰🇦​⋰"
+    "⋰🇧⋰⋰🇭⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇮⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇫⋰⋰🇦⋰⋰🇹⋰⋰🇮⋰ ⋰🇭⋰⋰🇦⋰⋰🇮⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇭⋰⋰🇴⋰⋰🇯⋰⋰🇦⋰",
+    "⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰ ⋰🇯⋰⋰🇦⋰⋰🇾⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇭⋰⋰🇦⋰⋰🇮⋰",
+    "⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇫⋰⋰🇮⋰⋰🇷⋰⋰🇸⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇬⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇫⋰⋰🇦⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇳⋰⋰🇦⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇲⋰⋰🇦⋰⋰🇷⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰??⋰⋰🇪⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇨⋰⋰🇭⋰⋰🇦⋰⋰🇵⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇩⋰⋰🇮⋰⋰🇩⋰⋰🇮⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇫⋰⋰🇦⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇦⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰",
+    "⋰🇳⋰⋰🇪⋰⋰🇹⋰ ⋰🇴⋰⋰🇫⋰⋰🇫⋰ ⋰🇰⋰⋰🇷⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰, ⋰🇹⋰⋰🇧⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇰⋰⋰🇷⋰ ⋰🇲⋰⋰🇸⋰⋰🇬⋰ ⋰🇩⋰⋰🇪⋰⋰🇱⋰⋰🇪⋰⋰🇹⋰⋰🇪⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰",
+    "⋰🇹⋰⋰??⋰⋰🇰⋰⋰🇨⋰ ⋰🇲⋰⋰🇦⋰⋰🇷⋰⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇫⋰⋰🇦⋰⋰🇹⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰",
+    "⋰🇸⋰⋰🇱⋰⋰🇴⋰⋰🇼⋰ ⋰🇫⋰⋰🇮⋰⋰🇷⋰⋰🇸⋰⋰🇪⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰ ⋰🇯⋰⋰🇦⋰⋰🇾⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰",
+    "⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇬⋰⋰🇷⋰⋰🇮⋰⋰🇧⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰, ⋰🇹⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇩⋰⋰🇴⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇳⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇧⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇵⋰⋰🇺⋰⋰🇷⋰⋰🇦⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇧⋰⋰🇪⋰⋰🇨⋰⋰🇭⋰ ⋰🇩⋰⋰🇴⋰",
+    "⋰🇴⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇴⋰⋰🇩⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰",
+    "⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇪⋰⋰🇪⋰⋰🇯⋰, ⋰🇹⋰⋰🇲⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇰⋰⋰🇴⋰",
+    "⋰🇸⋰⋰🇺⋰⋰🇦⋰⋰🇷⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇪⋰⋰🇪⋰⋰🇯⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇧⋰⋰🇦⋰⋰🇩⋰⋰🇮⋰ ⋰🇭⋰⋰🇦⋰⋰🇮⋰",
+    "⋰🇹⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇮⋰ ⋰🇰⋰⋰🇪⋰⋰🇸⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇫⋰⋰🇮⋰⋰🇷⋰⋰🇸⋰⋰🇪⋰",
+    "⋰🇹⋰⋰🇧⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇰⋰⋰🇷⋰ ⋰🇲⋰⋰🇸⋰⋰🇬⋰ ⋰🇩⋰⋰🇪⋰⋰🇱⋰⋰🇪⋰⋰🇹⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰",
+    "⋰🇴⋰⋰🇮⋰ ⋰🇸⋰⋰🇺⋰⋰🇦⋰⋰🇷⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇦⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇺⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇭⋰⋰🇦⋰⋰🇮⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇯⋰⋰🇦⋰⋰🇾⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇯⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇱⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇬⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇫⋰⋰🇦⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇸⋰⋰🇱⋰⋰🇴⋰⋰🇼⋰ ⋰🇹⋰⋰🇾⋰⋰🇵⋰⋰🇪⋰⋰🇷⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰??⋰ ⋰🇧⋰⋰🇭⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇦⋰⋰🇦⋰⋰🇯⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇬⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇲⋰⋰🇪⋰⋰🇮⋰⋰🇳⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇸⋰⋰🇰⋰⋰🇹⋰⋰🇦⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇲⋰⋰🇦⋰⋰🇩⋰⋰🇷⋰⋰🇨⋰⋰🇴⋰⋰🇩⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇩⋰⋰🇮⋰⋰🇩⋰⋰🇮⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇫⋰⋰🇦⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇦⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰",
+    "⋰🇳⋰⋰🇪⋰⋰🇹⋰ ⋰🇴⋰⋰🇫⋰⋰🇫⋰ ⋰🇰⋰⋰🇷⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰, ⋰🇹⋰⋰🇧⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇰⋰⋰🇷⋰ ⋰🇲⋰⋰🇸⋰⋰🇬⋰ ⋰🇩⋰⋰🇪⋰⋰🇱⋰⋰🇪⋰⋰🇹⋰⋰🇪⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇲⋰⋰🇰⋰⋰🇨⋰ ⋰🇲⋰⋰🇦⋰⋰🇷⋰⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇫⋰⋰🇦⋰⋰🇹⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰",
+    "⋰🇸⋰⋰🇱⋰⋰🇴⋰⋰🇼⋰ ⋰??⋰⋰🇮⋰⋰🇷⋰⋰🇸⋰⋰🇪⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰ ⋰🇯⋰⋰🇦⋰⋰🇾⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰",
+    "⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇬⋰⋰🇷⋰⋰🇮⋰⋰🇧⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰, ⋰🇹⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇩⋰⋰🇴⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇳⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇧⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇵⋰⋰🇺⋰⋰🇷⋰⋰🇦⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇧⋰⋰🇪⋰⋰🇨⋰⋰🇭⋰ ⋰🇩⋰⋰🇴⋰",
+    "⋰🇴⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇴⋰⋰🇩⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰",
+    "⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇪⋰⋰🇪⋰⋰🇯⋰, ⋰🇹⋰⋰🇲⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇰⋰⋰🇴⋰",
+    "⋰🇸⋰⋰🇺⋰⋰🇦⋰⋰🇷⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇪⋰⋰🇪⋰⋰🇯⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇧⋰⋰🇦⋰⋰🇩⋰⋰🇮⋰ ⋰🇭⋰⋰🇦⋰⋰🇮⋰",
+    "⋰🇹⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇮⋰ ⋰🇰⋰⋰🇪⋰⋰🇸⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇫⋰⋰🇮⋰⋰🇷⋰⋰🇸⋰⋰🇪⋰",
+    "⋰🇹⋰⋰🇧⋰⋰🇰⋰⋰🇨⋰ ⋰🇨⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰ ⋰🇰⋰⋰🇷⋰ ⋰🇲⋰⋰🇸⋰⋰🇬⋰ ⋰🇩⋰⋰🇪⋰⋰🇱⋰⋰🇪⋰⋰🇹⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰",
+    "⋰🇴⋰⋰🇮⋰ ⋰🇸⋰⋰🇺⋰⋰🇦⋰⋰🇷⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇦⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇺⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇭⋰⋰🇦⋰⋰🇮⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇯⋰⋰🇦⋰⋰🇾⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇯⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇱⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇬⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇫⋰⋰🇦⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇸⋰⋰🇱⋰⋰🇴⋰⋰🇼⋰ ⋰🇹⋰⋰🇾⋰⋰🇵⋰⋰🇪⋰⋰🇷⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇦⋰⋰🇦⋰⋰🇯⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇰⋰⋰??⋰ ⋰🇬⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇲⋰⋰🇪⋰⋰🇮⋰⋰🇳⋰, ⋰🇹⋰⋰🇺⋰ ⋰🇰⋰⋰🇾⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇸⋰⋰🇰⋰⋰🇹⋰⋰🇦⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇲⋰⋰🇦⋰⋰🇩⋰⋰🇷⋰⋰🇨⋰⋰🇴⋰⋰🇩⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇩⋰⋰🇮⋰⋰🇩⋰⋰🇮⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇫⋰⋰🇦⋰⋰🇩⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇱⋰⋰🇦⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰, ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰"
+    "⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇵⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰ ⋰🇧⋰⋰🇳⋰⋰🇦⋰⋰🇱⋰⋰🇪⋰ ⋰🇲⋰⋰🇺⋰⋰🇯⋰⋰🇪⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇦⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇵⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇿⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇾⋰⋰🇦⋰⋰🇦⋰⋰🇩⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇹⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇹⋰⋰🇺⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇦⋰ ⋰🇳⋰⋰🇦⋰ ⋰🇹⋰⋰🇾⋰⋰🇲⋰⋰🇵⋰⋰🇦⋰⋰🇸⋰⋰🇸⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰ ⋰🇺⋰⋰🇳⋰⋰🇫⋰⋰🇺⋰⋰🇳⋰⋰🇳⋰⋰🇾⋰ ⋰🇸⋰⋰🇼⋰⋰🇮⋰⋰🇵⋰⋰🇪⋰ ⋰🇲⋰⋰🇹⋰⋰🇹⋰ ⋰🇰⋰⋰🇷⋰",
+    "⋰🇴⋰⋰🇭⋰ ⋰🇭⋰⋰🇪⋰⋰🇱⋰⋰🇱⋰⋰🇴⋰ ⋰🇧⋰⋰🇮⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇦⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇵⋰ ⋰🇧⋰⋰🇮⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇴⋰⋰🇷⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇻⋰ ⋰🇧⋰⋰🇮⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇦⋰⋰🇺⋰⋰🇰⋰⋰🇦⋰⋰🇹⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇷⋰⋰🇭⋰⋰🇦⋰ ⋰🇰⋰⋰🇷⋰.",
+    "⋰🇴⋰⋰🇾⋰⋰🇾⋰ ⋰🇰⋰⋰🇮⋰⋰🇳⋰⋰🇳⋰⋰🇪⋰⋰🇷⋰ ⋰🇹⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰ ⋰🇬⋰⋰🇨⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇦⋰⋰🇦⋰⋰🇳⋰⋰🇪⋰ ⋰🇰⋰⋰🇮⋰ ⋰🇵⋰⋰🇪⋰⋰🇷⋰⋰🇲⋰⋰🇮⋰⋰🇸⋰⋰🇸⋰⋰🇮⋰⋰🇴⋰⋰🇳⋰ ⋰🇰⋰⋰🇮⋰⋰🇸⋰⋰🇳⋰⋰🇪⋰ ⋰🇩⋰⋰🇮⋰.",
+    "⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰ ⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇭⋰⋰🇦⋰",
+    "⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰ ⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇭⋰⋰🇦⋰ ⋰🇪⋰⋰🇰⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇷⋰.",
+    "⋰🇸⋰⋰🇺⋰⋰🇳⋰ ⋰🇸⋰⋰🇺⋰⋰🇳⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇦⋰.",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰??⋰ ⋰🇲⋰⋰🇦⋰⋰🇨⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇦⋰.",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇹⋰⋰🇮⋰ ⋰🇯⋰⋰🇦⋰⋰🇹⋰⋰🇮⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇹⋰⋰🇲⋰⋰🇷⋰.",
+    "⋰🇰⋰⋰🇾⋰? ⋰🇯⋰⋰🇱⋰⋰🇩⋰⋰🇮⋰ ⋰🇱⋰⋰🇮⋰⋰🇰⋰⋰🇭⋰ ⋰🇰⋰⋰🇮⋰⋰🇩⋰⋰🇩⋰⋰🇪⋰.",
+    "⋰🇧⋰⋰🇮⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇨⋰⋰🇴⋰⋰🇲⋰ ⋰🇬⋰⋰🇦⋰⋰🇳⋰⋰🇬⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇵⋰ ⋰🇰⋰⋰🇴⋰ ⋰🇹⋰⋰🇦⋰⋰🇬⋰ ⋰🇨⋰⋰🇷⋰⋰🇪⋰⋰🇬⋰⋰🇦⋰ ⋰🇹⋰⋰🇺⋰",
+    "⋰🇲⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇧⋰⋰🇮⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇹⋰⋰🇲⋰⋰🇰⋰⋰🇨⋰ ⋰🇧⋰⋰🇸⋰",
+    "⋰🇯⋰⋰🇦⋰⋰🇱⋰⋰🇩⋰⋰🇮⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇿⋰ ⋰🇵⋰⋰🇦⋰⋰🇵⋰⋰🇦⋰ ⋰🇧⋰⋰🇴⋰⋰🇱⋰",
+    "⋰🇸⋰⋰🇮⋰⋰🇩⋰⋰🇪⋰ ⋰🇭⋰⋰🇴⋰⋰🇯⋰⋰🇦⋰ ⋰🇧⋰⋰🇮⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇦⋰⋰🇮⋰ ⋰🇦⋰⋰🇧⋰",
+    "⋰🇭⋰⋰🇾⋰⋰🇪⋰ ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇧⋰⋰🇭⋰⋰🇬⋰ ⋰🇲⋰⋰🇦⋰⋰🇹⋰ ⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇬⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇦⋰⋰🇯⋰⋰🇯⋰",
+    "⋰🇭⋰⋰🇾⋰⋰🇪⋰ ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇲⋰⋰🇦⋰⋰🇹⋰",
+    "⋰🇭⋰⋰🇾⋰⋰🇪⋰ ⋰🇩⋰⋰🇺⋰⋰🇷⋰ ⋰🇭⋰⋰🇦⋰⋰🇹⋰⋰🇹⋰ ⋰🇲⋰⋰🇦⋰⋰🇩⋰⋰🇭⋰⋰🇦⋰⋰🇷⋰⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇧⋰⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇰⋰⋰🇴⋰⋰🇮⋰ ⋰🇧⋰⋰🇦⋰⋰🇹⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇪⋰⋰🇸⋰⋰🇱⋰⋰🇮⋰⋰🇾⋰⋰🇪⋰ ⋰🇲⋰⋰🇦⋰⋰🇫⋰ ⋰🇨⋰⋰🇷⋰ ⋰🇷⋰⋰🇭⋰⋰🇦⋰ ⋰🇭⋰⋰🇺⋰ ⋰🇹⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇰⋰⋰🇴⋰⋰🇮⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇹⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇲⋰⋰🇦⋰⋰🇫⋰⋰🇮⋰ ⋰🇩⋰⋰🇪⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇲⋰⋰🇦⋰⋰🇫⋰⋰🇮⋰ ⋰🇲⋰⋰🇮⋰⋰🇱⋰ ⋰🇯⋰⋰🇦⋰⋰🇾⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰ ⋰🇹⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇦⋰ ⋰🇲⋰⋰🇺⋰⋰🇯⋰⋰🇪⋰ ⋰🇸⋰⋰🇼⋰⋰🇮⋰⋰🇵⋰⋰🇪⋰ ⋰🇨⋰⋰🇷⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇸⋰⋰🇼⋰⋰🇮⋰⋰🇵⋰⋰🇪⋰ ⋰🇨⋰⋰🇷⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇫⋰⋰🇷⋰ ⋰🇧⋰⋰🇴⋰⋰🇱⋰⋰🇳⋰⋰🇦⋰ ⋰🇳⋰⋰🇦⋰ ⋰??⋰⋰🇮⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇱⋰⋰🇪⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇸⋰⋰🇼⋰⋰🇮⋰⋰🇵⋰⋰🇪⋰ ⋰🇨⋰⋰🇷⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇭⋰⋰🇺⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇵⋰⋰🇷⋰ ⋰🇰⋰⋰🇪⋰⋰🇸⋰⋰🇪⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰",
+    "⋰🇲⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰ ⋰🇵⋰⋰🇹⋰⋰🇦⋰ ⋰🇹⋰⋰🇭⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇦⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇲⋰⋰🇪⋰⋰🇾⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰⋰🇳⋰⋰🇹⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰",
+    "⋰🇱⋰⋰🇴⋰⋰🇩⋰⋰🇪⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇺⋰⋰🇹⋰⋰🇷⋰ ⋰🇲⋰⋰??⋰",
+    "⋰🇱⋰⋰🇺⋰⋰🇳⋰ ⋰🇲⋰⋰🇹⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇸⋰ ⋰🇲⋰⋰🇪⋰⋰🇷⋰⋰🇦⋰",
+    "⋰🇳⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰⋰🇱⋰ ⋰🇲⋰⋰🇦⋰⋰🇩⋰⋰🇦⋰⋰🇷⋰⋰🇨⋰⋰🇭⋰⋰🇩⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇴⋰⋰🇾⋰⋰🇪⋰ ⋰🇬⋰⋰🇦⋰⋰🇸⋰⋰🇭⋰⋰🇹⋰⋰🇮⋰ ⋰🇰⋰ ⋰🇧⋰⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇮⋰⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇹⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇲⋰⋰🇦⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇰⋰ ⋰🇭⋰⋰🇦⋰⋰🇹⋰⋰🇭⋰ ⋰🇹⋰⋰🇴⋰⋰🇩⋰⋰🇭⋰ ⋰🇰⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇪⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇵⋰ ⋰🇰⋰ ⋰🇲⋰⋰🇺⋰⋰🇭⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇫⋰⋰🇦⋰⋰🇸⋰⋰🇦⋰⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇱⋰⋰🇪⋰⋰🇦⋰⋰??⋰⋰🇪⋰ ⋰🇱⋰⋰🇪⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇵⋰⋰🇦⋰⋰🇸⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇳⋰⋰🇦⋰⋰🇮⋰ ⋰🇦⋰⋰🇾⋰⋰🇦⋰ ⋰🇲⋰⋰🇪⋰⋰🇰⋰⋰🇴⋰",
+    "⋰🇱⋰⋰🇪⋰⋰🇦⋰⋰🇻⋰⋰🇪⋰ ⋰🇱⋰⋰🇪⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇮⋰⋰🇩⋰⋰🇪⋰⋰🇷⋰ ⋰🇸⋰⋰🇪⋰",
+    "⋰🇱⋰⋰🇪⋰⋰🇦⋰⋰🇻⋰⋰🇪⋰ ⋰🇱⋰⋰🇪⋰ ⋰🇯⋰⋰🇱⋰⋰🇩⋰⋰🇮⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇼⋰⋰🇷⋰⋰🇳⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇦⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇱⋰⋰🇪⋰⋰🇦⋰⋰🇻⋰⋰🇪⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇱⋰⋰🇪⋰⋰🇬⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇸⋰⋰🇲⋰⋰🇯⋰⋰🇭⋰ ⋰🇧⋰⋰🇦⋰⋰🇹⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇱⋰⋰🇪⋰⋰🇦⋰⋰🇻⋰⋰🇪⋰ ⋰🇱⋰⋰🇪⋰",
+    "⋰🇫⋰⋰🇦⋰⋰🇸⋰⋰🇹⋰ ⋰🇱⋰⋰🇪⋰⋰🇦⋰⋰🇻⋰⋰🇪⋰ ⋰🇱⋰⋰🇪⋰ ⋰🇰⋰⋰🇦⋰⋰🇲⋰⋰🇯⋰⋰🇴⋰⋰🇷⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰",
+    "⋰🇹⋰⋰🇺⋰⋰🇹⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰",
+    "⋰🇴⋰⋰🇾⋰ ⋰🇭⋰⋰🇮⋰⋰🇯⋰⋰🇩⋰⋰🇪⋰ ⋰🇰⋰⋰🇭⋰⋰🇦⋰⋰🇳⋰⋰🇦⋰ ⋰🇰⋰⋰🇭⋰⋰🇦⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇦⋰⋰🇦⋰ ⋰🇰⋰⋰🇦⋰⋰🇲⋰⋰🇿⋰⋰🇴⋰⋰🇷⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇴⋰ ⋰🇮⋰⋰🇱⋰⋰🇾⋰ ⋰🇷⋰⋰🇪⋰⋰🇾",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇨⋰⋰🇭⋰⋰🇦⋰⋰🇵⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇹⋰⋰🇲⋰⋰🇰⋰⋰🇨⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰⋰🇨⋰⋰🇭⋰⋰🇦⋰⋰🇵⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇹⋰⋰🇺⋰",
+    "⋰🇸⋰⋰🇭⋰⋰🇮⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰⋰🇨⋰⋰🇭⋰⋰🇦⋰⋰🇵⋰",
+    "⋰🇫⋰⋰🇷⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰??⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰⋰🇨⋰⋰🇭⋰⋰🇦⋰⋰🇵⋰",
+    "⋰🇸⋰⋰🇭⋰⋰🇮⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇱⋰⋰🇮⋰⋰🇰⋰⋰🇭⋰ ⋰🇼⋰⋰🇷⋰⋰🇳⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇦⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇾⋰⋰🇺⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇦⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰⋰🇨⋰⋰🇭⋰⋰🇦⋰⋰🇵⋰",
+    "⋰🇵⋰⋰🇷⋰⋰🇴⋰⋰🇴⋰⋰🇫⋰ ⋰🇨⋰⋰🇷⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇵⋰⋰🇷⋰⋰🇴⋰⋰🇴⋰⋰🇫⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇪⋰⋰🇾⋰",
+    "⋰🇵⋰⋰🇷⋰⋰🇴⋰⋰🇴⋰⋰🇫⋰ ⋰🇭⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇰⋰⋰🇦⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇨⋰⋰🇭⋰⋰🇮⋰⋰🇱⋰⋰🇱⋰⋰🇦⋰⋰🇷⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇰⋰ ⋰🇧⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇦⋰ ⋰🇹⋰⋰🇪⋰⋰??⋰⋰🇾⋰",
+    "⋰🇴⋰⋰🇾⋰ ⋰🇭⋰⋰🇮⋰⋰🇯⋰⋰🇩⋰⋰🇪⋰ ⋰🇰⋰⋰🇭⋰⋰🇦⋰⋰🇳⋰⋰🇦⋰ ⋰🇰⋰⋰🇭⋰⋰🇦⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇦⋰⋰🇦⋰ ⋰🇰⋰⋰🇦⋰⋰🇲⋰⋰🇿⋰⋰🇴⋰⋰🇷⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇲​⋰⋰🇦​⋰⋰🇩​⋰⋰🇷​⋰⋰🇨​⋰⋰🇭​⋰⋰🇴​⋰⋰🇩​⋰ ?",
+    "⋰🇦⋰⋰🇧⋰ ⋰🇹⋰⋰🇰⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇮⋰ ⋰🇭⋰⋰🇴⋰⋰🇬⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ?",
+    "⋰🇳⋰⋰🇾⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇰⋰⋰🇺⋰⋰🇨⋰⋰🇭⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇯⋰⋰🇦⋰⋰🇳⋰⋰🇹⋰⋰🇦⋰ ⋰🇧⋰⋰🇸⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰ ⋰🇪⋰⋰🇾⋰",
+    "⋰🇸⋰⋰🇧⋰⋰🇸⋰⋰🇪⋰ ⋰🇵⋰⋰🇭⋰⋰🇪⋰⋰🇱⋰⋰🇪⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇰⋰⋰🇴⋰ ⋰🇧⋰⋰🇴⋰⋰🇱⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇳⋰⋰🇦⋰ ⋰🇰⋰⋰🇦⋰⋰🇲⋰ ⋰🇰⋰⋰🇷⋰⋰🇪⋰",
+    "⋰🇾⋰⋰🇦⋰⋰🇭⋰⋰🇦⋰ ⋰🇧⋰⋰🇭⋰⋰🇮⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇦⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇨⋰⋰🇪⋰ ⋰🇵⋰⋰🇮⋰⋰🇱⋰⋰🇱⋰⋰🇪⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰⋰🇲⋰⋰🇦⋰⋰🇰⋰⋰🇦⋰⋰🇧⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇦⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇹⋰⋰🇴⋰ ⋰🇧⋰⋰🇭⋰⋰🇪⋰⋰🇳⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇪⋰⋰🇬⋰⋰🇮⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇵⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇹⋰⋰🇴⋰⋰🇲⋰⋰🇲⋰⋰🇾⋰",
+    "⋰🇳⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰⋰🇱⋰ ⋰🇲⋰⋰🇦⋰⋰🇩⋰⋰🇦⋰⋰🇷⋰⋰🇨⋰⋰🇭⋰⋰🇩⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰ ⋰🇾⋰⋰🇭⋰⋰🇦⋰ ⋰🇸⋰⋰🇪⋰",
+    "⋰🇨⋰⋰🇴⋰⋰🇿⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇭⋰⋰🇮⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰ ⋰🇭⋰⋰🇪⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇹⋰⋰🇴⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇵⋰ ⋰🇧⋰⋰🇴⋰⋰🇱⋰ ⋰🇲⋰⋰🇺⋰⋰🇯⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇳⋰⋰🇾⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇭⋰⋰🇴⋰⋰🇬⋰⋰🇮⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⊶⊶🇮⋰ ⋰🇯⋰⋰🇴⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰⋰🇹⋰⋰🇮⋰ ⋰🇯⋰⋰🇴⋰⋰🇬⋰⋰🇮⋰",
+    "⋰🇹⋰⋰🇷⋰⋰🇾⋰ ⋰🇦⋰⋰🇲⋰⋰🇲⋰⋰🇮⋰ ⋰🇨⋰⋰🇪⋰ ⋰🇧⋰⋰🇭⋰⋰🇴⋰⋰🇸⋰⋰🇩⋰⋰🇪⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇪⋰⋰🇲⋰⋰🇴⋰⋰🇯⋰⋰🇮⋰ ⋰🇩⋰⋰🇦⋰⋰🇱⋰ ⋰🇲⋰⋰🇨⋰",
+    "⋰🇨⋰⋰🇾⋰⋰🇦⋰ ? ⋰🇨⋰⋰🇭⋰⋰🇲⋰⋰🇷⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇦⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ?",
+    "⋰🇹⋰⋰🇲⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇷⋰⋰🇮⋰ ⋰🇭⋰⋰🇴⋰⋰🇬⋰⋰🇮⋰ ⋰🇫⋰⋰🇷⋰⋰🇷⋰⋰🇹⋰⋰🇴⋰",
+    "⋰🇨⋰⋰🇾⋰⋰🇦⋰ ? ⋰🇰⋰⋰🇧⋰ ? ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇰⋰⋰🇪⋰⋰🇰⋰",
+    "⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇸⋰⋰🇨⋰⋰🇭⋰ ⋰🇲⋰⋰🇪⋰⋰🇾⋰ ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇷⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰⋰🇾⋰⋰🇰⋰⋰🇪⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇱⋰⋰🇮⋰ ⋰🇹⋰⋰🇺⋰⋰🇳⋰⋰🇪⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰",
+    "⋰🇮⋰⋰🇹⋰⋰🇳⋰⋰🇦⋰ ⋰🇸⋰⋰🇨⋰⋰🇭⋰ ⋰🇳⋰⋰🇾⋰ ⋰🇧⋰⋰🇴⋰⋰🇱⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇦⋰⋰🇮⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇾⋰",
+    "⋰🇸⋰⋰🇨⋰⋰🇭⋰ ⋰🇲⋰⋰🇪⋰⋰🇾⋰ ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇹⋰⋰🇺⋰ ⋰🇦⋰⋰🇵⋰⋰🇳⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇼⋰⋰🇦⋰ ⋰🇱⋰⋰🇮⋰⋰🇦⋰ ⋰🇲⋰⋰🇪⋰⋰🇷⋰⋰🇪⋰ ⋰🇸⋰⋰🇹⋰⋰🇭⋰",
+    "⋰🇲⋰⋰🇹⋰⋰🇱⋰⋰🇧⋰ ⋰🇹⋰⋰🇲⋰⋰🇷⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇹⋰⋰🇴⋰",
+    "⋰🇵⋰⋰🇺⋰⋰🇷⋰⋰🇦⋰ ⋰🇱⋰⋰🇮⋰⋰🇰⋰⋰🇭⋰ ⋰🇲⋰⋰🇨⋰",
+    "⋰🇹⋰⋰🇲⋰⋰🇷⋰ ⋰🇫⋰⋰🇷⋰⋰🇷⋰⋰🇹⋰⋰🇴⋰",
+    "⋰🇴⋰⋰🇭⋰ ⋰🇴⋰⋰🇰⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇱⋰⋰🇪⋰ ⋰🇫⋰⋰🇮⋰⋰🇷⋰",
+    "⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇰⋰⋰🇦⋰ ⋰🇩⋰⋰🇦⋰⋰🇲⋰⋰🇦⋰⋰🇩⋰",
+    "⋰🇨⋰⋰🇾⋰⋰🇦⋰ ? ⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰ ⋰🇸⋰⋰🇪⋰ ⋰🇱⋰⋰🇮⋰⋰🇰⋰⋰🇭⋰⋰🇪⋰ ⋰🇵⋰⋰🇪⋰⋰🇭⋰⋰🇱⋰⋰🇪⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇪⋰⋰🇧⋰⋰🇦⋰⋰🇨⋰⋰🇭⋰⋰🇪⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇹⋰⋰🇴⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰⋰🇳⋰⋰🇪⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇻⋰⋰🇾⋰⋰🇦⋰⋰🇸⋰⋰🇹⋰ ⋰🇭⋰⋰🇺⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇹⋰⋰🇴⋰ ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇰⋰⋰🇺⋰⋰🇨⋰⋰🇭⋰ ⋰🇧⋰⋰🇮⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰⋰🇪⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ? ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇬⋰⋰🇾⋰⋰🇦⋰ ?",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇲⋰⋰🇹⋰ ⋰🇭⋰⋰🇸⋰⋰🇸⋰",
+    "⋰🇾⋰⋰🇺⋰⋰🇷⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⊶⊶🇮⋰ ⋰🇲⋰⋰🇴⋰⋰🇲⋰",
+    "⋰🇦⋰⋰🇷⋰⋰🇪⋰ ⋰🇸⋰⋰🇧⋰⋰🇰⋰⋰🇮⋰ ⋰🇲⋰⋰??⋰⋰🇦⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⊶⊶🇮⋰ ⋰🇴⋰⋰🇷⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇧⋰⋰🇮⋰",
+    "⋰🇦⋰⋰🇷⋰⋰🇪⋰ ⋰🇮⋰⋰🇩⋰⋰🇦⋰⋰🇷⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰⋰🇱⋰⋰🇪⋰ ⋰🇪⋰⋰🇰⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇷⋰",
+    "⋰🇹⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇮⋰ ⋰🇹⋰⋰🇷⋰⋰🇭⋰",
+    "⋰🇪⋰⋰🇰⋰ ⋰🇱⋰⋰🇮⋰⋰🇳⋰⋰🇪⋰ ⋰🇲⋰⋰🇪⋰ ⋰🇹⋰⋰🇲⋰⋰🇷⋰",
+    "⋰🇶⋰",
+    "⋰🇴⋰⋰🇨⋰⋰🇾⋰ ⋰🇦⋰⋰🇧⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇱⋰⋰🇪⋰",
+    "⋰🇵⋰⋰🇪⋰⋰🇭⋰⋰🇪⋰⋰🇱⋰⋰🇪⋰ ⋰🇹⋰⋰🇪⋰⋰🇷⋰⋰🇮⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰ ⋰🇨⋰⋰🇭⋰⋰🇴⋰⋰🇩⋰⋰🇺⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇹⋰⋰🇴⋰",
+    "⋰🇶⋰ ?",
+    "⋰??⋰⋰🇾⋰⋰🇾⋰⋰🇾⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰ ⋰🇪⋰⋰🇰⋰ ⋰🇧⋰⋰🇦⋰⋰🇦⋰⋰🇷⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰⋰🇪⋰ ⋰🇸⋰⋰🇺⋰⋰🇳⋰ ⋰🇩⋰⋰🇴⋰⋰🇸⋰⋰🇹⋰ ⋰🇹⋰⋰🇲⋰⋰🇷⋰",
+    "⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇯⋰⋰🇦⋰ ⋰🇷⋰⋰🇦⋰⋰🇦⋰⋰🇳⋰⋰🇩⋰ ⋰🇲⋰⋰🇦⋰⋰🇦⋰⋰🇫⋰ ⋰🇨⋰⋰🇷⋰⋰🇷⋰ ⋰🇩⋰⋰🇺⋰⋰🇳⋰⋰🇬⋰⋰🇦⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰⋰🇪⋰ ⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇷⋰⋰🇳⋰⋰🇩⋰⋰🇮⋰⊶⊶🇮⋰ ⋰🇮⋰⋰🇩⋰⋰🇦⋰⋰🇷⋰ ⋰🇦⋰⋰🇦⋰",
+    "⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇹⋰⋰🇲⋰⋰🇷⋰ ⋰🇫⋰⋰🇷⋰⋰🇷⋰⋰🇹⋰⋰🇴⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰⋰🇪⋰ ⋰🇮⋰⋰🇩⋰⋰🇦⋰⋰🇷⋰ ⋰🇦⋰⋰🇦⋰⋰🇰⋰⋰🇪⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇱⋰⋰🇪⋰ ⋰🇨⋰⋰🇭⋰⋰🇲⋰⋰🇷⋰",
+    "⋰🇳⋰⋰🇾⋰⋰🇹⋰⋰🇴⋰ ⋰🇦⋰⋰🇪⋰⋰🇸⋰⋰🇪⋰ ⋰🇭⋰⋰🇮⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰",
+    "⋰🇴⋰⋰🇾⋰⋰🇪⋰⋰🇪⋰ ⋰🇭⋰⋰🇾⋰⋰🇾⋰ ⋰🇦⋰⋰🇮⋰⋰🇸⋰⋰🇪⋰ ⋰🇭⋰⋰🇮⋰ ⋰🇨⋰⋰🇺⋰⋰🇩⋰ ⋰🇱⋰⋰🇪⋰⋰🇳⋰⋰🇦⋰",
+    "⋰🇴⋰⋰🇷⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇱⋰⋰🇪⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇰⋰⋰🇪⋰ ⋰🇩⋰⋰🇮⋰⋰🇰⋰⋰🇦⋰ ⋰🇴⋰⋰🇷⋰",
+    "⋰🇭⋰⋰🇾⋰⋰🇾⋰ ⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇴⋰ ⋰??⋰⋰🇦⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰⋰🇴⋰ ⋰🇲⋰⋰🇹⋰ ⋰🇧⋰⋰🇭⋰⋰🇦⋰⋰🇬⋰ ⋰🇯⋰⋰🇦⋰⋰🇴⋰",
+    "⋰🇧⋰⋰🇾⋰⋰🇾⋰⋰🇪⋰⋰🇪⋰ ⋰🇭⋰⋰🇾⋰⋰🇾⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ?",
+    "⋰🇶⋰⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇶⋰ ⋰🇷⋰⋰🇭⋰⋰🇪⋰ ⋰🇭⋰⋰🇴⋰ ?",
+    "⋰🇵⋰⋰🇬⋰⋰🇱⋰ ⋰🇪⋰⋰🇾⋰ ⋰🇨⋰⋰🇾⋰⋰🇦⋰ ⋰🇲⋰⋰🇨⋰",
+    "⋰🇨⋰⋰🇭⋰⋰🇺⋰⋰🇩⋰ ⋰🇲⋰⋰🇹⋰",
+    ]
 
-        situation_texts = [
-            "Agar tumhe 1 crore mil jaye toh kya karoge? 💰",
-            "Agar tum 1 din invisible ho sakte ho toh kya karoge? 👻",
-            "Agar tumhe ek wish mil jaye toh kya maangoge? ✨",
-            "Agar tum president ban jao toh kya change karoge? 🏛️",
-            "Agar tumhe time travel karna hai toh kahan jaoge? ⏳",
-            "Agar tumhe 3 wishes mil jaye toh kya maangoge? 🌟",
-            "Agar tum superpower choose kar sakte ho toh kya? 🦸",
-            "Agar tumhe ek book likhni hai toh kya likhoge? 📖",
-            "Agar tum famous ho jao toh kya karoge? 🌟",
-            "Agar tumhe ek din kuch bhi karne ko mile toh kya karoge? 🎉",
-            "Agar tumhe ek country choose karni hai toh kaunsi? 🌍",
-            "Agar tumhe ek language seekhni hai toh kaunsi? 🗣️",
-            "Agar tum apna naam change kar sakte ho toh kya rakhenge? 📛",
-            "Agar tumhe apni life 1 word mein describe karni hai toh kya? 💬",
-            "Agar tumhe ek famous personality se milna hai toh kaun? 🌟",
-            "Agar tumhe 1 din life free ho toh kya karoge? 🎈",
-            "Agar tumhe apni life ka best moment choose karna hai toh kya? 📸",
-            "Agar tumhe ek skill seekhni hai toh kaunsi? 🎯",
-            "Agar tumhe apni life ka worst moment choose karna hai toh kya? 😢",
-            "Agar tumhe ek adventure karna hai toh kya? 🏔️",
-            "Agar tumhe apni life change karni hai toh kya change karoge? 🔄",
-            "Agar tumhe ek dream choose karna hai toh kya? 💭",
-            "Agar tumhe apni life ka best decision choose karna hai toh kya? ✅",
-            "Agar tumhe ek challenge choose karna hai toh kya? 🏆",
-            "Agar tumhe apni life ka best friend choose karna hai toh kaun? 🤝",
-            "Agar tumhe apni life ka worst decision choose karna hai toh kya? ❌",
-            "Agar tumhe ek goal choose karna hai toh kya? 🎯",
-            "Agar tumhe apni life ka best memory choose karna hai toh kya? 📸",
-            "Agar tumhe apni life ka worst memory choose karna hai toh kya? 😢",
-            "Agar tumhe apni life ka best achievement choose karna hai toh kya? 🏆"
-        ]
+            
+            bs3_texts = [
+                            "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄾⋰⋰🄻⋰ ⋰🅃⋰⋰🄾⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄳⋰⋰??⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄼⋰⋰🅄⋰⋰🄷⋰ ⋰🄼⋰⋰🄴⋰ ⋰🅁⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰⋰🄳⋰ ⋰🄳⋰⋰🅄⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰ ⋰??⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄼⋰⋰🄴⋰ ⋰🄻⋰⋰🄾⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄼⋰⋰🄰⋰⋰🅂⋰⋰🄰⋰⋰🄻⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🄵⋰⋰🄰⋰⋰🄼⋰⋰🄴⋰ ⋰🄻⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄿⋰⋰🄴⋰ ⋰🅃⋰⋰🄷⋰⋰🄰⋰⋰🄿⋰⋰🄿⋰⋰🄰⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄼⋰⋰🄴⋰ ⋰🄻⋰⋰🄾⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🅄⋰",
+    "⋰🅇⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰ ⋰🅄⋰⋰🅃⋰⋰🄷⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🄷⋰⋰🄴⋰⋰🅁⋰⋰🄲⋰⋰🄷⋰⋰??⋰⋰🄳⋰",
+    "⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🄽⋰⋰🄰⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🄳⋰⋰🄺⋰⋰🄴⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄱⋰⋰🅄⋰⋰🄳⋰⋰🄷⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🄳⋰⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄸⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🄷⋰⋰🄴⋰⋰🅁⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰ ⋰🄲⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰ ⋰🅄⋰⋰🅃⋰⋰🄷⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄰⋰⋰🄺⋰⋰🄴⋰⋰🄻⋰⋰🄰⋰ ⋰🄿⋰⋰🄰⋰⋰🄽⋰ ⋰🄼⋰⋰🄸⋰⋰🅃⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄸⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰⋰🄸⋰ ⋰🅇⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄷⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰⋰🅃⋰ ⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄲⋰⋰🄷⋰⋰🄰⋰⋰🄿⋰⋰🄿⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🄻⋰⋰🄻⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄽⋰⋰🄰⋰⋰🄽⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄾⋰⋰🄾⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄴⋰⋰🅁⋰⋰🅁⋰ ⋰🄵⋰⋰🄰⋰⋰🄰⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰⋰🅃⋰ ⋰🅂⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰⋰🅁⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰⋰🄻⋰⋰🄻⋰⋰🄻⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰⋰🄹⋰⋰🄹⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄵⋰⋰🄰⋰⋰🄰⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰ ⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰??⋰⋰🅈⋰⋰🅈⋰⋰🅈⋰ ⋰🄺⋰⋰🅁⋰⋰🅁⋰⋰🅁⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄽⋰⋰🄸⋰⋰🄻⋰⋰🄰⋰⋰🄰⋰⋰🄼⋰⋰🄼⋰⋰🄼⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰⋰🄽⋰⋰🄽⋰ ⋰🄺⋰⋰🄾⋰⋰🄾⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄺⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰⋰🄰⋰⋰🄰⋰ ⋰🅂⋰⋰🄴⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄶⋰⋰🄶⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰🄻⋰⋰🅈⋰⋰🅈⋰⋰🅈⋰ ⋰🄳⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰⋰🅃⋰ ⋰🄼⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰⋰🄽⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰ ⋰🄼⋰⋰🄴⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰⋰🄽⋰ ⋰🄷⋰⋰🄰⋰⋰🅃⋰⋰🄷⋰⋰🄷⋰⋰🄷⋰ ⋰🄳⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🄻⋰⋰🄻⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰⋰🄹⋰⋰🄹⋰⋰🄹⋰ ⋰??⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰⋰🄽⋰⋰🄽⋰",
+    "⋰🅂⋰⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄿⋰⋰🄰⋰⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅂⋰⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄻⋰⋰🄴⋰⋰🄺⋰⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰⋰🅁⋰ ⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🄰⋰⋰🅁⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🅂⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰🄻⋰⋰🅈⋰⋰🅈⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰ ⋰🄽⋰⋰🄰⋰⋰🄽⋰⋰🄸⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄰⋰⋰🅄⋰⋰🄻⋰⋰🄰⋰⋰🄳⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄰⋰⋰🅄⋰⋰🄻⋰⋰🄰⋰⋰🄳⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🄰⋰⋰🅁⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄳⋰ ⋰🄺⋰⋰🄸⋰⋰🄳⋰⋰🄳⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🅂⋰⋰🄰⋰⋰🅃⋰⋰🄷⋰ ⋰🅂⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🅅⋰⋰🄾⋰⋰🄸⋰⋰🄲⋰⋰🄴⋰ ⋰🄷⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🅂⋰⋰🄴⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🅂⋰⋰🄰⋰⋰🄺⋰⋰🅃⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄱⋰⋰🄰⋰⋰🄰⋰⋰🄿⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄸⋰⋰🄶⋰⋰🄽⋰⋰🄾⋰⋰🅁⋰⋰🄴⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🅄⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄸⋰⋰🄶⋰⋰🄽⋰⋰🄾⋰⋰🅁⋰⋰🄴⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🅁⋰⋰🄰⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰ ⋰??⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄰⋰⋰🅃⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄰⋰ ⋰🄻⋰⋰🄾⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄻⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄰⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄰⋰⋰🄰⋰⋰🄿⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄻⋰⋰🄸⋰ ⋰🄹⋰⋰🅄⋰⋰🄱⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄴⋰⋰🄽⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰??⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄽⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄼⋰⋰🄰⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄱⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🅂⋰⋰🄴⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄴⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄰⋰⋰🅃⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄴⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄻⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰ ⋰🄰⋰⋰🄱⋰ ⋰🅃⋰⋰🅄⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄴⋰ ⋰🄿⋰⋰🄴⋰⋰🅁⋰ ⋰🄶⋰⋰??⋰⋰🅄⋰⋰🄼⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄻⋰⋰🄴⋰⋰🄺⋰⋰🄸⋰⋰🄽⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄹⋰⋰🄷⋰⋰🅄⋰⋰🄺⋰⋰🄽⋰⋰🄴⋰ ⋰🄽⋰⋰🄰⋰⋰🄸⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰ ⋰🄱⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄰⋰ ⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰🄻⋰⋰🅈⋰ ⋰🄷⋰⋰🄾⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄳⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰ ⋰🄹⋰⋰🄰⋰⋰🅈⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄽⋰⋰🄰⋰ ⋰🄲⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰⋰🅄⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🅃⋰⋰🄾⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄱⋰⋰🄾⋰⋰🄻⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄰⋰⋰🅃⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄷⋰⋰🄾⋰⋰🄹⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🅄⋰⋰🅃⋰⋰🄷⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄵⋰⋰🄴⋰⋰🄽⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🄿⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🅁⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄺⋰⋰🄾⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰??⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰ ⋰🄹⋰⋰🄰⋰⋰🅈⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄴⋰ ⋰🄿⋰⋰🄴⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄳⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🄾⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄼⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🅂⋰⋰🄰⋰⋰🅃⋰⋰🄷⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄱⋰⋰🄷⋰⋰🄸⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄷⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰??⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🅂⋰⋰🄴⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🄶⋰⋰🄰⋰⋰🄸⋰⋰🅁⋰⋰🄱⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄰⋰⋰🅄⋰⋰🄻⋰⋰🄰⋰⋰🄳⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄱⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄿⋰ ⋰🄺⋰⋰🄸⋰ ⋰🅂⋰⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🅃⋰⋰🄲⋰⋰🄷⋰ ⋰🄺⋰⋰🅁⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰ ⋰🄶⋰⋰🄰⋰⋰🅁⋰⋰🄸⋰⋰🄱⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄴⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄴⋰⋰🄴⋰⋰🄹⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰??⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄺⋰⋰🄾⋰ ⋰🅃⋰⋰🄰⋰⋰🄶⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰⋰🅁⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄰⋰⋰🅃⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄴⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄻⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰ ⋰🄰⋰⋰🄱⋰ ⋰🅃⋰⋰🅄⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄴⋰ ⋰🄿⋰⋰🄴⋰⋰🅁⋰ ⋰🄶⋰⋰🄷⋰⋰🅄⋰⋰🄼⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄻⋰⋰🄴⋰⋰🄺⋰⋰🄸⋰⋰🄽⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄹⋰⋰🄷⋰⋰🅄⋰⋰🄺⋰⋰🄽⋰⋰🄴⋰ ⋰🄽⋰⋰🄰⋰⋰🄸⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰ ⋰🄱⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄰⋰ ⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰🄻⋰⋰🅈⋰ ⋰🄷⋰⋰🄾⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄳⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰??⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰??⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰ ⋰🄹⋰⋰🄰⋰⋰🅈⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄽⋰⋰🄰⋰ ⋰🄲⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰⋰🅄⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🅃⋰⋰🄾⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄱⋰⋰🄾⋰⋰🄻⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄰⋰⋰🅃⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰??⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄷⋰⋰🄾⋰⋰🄹⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🅄⋰⋰🅃⋰⋰🄷⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄵⋰⋰🄴⋰⋰🄽⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰??⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🄿⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🅁⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄺⋰⋰🄾⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰ ⋰🄹⋰⋰🄰⋰⋰🅈⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄴⋰ ⋰🄿⋰⋰🄴⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄳⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🄾⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄼⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🅂⋰⋰🄰⋰⋰🅃⋰⋰🄷⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄱⋰⋰🄷⋰⋰🄸⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄷⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🅂⋰⋰🄴⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🄶⋰⋰🄰⋰⋰🄸⋰⋰🅁⋰⋰🄱⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄰⋰⋰🅄⋰⋰🄻⋰⋰🄰⋰⋰🄳⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄱⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄿⋰ ⋰🄺⋰⋰🄸⋰ ⋰🅂⋰⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🅃⋰⋰🄲⋰⋰🄷⋰ ⋰🄺⋰⋰🅁⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰ ⋰🄶⋰⋰🄰⋰⋰🅁⋰⋰🄸⋰⋰🄱⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄴⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄴⋰⋰🄴⋰⋰🄹⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄺⋰⋰🄾⋰ ⋰🅃⋰⋰🄰⋰⋰🄶⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰⋰🅁⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰"
+    ]
 
-        # ─── QUIZ TEXTS ────────────────────────────────────────────────────────
+            
+            sqs_texts = [
+                            "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄾⋰⋰🄻⋰ ⋰🅃⋰⋰🄾⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄳⋰⋰??⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄼⋰⋰🅄⋰⋰🄷⋰ ⋰🄼⋰⋰🄴⋰ ⋰🅁⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰⋰🄳⋰ ⋰🄳⋰⋰🅄⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰ ⋰??⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄼⋰⋰🄴⋰ ⋰🄻⋰⋰🄾⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄼⋰⋰🄰⋰⋰🅂⋰⋰🄰⋰⋰🄻⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🄵⋰⋰🄰⋰⋰🄼⋰⋰🄴⋰ ⋰🄻⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄿⋰⋰🄴⋰ ⋰🅃⋰⋰🄷⋰⋰🄰⋰⋰🄿⋰⋰🄿⋰⋰🄰⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄼⋰⋰🄴⋰ ⋰🄻⋰⋰🄾⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🅄⋰",
+    "⋰🅇⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰ ⋰🅄⋰⋰🅃⋰⋰🄷⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🄷⋰⋰🄴⋰⋰🅁⋰⋰🄲⋰⋰🄷⋰⋰??⋰⋰🄳⋰",
+    "⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🄽⋰⋰🄰⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🄳⋰⋰🄺⋰⋰🄴⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄱⋰⋰🅄⋰⋰🄳⋰⋰🄷⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🄳⋰⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄸⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🄷⋰⋰🄴⋰⋰🅁⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰ ⋰🄲⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰ ⋰🅄⋰⋰🅃⋰⋰🄷⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄰⋰⋰🄺⋰⋰🄴⋰⋰🄻⋰⋰🄰⋰ ⋰🄿⋰⋰🄰⋰⋰🄽⋰ ⋰🄼⋰⋰🄸⋰⋰🅃⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄸⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰⋰🄸⋰ ⋰🅇⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄷⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰⋰🅃⋰ ⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄲⋰⋰🄷⋰⋰🄰⋰⋰🄿⋰⋰🄿⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🄻⋰⋰🄻⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄽⋰⋰🄰⋰⋰🄽⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄾⋰⋰🄾⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄴⋰⋰🅁⋰⋰🅁⋰ ⋰🄵⋰⋰🄰⋰⋰🄰⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰⋰🅃⋰ ⋰🅂⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰⋰🅁⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰⋰🄻⋰⋰🄻⋰⋰🄻⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰⋰🄹⋰⋰🄹⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄵⋰⋰🄰⋰⋰🄰⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰ ⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰??⋰⋰🅈⋰⋰🅈⋰⋰🅈⋰ ⋰🄺⋰⋰🅁⋰⋰🅁⋰⋰🅁⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄽⋰⋰🄸⋰⋰🄻⋰⋰🄰⋰⋰🄰⋰⋰🄼⋰⋰🄼⋰⋰🄼⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰⋰🄽⋰⋰🄽⋰ ⋰🄺⋰⋰🄾⋰⋰🄾⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄺⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰⋰🄰⋰⋰🄰⋰ ⋰🅂⋰⋰🄴⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄶⋰⋰🄶⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰🄻⋰⋰🅈⋰⋰🅈⋰⋰🅈⋰ ⋰🄳⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰⋰🅃⋰ ⋰🄼⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰⋰🄽⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰ ⋰🄼⋰⋰🄴⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰⋰🄽⋰ ⋰🄷⋰⋰🄰⋰⋰🅃⋰⋰🄷⋰⋰🄷⋰⋰🄷⋰ ⋰🄳⋰⋰🄰⋰⋰🄰⋰⋰🄻⋰⋰🄻⋰⋰🄻⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰⋰🄹⋰⋰🄹⋰⋰🄹⋰ ⋰??⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰⋰🄽⋰⋰🄽⋰",
+    "⋰🅂⋰⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄿⋰⋰🄰⋰⋰🄺⋰⋰🄰⋰⋰🄰⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅂⋰⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄻⋰⋰🄴⋰⋰🄺⋰⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🅁⋰⋰🅁⋰ ⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🄰⋰⋰🅁⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄳⋰⋰🄳⋰ ⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🅂⋰⋰🄴⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰🄻⋰⋰🅈⋰⋰🅈⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰ ⋰🄽⋰⋰🄰⋰⋰🄽⋰⋰🄸⋰ ⋰🄺⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰⋰🅃⋰ ⋰🄺⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄱⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄰⋰⋰🅄⋰⋰🄻⋰⋰🄰⋰⋰🄳⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄴⋰⋰🄽⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄰⋰⋰🅄⋰⋰🄻⋰⋰🄰⋰⋰🄳⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🄰⋰⋰🅁⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄳⋰ ⋰🄺⋰⋰🄸⋰⋰🄳⋰⋰🄳⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🅂⋰⋰🄰⋰⋰🅃⋰⋰🄷⋰ ⋰🅂⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🅅⋰⋰🄾⋰⋰🄸⋰⋰🄲⋰⋰🄴⋰ ⋰🄷⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🅂⋰⋰🄴⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🅂⋰⋰🄰⋰⋰🄺⋰⋰🅃⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄱⋰⋰🄰⋰⋰🄰⋰⋰🄿⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄸⋰⋰🄶⋰⋰🄽⋰⋰🄾⋰⋰🅁⋰⋰🄴⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🅄⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄸⋰⋰🄶⋰⋰🄽⋰⋰🄾⋰⋰🅁⋰⋰🄴⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🅁⋰⋰🄰⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰⋰🄸⋰ ⋰??⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄰⋰⋰🅃⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄰⋰ ⋰🄻⋰⋰🄾⋰⋰🄳⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄻⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄰⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄰⋰⋰🄰⋰⋰🄿⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄻⋰⋰🄸⋰ ⋰🄹⋰⋰🅄⋰⋰🄱⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄴⋰⋰🄽⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰??⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄽⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄼⋰⋰🄰⋰⋰🄸⋰ ⋰🄺⋰⋰🄰⋰⋰🄱⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🅂⋰⋰🄴⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄴⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄰⋰⋰🅃⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄴⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄻⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰ ⋰🄰⋰⋰🄱⋰ ⋰🅃⋰⋰🅄⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄴⋰ ⋰🄿⋰⋰🄴⋰⋰🅁⋰ ⋰🄶⋰⋰??⋰⋰🅄⋰⋰🄼⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄻⋰⋰🄴⋰⋰🄺⋰⋰🄸⋰⋰🄽⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄹⋰⋰🄷⋰⋰🅄⋰⋰🄺⋰⋰🄽⋰⋰🄴⋰ ⋰🄽⋰⋰🄰⋰⋰🄸⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰ ⋰🄱⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄰⋰ ⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰🄻⋰⋰🅈⋰ ⋰🄷⋰⋰🄾⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄳⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰ ⋰🄹⋰⋰🄰⋰⋰🅈⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄽⋰⋰🄰⋰ ⋰🄲⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰⋰🅄⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🅃⋰⋰🄾⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄱⋰⋰🄾⋰⋰🄻⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄰⋰⋰🅃⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄷⋰⋰🄾⋰⋰🄹⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🅄⋰⋰🅃⋰⋰🄷⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄵⋰⋰🄴⋰⋰🄽⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🄿⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🅁⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄺⋰⋰🄾⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰??⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰ ⋰🄹⋰⋰🄰⋰⋰🅈⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄴⋰ ⋰🄿⋰⋰🄴⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄳⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🄾⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄼⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🅂⋰⋰🄰⋰⋰🅃⋰⋰🄷⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄱⋰⋰🄷⋰⋰🄸⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄷⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰??⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🅂⋰⋰🄴⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🄶⋰⋰🄰⋰⋰🄸⋰⋰🅁⋰⋰🄱⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄰⋰⋰🅄⋰⋰🄻⋰⋰🄰⋰⋰🄳⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄱⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄿⋰ ⋰🄺⋰⋰🄸⋰ ⋰🅂⋰⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🅃⋰⋰🄲⋰⋰🄷⋰ ⋰🄺⋰⋰🅁⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰ ⋰🄶⋰⋰🄰⋰⋰🅁⋰⋰🄸⋰⋰🄱⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄴⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄴⋰⋰🄴⋰⋰🄹⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰??⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄺⋰⋰🄾⋰ ⋰🅃⋰⋰🄰⋰⋰🄶⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰⋰🅁⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄰⋰⋰🅃⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄴⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰ ⋰🄹⋰⋰🄰⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄻⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰ ⋰🄰⋰⋰🄱⋰ ⋰🅃⋰⋰🅄⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄴⋰ ⋰🄿⋰⋰🄴⋰⋰🅁⋰ ⋰🄶⋰⋰🄷⋰⋰🅄⋰⋰🄼⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄻⋰⋰🄴⋰⋰🄺⋰⋰🄸⋰⋰🄽⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄹⋰⋰🄷⋰⋰🅄⋰⋰🄺⋰⋰🄽⋰⋰🄴⋰ ⋰🄽⋰⋰🄰⋰⋰🄸⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰ ⋰🄱⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰⋰🄰⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄰⋰ ⋰🅁⋰⋰🄴⋰⋰🄿⋰⋰🄻⋰⋰🅈⋰ ⋰🄷⋰⋰🄾⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄳⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰⋰🄰⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰??⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰??⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰ ⋰🄹⋰⋰🄰⋰⋰🅈⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰⋰🄽⋰⋰🄰⋰ ⋰🄲⋰⋰🄷⋰⋰🄰⋰⋰🄻⋰⋰🅄⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🅃⋰⋰🄾⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄱⋰⋰🄾⋰⋰🄻⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🅄⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄰⋰⋰🅃⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰??⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄷⋰⋰🄾⋰⋰🄹⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🅄⋰⋰🅃⋰⋰🄷⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄵⋰⋰🄴⋰⋰🄽⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰??⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🄿⋰ ⋰🄼⋰⋰🄰⋰⋰🄳⋰⋰🅁⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄾⋰⋰🄳⋰",
+    "⋰🄹⋰⋰🄰⋰⋰🄻⋰⋰🄳⋰⋰🄸⋰ ⋰🄹⋰⋰🄸⋰⋰🄽⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄺⋰⋰🄾⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰ ⋰🄹⋰⋰🄰⋰⋰🅈⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄻⋰⋰🄰⋰⋰🅄⋰⋰🄳⋰⋰🄴⋰ ⋰🄿⋰⋰🄴⋰",
+    "⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰ ⋰🄰⋰⋰🄿⋰⋰🄽⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄳⋰⋰🄸⋰⋰🄺⋰⋰🄷⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄲⋰⋰🄷⋰⋰🅄⋰⋰🅃⋰ ⋰🄺⋰⋰🄾⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰⋰🄾⋰ ⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄼⋰⋰🄴⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🅂⋰⋰🄰⋰⋰🅃⋰⋰🄷⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄱⋰⋰🄷⋰⋰🄸⋰ ⋰🄳⋰⋰🄰⋰⋰🄵⋰⋰🄰⋰⋰🄽⋰ ⋰🄷⋰⋰🄾⋰ ⋰🄹⋰⋰🄰⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🄱⋰⋰🄷⋰⋰🄰⋰⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄰⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄷⋰⋰🄰⋰⋰🄸⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🅂⋰⋰🄴⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰",
+    "⋰🄶⋰⋰🄰⋰⋰🄸⋰⋰🅁⋰⋰🄱⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄰⋰⋰🅄⋰⋰🄻⋰⋰🄰⋰⋰🄳⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄼⋰⋰🄰⋰⋰🅁⋰⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰",
+    "⋰🄱⋰⋰🄰⋰⋰🄰⋰⋰🄰⋰⋰🄿⋰ ⋰🄺⋰⋰🄸⋰ ⋰🅂⋰⋰🄿⋰⋰🄴⋰⋰🄴⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🅃⋰⋰🄲⋰⋰🄷⋰ ⋰🄺⋰⋰🅁⋰⋰🄴⋰⋰🄶⋰⋰🄰⋰ ⋰🄶⋰⋰🄰⋰⋰🅁⋰⋰🄸⋰⋰🄱⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄲⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰ ⋰🄺⋰⋰🄰⋰⋰🅃⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄵⋰⋰🄴⋰⋰🄺⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄴⋰⋰🄴⋰⋰🄹⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄴⋰ ⋰🄱⋰⋰🄷⋰⋰🄾⋰⋰🅂⋰⋰🄳⋰⋰🄰⋰⋰🄳⋰⋰🄴⋰ ⋰🄼⋰⋰🄴⋰⋰🄸⋰⋰🄽⋰ ⋰🄲⋰⋰🄿⋰ ⋰🄺⋰⋰🄰⋰⋰🅁⋰ ⋰🄳⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰ ⋰🄽⋰⋰🄸⋰⋰🄺⋰⋰🄰⋰⋰🄻⋰",
+    "⋰🄰⋰⋰🄰⋰⋰🄹⋰ ⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🅁⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄽⋰⋰🄰⋰⋰🄷⋰⋰🄸⋰ ⋰🄱⋰⋰🄰⋰⋰🄲⋰⋰🄷⋰⋰🄴⋰⋰🄶⋰⋰🄸⋰ ⋰🅃⋰⋰🅄⋰ ⋰🄼⋰⋰🄴⋰⋰🅁⋰⋰🄴⋰ ⋰🄺⋰⋰🄾⋰ ⋰🅃⋰⋰🄰⋰⋰🄶⋰ ⋰🄺⋰⋰🄰⋰⋰🄸⋰⋰🅂⋰⋰🄴⋰ ⋰🄺⋰⋰🄸⋰⋰🅈⋰⋰🄰⋰",
+    "⋰🅃⋰⋰🄴⋰⋰🅁⋰⋰🄸⋰ ⋰🄼⋰⋰🅄⋰⋰🄼⋰⋰🄼⋰⋰🅈⋰ ⋰🄺⋰⋰🄸⋰ ⋰🄶⋰⋰🄰⋰⋰🄽⋰⋰🄳⋰ ⋰🄼⋰⋰🄰⋰⋰🄰⋰⋰🅁⋰ ⋰🄻⋰⋰🅄⋰⋰🄽⋰⋰🄶⋰⋰🄰⋰"
+    ]
 
-        quiz_texts = [
-            {"q": "IIT JEE mein kaunsi book sabse important hai?", "a": "HC Verma"},
-            {"q": "Physics mein 'g' ki value kya hai?", "a": "9.8"},
-            {"q": "Formula E = mc² kisne diya?", "a": "Einstein"},
-            {"q": "IIT ka full form kya hai?", "a": "Indian Institute of Technology"},
-            {"q": "JEE ka full form kya hai?", "a": "Joint Entrance Examination"},
-            {"q": "Physics mein SI unit of force kya hai?", "a": "Newton"},
-            {"q": "Chemistry mein H2O kya hai?", "a": "Water"},
-            {"q": "Maths mein 'pi' ki value kya hai?", "a": "3.14"},
-            {"q": "Biology mein human body mein kitna water hai?", "a": "70%"},
-            {"q": "IIT mein admission kaunsi exam se hota hai?", "a": "JEE Advanced"},
-            {"q": "NEET ka full form kya hai?", "a": "National Eligibility cum Entrance Test"},
-            {"q": "Human body mein kitna blood hai?", "a": "5 liters"},
-            {"q": "Heart ka function kya hai?", "a": "Blood pump"},
-            {"q": "Brain ka weight kitna hai?", "a": "1.4 kg"},
-            {"q": "Biology mein DNA ka full form kya hai?", "a": "Deoxyribonucleic Acid"},
-            {"q": "Human eye mein kitne colors dikhte hain?", "a": "10 million"},
-            {"q": "Body mein kitne bones hain?", "a": "206"},
-            {"q": "Blood group kaunse type ke hote hain?", "a": "A, B, AB, O"},
-            {"q": "NEET mein kitne questions hote hain?", "a": "200"},
-            {"q": "MBBS ka full form kya hai?", "a": "Bachelor of Medicine and Bachelor of Surgery"},
-            {"q": "Earth ka sabse bada ocean kaunsa hai?", "a": "Pacific Ocean"},
-            {"q": "World ka sabse lamba river kaunsa hai?", "a": "Nile River"},
-            {"q": "Human body mein sabse bada organ kaunsa hai?", "a": "Skin"},
-            {"q": "Universe ka sabse bada planet kaunsa hai?", "a": "Jupiter"},
-            {"q": "Light ki speed kya hai?", "a": "3x10^8 m/s"},
-            {"q": "Earth ka sabse ooncha mountain kaunsa hai?", "a": "Mount Everest"},
-            {"q": "World mein sabse zyada population wala country kaunsa hai?", "a": "India"},
-            {"q": "Computer ka brain kaunsa hai?", "a": "CPU"},
-            {"q": "Mobile OS kaunse hain?", "a": "Android, iOS"},
-            {"q": "World ka sabse bada desert kaunsa hai?", "a": "Sahara Desert"}
-        ]
+            sqr_texts = [
+                "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓐ ⊶Ⓑ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ, ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓒ⊶Ⓐ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓑ⊶Ⓗ⊶Ⓘ ⊶Ⓑ⊶Ⓝ⊶Ⓐ⊶Ⓛ⊶Ⓔ ⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓔ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓐ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓩ ⊶Ⓔ⊶Ⓨ ⊶Ⓨ⊶Ⓐ⊶Ⓐ⊶Ⓓ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓐ ⊶Ⓝ⊶Ⓐ ⊶Ⓣ⊶Ⓨ⊶Ⓜ⊶Ⓟ⊶Ⓐ⊶Ⓢ⊶Ⓢ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ ⊶Ⓤ⊶Ⓝ⊶Ⓕ⊶Ⓤ⊶Ⓝ⊶Ⓝ⊶Ⓨ ⊶Ⓢ⊶Ⓦ⊶Ⓘ⊶Ⓟ⊶Ⓔ ⊶Ⓜ⊶Ⓣ⊶Ⓣ ⊶Ⓚ⊶Ⓡ",
+    "⊶Ⓞ⊶Ⓗ ⊶Ⓗ⊶Ⓔ⊶Ⓛ⊶Ⓛ⊶Ⓞ ⊶Ⓑ⊶Ⓘ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓐ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓑ⊶Ⓘ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓞ⊶Ⓡ ⊶Ⓣ⊶Ⓤ ⊶Ⓥ ⊶Ⓑ⊶Ⓘ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓤ⊶Ⓚ⊶Ⓐ⊶Ⓣ ⊶Ⓜ⊶Ⓔ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ⊶Ⓚ⊶Ⓡ.",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓨ ⊶Ⓚ⊶Ⓘ⊶Ⓝ⊶Ⓝ⊶Ⓔ⊶Ⓡ ⊶Ⓣ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓖ⊶Ⓒ ⊶Ⓜ⊶Ⓔ ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓔ ⊶Ⓚ⊶Ⓘ ⊶Ⓟ⊶Ⓔ⊶Ⓡ⊶Ⓜ⊶Ⓘ⊶Ⓢ⊶Ⓢ⊶Ⓘ⊶Ⓞ⊶Ⓝ ⊶Ⓚ⊶Ⓘ⊶Ⓢ⊶Ⓝ⊶Ⓔ ⊶Ⓓ⊶Ⓘ.",
+    "⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓐ",
+    "⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓔ⊶Ⓚ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓡ.",
+    "⊶Ⓢ⊶Ⓤ⊶Ⓝ ⊶Ⓢ⊶Ⓤ⊶Ⓝ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓐ.",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓒ⊶Ⓐ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ.",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓣ⊶Ⓘ ⊶Ⓙ⊶Ⓐ⊶Ⓣ⊶Ⓘ ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓜ⊶Ⓡ.",
+    "⊶Ⓚ⊶Ⓨ? ⊶Ⓙ⊶Ⓛ⊶Ⓓ⊶Ⓘ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ ⊶Ⓚ⊶Ⓘ⊶Ⓓ⊶Ⓓ⊶Ⓔ.",
+    "⊶Ⓑ⊶Ⓘ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓒ⊶Ⓞ⊶Ⓜ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓖ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓚ⊶Ⓞ ⊶Ⓣ⊶Ⓐ⊶Ⓖ ⊶Ⓒ⊶Ⓡ⊶Ⓔ⊶Ⓖ⊶Ⓐ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓑ⊶Ⓘ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓜ⊶Ⓚ⊶Ⓒ ⊶Ⓑ⊶Ⓢ",
+    "⊶Ⓙ⊶Ⓐ⊶Ⓛ⊶Ⓓ⊶Ⓘ ⊶Ⓢ⊶Ⓔ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓩ ⊶Ⓟ⊶Ⓐ⊶Ⓟ⊶Ⓐ ⊶Ⓑ⊶Ⓞ⊶Ⓛ",
+    "⊶Ⓢ⊶Ⓘ⊶Ⓓ⊶Ⓔ ⊶Ⓗ⊶Ⓞ⊶Ⓙ⊶Ⓐ ⊶Ⓑ⊶Ⓘ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓐ⊶Ⓑ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓔ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓑ⊶Ⓗ⊶Ⓖ ⊶Ⓜ⊶Ⓐ⊶Ⓣ ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ",
+    "⊶Ⓑ⊶Ⓗ⊶Ⓖ ⊶Ⓝ⊶Ⓨ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓙ⊶Ⓙ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓔ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓐ⊶Ⓖ ⊶Ⓜ⊶Ⓐ⊶Ⓣ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓔ ⊶Ⓓ⊶Ⓤ⊶Ⓡ ⊶Ⓗ⊶Ⓐ⊶Ⓣ⊶Ⓣ ⊶Ⓜ⊶Ⓐ⊶Ⓓ⊶Ⓗ⊶Ⓐ⊶Ⓡ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓚ⊶Ⓞ⊶Ⓘ ⊶Ⓑ⊶Ⓐ⊶Ⓣ ⊶Ⓝ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ ⊶Ⓔ⊶Ⓢ⊶Ⓛ⊶Ⓘ⊶Ⓨ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓕ ⊶Ⓒ⊶Ⓡ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ⊶Ⓗ⊶Ⓤ ⊶Ⓣ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓚ⊶Ⓞ⊶Ⓘ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓣ ⊶Ⓝ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓣ⊶Ⓤ ⊶Ⓜ⊶Ⓐ⊶Ⓕ⊶Ⓘ ⊶Ⓓ⊶Ⓔ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓣ⊶Ⓤ ⊶Ⓜ⊶Ⓐ⊶Ⓕ⊶Ⓘ ⊶Ⓜ⊶Ⓘ⊶Ⓛ ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓖ⊶Ⓘ ⊶Ⓣ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓣ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓐ ⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓔ ⊶Ⓢ⊶Ⓦ⊶Ⓘ⊶Ⓟ⊶Ⓔ ⊶Ⓒ⊶Ⓡ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓢ⊶Ⓦ⊶Ⓘ⊶Ⓟ⊶Ⓔ ⊶Ⓒ⊶Ⓡ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓑ⊶Ⓞ⊶Ⓛ⊶Ⓝ⊶Ⓐ ⊶Ⓝ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓢ⊶Ⓦ⊶Ⓘ⊶Ⓟ⊶Ⓔ ⊶Ⓒ⊶Ⓡ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓗ⊶Ⓤ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓚ⊶Ⓔ⊶Ⓢ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓣ⊶Ⓗ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓨ ⊶Ⓝ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓝ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ",
+    "⊶Ⓛ⊶Ⓞ⊶Ⓓ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓤ⊶Ⓣ⊶Ⓡ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓛ⊶Ⓤ⊶Ⓝ ⊶Ⓜ⊶Ⓣ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓢ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓐ",
+    "⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓓ⊶Ⓐ⊶Ⓡ⊶Ⓒ⊶Ⓗ⊶Ⓓ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓞ⊶Ⓨ⊶Ⓔ ⊶Ⓖ⊶Ⓐ⊶Ⓢ⊶Ⓗ⊶Ⓣ⊶Ⓘ ⊶Ⓚ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓘ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓚ ⊶Ⓗ⊶Ⓐ⊶Ⓣ⊶Ⓗ ⊶Ⓣ⊶Ⓞ⊶Ⓓ⊶Ⓗ ⊶Ⓚ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓚ ⊶Ⓜ⊶Ⓤ⊶Ⓗ ⊶Ⓜ⊶Ⓔ ⊶Ⓕ⊶Ⓐ⊶Ⓢ⊶Ⓐ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓛ⊶Ⓔ⊶Ⓐ⊶Ⓥ⊶Ⓔ ⊶Ⓛ⊶Ⓔ ⊶Ⓣ⊶Ⓤ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓟ⊶Ⓐ⊶Ⓢ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓝ⊶Ⓐ⊶Ⓘ ⊶Ⓐ⊶Ⓨ⊶Ⓐ ⊶Ⓜ⊶Ⓔ⊶Ⓚ⊶Ⓞ",
+    "⊶Ⓛ⊶Ⓔ⊶Ⓐ⊶Ⓥ⊶Ⓔ ⊶Ⓛ⊶Ⓔ ⊶Ⓣ⊶Ⓤ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓘ⊶Ⓓ⊶Ⓔ⊶Ⓡ ⊶Ⓢ⊶Ⓔ",
+    "⊶Ⓛ⊶Ⓔ⊶Ⓐ⊶Ⓥ⊶Ⓔ ⊶Ⓛ⊶Ⓔ ⊶Ⓙ⊶Ⓛ⊶Ⓓ⊶Ⓘ ⊶Ⓢ⊶Ⓔ ⊶Ⓦ⊶Ⓡ⊶Ⓝ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓛ⊶Ⓔ⊶Ⓐ⊶Ⓥ⊶Ⓔ ⊶Ⓝ⊶Ⓨ ⊶Ⓛ⊶Ⓔ⊶Ⓖ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ ⊶Ⓑ⊶Ⓐ⊶Ⓣ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓛ⊶Ⓔ⊶Ⓐ⊶Ⓥ⊶Ⓔ ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓕ⊶Ⓐ⊶Ⓢ⊶Ⓣ ⊶Ⓛ⊶Ⓔ⊶Ⓐ⊶Ⓥ⊶Ⓔ ⊶Ⓛ⊶Ⓔ ⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓙ⊶Ⓞ⊶Ⓡ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓤ⊶Ⓣ⊶Ⓞ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ",
+    "⊶Ⓞ⊶Ⓨ ⊶Ⓗ⊶Ⓘ⊶Ⓙ⊶Ⓓ⊶Ⓔ ⊶Ⓚ⊶Ⓗ⊶Ⓐ⊶Ⓝ⊶Ⓐ ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓩ⊶Ⓞ⊶Ⓡ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓞ ⊶Ⓘ⊶Ⓛ⊶Ⓨ ⊶Ⓡ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓣ⊶Ⓜ⊶Ⓚ⊶Ⓒ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓢ⊶Ⓗ⊶Ⓘ ⊶Ⓢ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓣ⊶Ⓤ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓢ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ",
+    "⊶Ⓢ⊶Ⓗ⊶Ⓘ ⊶Ⓢ⊶Ⓔ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ ⊶Ⓦ⊶Ⓡ⊶Ⓝ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓨ⊶Ⓤ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶ⓒ⊶ⓤ⊶ⓓ⊶ⓦ⊶ⓐ",
+    "⊶Ⓟ⊶Ⓡ⊶Ⓞ⊶Ⓞ⊶Ⓕ ⊶Ⓒ⊶Ⓡ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ⊶Ⓞ⊶Ⓞ⊶Ⓕ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ⊶Ⓞ⊶Ⓞ⊶Ⓕ ⊶Ⓗ⊶Ⓞ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓚ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓒ⊶Ⓗ⊶Ⓘ⊶Ⓛ⊶Ⓛ⊶Ⓐ⊶Ⓡ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ ⊶Ⓑ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓞ⊶Ⓨ ⊶Ⓗ⊶Ⓘ⊶Ⓙ⊶Ⓓ⊶Ⓔ ⊶Ⓚ⊶Ⓗ⊶Ⓐ⊶Ⓝ⊶Ⓐ ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓩ⊶Ⓞ⊶Ⓡ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶ⓜ⊶ⓐ⊶ⓓ⊶ⓡ⊶ⓒ⊶ⓗ⊶ⓞ⊶ⓓ?",
+    "⊶Ⓐ⊶Ⓑ ⊶Ⓣ⊶Ⓚ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓗ⊶Ⓞ⊶Ⓖ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ?",
+    "⊶Ⓝ⊶Ⓨ ⊶Ⓝ⊶Ⓨ ⊶Ⓜ⊶Ⓔ ⊶Ⓚ⊶Ⓤ⊶Ⓒ⊶Ⓗ ⊶Ⓝ⊶Ⓨ ⊶Ⓙ⊶Ⓐ⊶Ⓝ⊶Ⓣ⊶Ⓐ ⊶Ⓑ⊶Ⓢ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓢ⊶Ⓑ⊶Ⓢ⊶Ⓔ ⊶Ⓟ⊶Ⓗ⊶Ⓔ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓞ ⊶Ⓑ⊶Ⓞ⊶Ⓛ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓝ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓜ ⊶Ⓚ⊶Ⓡ⊶Ⓔ",
+    "⊶Ⓨ⊶Ⓐ⊶Ⓗ⊶Ⓐ ⊶Ⓑ⊶Ⓗ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓒ⊶Ⓔ ⊶Ⓟ⊶Ⓘ⊶Ⓛ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓐ⊶Ⓑ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓣ⊶Ⓞ ⊶Ⓑ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓔ⊶Ⓖ⊶Ⓘ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓞ⊶Ⓜ⊶Ⓜ⊶Ⓨ",
+    "⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓓ⊶Ⓐ⊶Ⓡ⊶Ⓒ⊶Ⓗ⊶Ⓓ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓚ⊶Ⓔ ⊶Ⓨ⊶Ⓗ⊶Ⓐ ⊶Ⓢ⊶Ⓔ",
+    "⊶Ⓒ⊶Ⓞ⊶Ⓩ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓗ⊶Ⓘ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓣ⊶Ⓞ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓑ⊶Ⓞ⊶Ⓛ ⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓝ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓗ⊶Ⓞ⊶Ⓖ⊶Ⓘ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶⊶Ⓘ ⊶Ⓙ⊶Ⓞ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ⊶Ⓣ⊶Ⓘ ⊶Ⓙ⊶Ⓞ⊶Ⓖ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓡ⊶Ⓨ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓘ ⊶Ⓒ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓔ⊶Ⓜ⊶Ⓞ⊶Ⓙ⊶Ⓘ ⊶Ⓓ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ? ⊶Ⓒ⊶Ⓗ⊶Ⓜ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓐ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ?",
+    "⊶Ⓣ⊶Ⓜ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓡ⊶Ⓘ ⊶Ⓗ⊶Ⓞ⊶Ⓖ⊶Ⓘ ⊶Ⓕ⊶Ⓡ⊶Ⓡ⊶Ⓣ⊶Ⓞ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ? ⊶Ⓚ⊶Ⓑ ? ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓔ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓚ⊶Ⓔ⊶Ⓚ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓢ⊶Ⓒ⊶Ⓗ ⊶Ⓜ⊶Ⓔ⊶Ⓨ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓔ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓘ ⊶Ⓣ⊶Ⓤ⊶Ⓝ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ",
+    "⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓐ ⊶Ⓢ⊶Ⓒ⊶Ⓗ ⊶Ⓝ⊶Ⓨ ⊶Ⓑ⊶Ⓞ⊶Ⓛ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓢ⊶Ⓒ⊶Ⓗ ⊶Ⓜ⊶Ⓔ⊶Ⓨ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓘ⊶Ⓐ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓔ ⊶Ⓢ⊶Ⓣ⊶Ⓗ",
+    "⊶Ⓜ⊶Ⓣ⊶Ⓛ⊶Ⓑ ⊶Ⓣ⊶Ⓜ⊶Ⓡ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓣ⊶Ⓞ",
+    "⊶Ⓟ⊶Ⓤ⊶Ⓡ⊶Ⓐ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓣ⊶Ⓜ⊶Ⓡ ⊶Ⓕ⊶Ⓡ⊶Ⓡ⊶Ⓣ⊶Ⓞ",
+    "⊶Ⓞ⊶Ⓗ ⊶Ⓞ⊶Ⓚ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ ⊶Ⓕ⊶Ⓘ⊶Ⓡ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓐ ⊶Ⓓ⊶Ⓐ⊶Ⓜ⊶Ⓐ⊶Ⓓ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ? ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓔ ⊶Ⓟ⊶Ⓔ⊶Ⓗ⊶Ⓛ⊶Ⓔ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓔ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓣ⊶Ⓞ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓝ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓥ⊶Ⓨ⊶Ⓐ⊶Ⓢ⊶Ⓣ ⊶Ⓗ⊶Ⓤ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓣ⊶Ⓞ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓔ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓚ⊶Ⓤ⊶Ⓒ⊶Ⓗ ⊶Ⓑ⊶Ⓘ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ? ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓐ ?",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓜ⊶Ⓣ ⊶Ⓗ⊶Ⓢ⊶Ⓢ",
+    "⊶Ⓨ⊶Ⓤ⊶Ⓡ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶⊶Ⓘ ⊶Ⓜ⊶Ⓞ⊶Ⓜ",
+    "⊶Ⓐ⊶Ⓡ⊶Ⓔ ⊶Ⓢ⊶Ⓑ⊶Ⓚ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶⊶Ⓘ ⊶Ⓞ⊶Ⓡ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓘ",
+    "⊶Ⓐ⊶Ⓡ⊶Ⓔ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ ⊶Ⓔ⊶Ⓚ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓡ",
+    "⊶Ⓣ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓘ ⊶Ⓣ⊶Ⓡ⊶Ⓗ",
+    "⊶Ⓔ⊶Ⓚ ⊶Ⓛ⊶Ⓘ⊶Ⓝ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓣ⊶Ⓜ⊶Ⓡ",
+    "⊶Ⓠ",
+    "⊶Ⓞ⊶Ⓒ⊶Ⓨ ⊶Ⓐ⊶Ⓑ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓟ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓛ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓤ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓣ⊶Ⓞ",
+    "⊶Ⓠ ?",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓨ⊶Ⓨ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓐ ⊶Ⓔ⊶Ⓚ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓡ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓢ⊶Ⓤ⊶Ⓝ ⊶Ⓓ⊶Ⓞ⊶Ⓢ⊶Ⓣ ⊶Ⓣ⊶Ⓜ⊶Ⓡ",
+    "⊶Ⓑ⊶Ⓗ⊶Ⓐ⊶Ⓖ ⊶Ⓙ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓕ ⊶Ⓒ⊶Ⓡ⊶Ⓡ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶⊶Ⓘ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓜ⊶Ⓡ ⊶Ⓕ⊶Ⓡ⊶Ⓡ⊶Ⓣ⊶Ⓞ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓛ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓜ⊶Ⓡ",
+    "⊶Ⓝ⊶Ⓨ⊶Ⓣ⊶Ⓞ ⊶Ⓐ⊶Ⓔ⊶Ⓢ⊶Ⓔ ⊶Ⓗ⊶Ⓘ ⊶Ⓒ⊶Ⓤ⊶Ⓓ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓗ⊶Ⓨ⊶Ⓨ ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓗ⊶Ⓘ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓛ⊶Ⓔ⊶Ⓝ⊶Ⓐ",
+    "⊶Ⓞ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓐ ⊶Ⓞ⊶Ⓡ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓨ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓞ ⊶Ⓝ⊶Ⓐ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓞ ⊶Ⓜ⊶Ⓣ ⊶Ⓑ⊶Ⓗ⊶Ⓐ⊶Ⓖ ⊶Ⓙ⊶Ⓐ⊶Ⓞ",
+    "⊶Ⓑ⊶Ⓨ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓗ⊶Ⓨ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ?",
+    "⊶Ⓠ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓠ ⊶Ⓡ⊶Ⓗ⊶Ⓔ ⊶Ⓗ⊶Ⓞ ?",
+    "⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓔ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓜ⊶Ⓣ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶⊶Ⓘ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓘ ⊶Ⓒ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶Ⓟ⊶Ⓐ⊶Ⓛ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓚ⊶Ⓜ⊶Ⓩ⊶Ⓡ⊶Ⓞ⊶Ⓡ ⊶Ⓔ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓔ⊶Ⓚ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ?",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓣ⊶Ⓗ⊶Ⓐ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ?",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓢ⊶Ⓛ⊶Ⓘ⊶Ⓓ⊶Ⓔ ⊶Ⓛ⊶Ⓔ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶ⒶⓉ ⊶Ⓒ⊶Ⓡ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓤ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓒ⊶Ⓟ ⊶Ⓜ⊶Ⓣ ⊶Ⓒ⊶Ⓡ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓗ⊶Ⓨ⊶Ⓨ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓐ",
+    "⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓢ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓕ⊶Ⓤ ⊶Ⓚ⊶Ⓗ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓡ ⊶Ⓚ⊶Ⓗ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓡ",
+    "⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ ⊶Ⓙ⊶Ⓐ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓨ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓚ⊶Ⓜ⊶Ⓩ⊶Ⓞ⊶Ⓡ ⊶Ⓜ⊶Ⓒ ⊶Ⓘ⊶Ⓓ⊶Ⓐ⊶Ⓡ ⊶Ⓐ⊶Ⓐ",
+    "⊶Ⓨ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓜ⊶Ⓡ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓝ⊶Ⓨ ⊶Ⓒ⊶Ⓟ ⊶Ⓝ⊶Ⓨ ⊶Ⓒ⊶Ⓡ⊶Ⓡ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ⊶Ⓔ ⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓜ⊶Ⓣ ⊶Ⓒ⊶Ⓡ⊶Ⓡ",
+    "⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓡ⊶ⒶⓂ ⊶Ⓢ⊶Ⓔ ⊶Ⓜ⊶Ⓒ",
+    "⊶Ⓟ⊶Ⓖ⊶Ⓛ ⊶Ⓔ⊶Ⓨ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓔ⊶Ⓚ",
+    "⊶Ⓒ⊶Ⓟ ⊶Ⓒ⊶Ⓡ⊶Ⓒ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓔ⊶Ⓖ⊶Ⓐ !",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ? ⊶Ⓜ⊶Ⓒ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓐ ⊶Ⓒ⊶Ⓞ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓑ⊶Ⓐ⊶Ⓐ⊶Ⓟ ⊶Ⓝ⊶Ⓨ ⊶Ⓔ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓘ ⊶Ⓤ⊶Ⓟ⊶Ⓐ⊶Ⓡ ⊶Ⓢ⊶Ⓔ ⊶Ⓡ⊶Ⓞ⊶Ⓒ⊶Ⓚ⊶Ⓔ⊶Ⓣ ⊶Ⓟ⊶Ⓔ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓗ ⊶Ⓒ⊶Ⓔ ⊶ⒷⓈⓈ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓝ⊶Ⓔ ⊶Ⓐ⊶Ⓨ⊶Ⓐ ⊶Ⓗ⊶Ⓤ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓣ⊶Ⓐ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ ⊶Ⓚ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓣ⊶Ⓐ ⊶Ⓛ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓦ⊶Ⓡ⊶Ⓝ⊶Ⓐ ⊶ⓉⓇ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓨ",
+    "⊶Ⓣ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓑ⊶Ⓐ⊶Ⓚ⊶Ⓐ ⊶Ⓒ⊶Ⓞ⊶Ⓓ⊶Ⓔ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓜ⊶Ⓚ⊶Ⓒ ⊶Ⓜ⊶Ⓐ⊶Ⓘ⊶Ⓝ ⊶Ⓑ⊶Ⓤ⊶Ⓡ⊶Ⓕ",
+    "⊶Ⓑ⊶Ⓗ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓚ⊶Ⓘ ⊶Ⓙ⊶Ⓗ⊶Ⓐ⊶Ⓣ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓐ ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓖ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓜ⊶Ⓚ⊶Ⓒ ⊶Ⓜ⊶Ⓐ⊶Ⓘ⊶Ⓝ ⊶Ⓜ⊶Ⓞ⊶Ⓤ⊶Ⓝ⊶Ⓣ ⊶Ⓔ⊶Ⓥ⊶Ⓔ⊶Ⓡ⊶Ⓔ⊶Ⓢ⊶Ⓣ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓗ ⊶Ⓜ⊶Ⓔ⊶Ⓨ ⊶Ⓛ⊶Ⓔ⊶Ⓖ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓐ",
+    "⊶Ⓗ⊶Ⓘ⊶Ⓙ⊶Ⓓ⊶Ⓔ ⊶Ⓚ⊶Ⓘ ⊶Ⓙ⊶Ⓗ⊶Ⓐ⊶Ⓣ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓦ⊶Ⓡ⊶Ⓝ⊶Ⓐ ⊶ⓉⓇ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓝ⊶Ⓨ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓚ⊶Ⓘ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓢ⊶Ⓑ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓟ⊶Ⓡ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ",
+    "⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓟ⊶Ⓣ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓞ⊶Ⓡ ⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓤ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓔ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓑ⊶Ⓢ ⊶Ⓑ⊶Ⓢ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ",
+    "⊶Ⓑ⊶Ⓢ ⊶Ⓑ⊶Ⓢ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓣ⊶Ⓗ⊶Ⓝ⊶Ⓚ⊶Ⓢ⊶Ⓢ",
+    "⊶Ⓑ⊶Ⓢ ⊶Ⓑ⊶Ⓢ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓘ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ",
+    "⊶Ⓑ⊶Ⓢ ⊶Ⓑ⊶Ⓢ ⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓙ⊶Ⓞ⊶Ⓡ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ ⊶Ⓖ⊶Ⓨ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓑ",
+    "⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ ⊶Ⓖ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ ⊶Ⓖ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓢ⊶Ⓐ⊶Ⓑ⊶Ⓘ⊶Ⓣ ⊶Ⓚ⊶Ⓡ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓗ⊶Ⓤ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ",
+    "⊶Ⓔ⊶Ⓐ⊶Ⓢ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓔ⊶Ⓐ⊶Ⓢ⊶Ⓨ ⊶Ⓦ⊶8 ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓐ⊶Ⓑ",
+    "⊶Ⓢ⊶Ⓐ⊶Ⓝ⊶Ⓢ ⊶Ⓐ⊶Ⓡ⊶Ⓘ ⊶Ⓗ⊶Ⓐ ⊶Ⓚ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓖ⊶Ⓘ ⊶Ⓐ⊶Ⓙ⊶Ⓙ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓞ ⊶Ⓑ⊶Ⓘ⊶Ⓝ⊶Ⓐ ⊶Ⓢ⊶Ⓐ⊶Ⓝ⊶Ⓢ⊶Ⓢ ⊶Ⓛ⊶Ⓔ⊶Ⓣ⊶Ⓔ ⊶Ⓗ⊶Ⓤ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓟ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓔ ⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓙ⊶Ⓞ⊶Ⓡ",
+    "⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓝ⊶Ⓞ⊶Ⓡ⊶Ⓜ⊶Ⓘ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓔ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓝ⊶Ⓞ⊶Ⓡ⊶Ⓜ⊶Ⓘ⊶Ⓔ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓢ ⊶Ⓣ⊶Ⓗ⊶Ⓔ⊶Ⓚ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓢ ⊶Ⓣ⊶Ⓗ⊶Ⓔ⊶Ⓚ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ",
+    "⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓙ⊶Ⓞ⊶Ⓡ ⊶Ⓣ⊶Ⓗ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓔ⊶Ⓢ⊶Ⓛ⊶Ⓘ⊶Ⓨ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ",
+    "⊶Ⓜ⊶Ⓐ⊶Ⓘ ⊶Ⓢ⊶Ⓑ ⊶Ⓙ⊶Ⓐ⊶Ⓝ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓛ ⊶Ⓒ⊶Ⓗ⊶Ⓛ ⊶Ⓗ⊶Ⓣ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓚ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓢ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓚ⊶Ⓐ⊶Ⓜ⊶Ⓙ⊶Ⓞ⊶Ⓡ ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓐ ⊶Ⓑ⊶Ⓒ⊶Ⓗ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓣ ⊶Ⓖ⊶Ⓝ⊶Ⓓ⊶Ⓘ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓚ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓐ ⊶Ⓖ⊶Ⓝ⊶Ⓓ⊶Ⓐ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓑ⊶Ⓣ⊶Ⓐ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓕ⊶Ⓘ⊶Ⓡ ⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓝ⊶Ⓨ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓝ⊶Ⓨ ⊶Ⓚ⊶Ⓞ⊶Ⓝ ⊶Ⓒ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓘ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓞ",
+    "⊶Ⓡ⊶Ⓤ⊶Ⓚ ⊶Ⓐ⊶Ⓐ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓞ⊶Ⓓ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓦ⊶Ⓐ⊶Ⓘ⊶Ⓣ ⊶Ⓒ⊶Ⓡ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓞ⊶Ⓓ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ⊶Ⓗ⊶Ⓤ",
+    "⊶Ⓦ⊶Ⓐ⊶Ⓘ⊶Ⓣ ⊶Ⓒ⊶Ⓡ ⊶Ⓡ⊶Ⓐ⊶Ⓑ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓡ⊶Ⓗ⊶Ⓘ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓦ⊶Ⓐ⊶Ⓘ⊶Ⓣ ⊶Ⓚ⊶Ⓡ ⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓞ⊶Ⓓ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓦ⊶Ⓐ⊶Ⓘ⊶Ⓣ ⊶Ⓛ⊶Ⓔ ⊶Ⓣ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓝ⊶Ⓔ ⊶Ⓓ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓞ",
+    "⊶Ⓡ⊶Ⓤ⊶Ⓚ ⊶Ⓙ⊶Ⓐ ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓡ⊶Ⓚ⊶Ⓗ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓛ⊶Ⓘ⊶Ⓨ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓕ⊶Ⓐ⊶Ⓜ⊶Ⓞ⊶Ⓤ⊶Ⓢ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓐ⊶ⒶⓃ ⊶Ⓛ⊶Ⓘ⊶Ⓐ ⊶Ⓜ⊶Ⓔ⊶Ⓝ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓢ⊶Ⓐ⊶Ⓛ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓐ⊶ⒶⓃ ⊶Ⓛ⊶Ⓘ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓢ⊶Ⓗ⊶Ⓐ⊶Ⓝ⊶Ⓣ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓗ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ",
+    "⊶Ⓢ⊶Ⓗ⊶Ⓐ⊶Ⓝ⊶Ⓣ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓗ⊶Ⓚ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓞ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓢ⊶Ⓔ ⊶Ⓢ⊶Ⓗ⊶Ⓐ⊶Ⓝ⊶Ⓣ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓗ ⊶Ⓣ⊶Ⓤ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓐ⊶Ⓑ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ ⊶Ⓨ⊶Ⓗ⊶Ⓐ",
+    "⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓔ ⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ ⊶Ⓝ⊶Ⓨ ⊶Ⓐ⊶Ⓨ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓛ⊶Ⓔ ⊶ⓛ⊶ⓤ⊶ⓝ⊶ⓓ ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓜ⊶Ⓐ⊶Ⓓ⊶Ⓐ⊶Ⓡ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓨ⊶Ⓘ ⊶Ⓒ⊶Ⓨ⊶Ⓐ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓒ⊶Ⓨ⊶Ⓐ",
+    "⊶Ⓗ⊶Ⓨ⊶Ⓔ ⊶Ⓢ⊶Ⓒ⊶Ⓗ ⊶Ⓑ⊶Ⓣ⊶Ⓐ ⊶Ⓒ⊶Ⓞ⊶Ⓜ ⊶Ⓒ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓘ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓞ",
+    "⊶Ⓒ⊶Ⓗ⊶Ⓛ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓘ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓞ ⊶Ⓢ⊶Ⓜ⊶Ⓙ⊶Ⓗ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓚ⊶Ⓞ⊶Ⓘ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓚ⊶Ⓐ⊶Ⓣ ⊶Ⓝ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓑ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓢ⊶Ⓑ ⊶Ⓙ⊶Ⓐ⊶Ⓝ⊶Ⓣ⊶Ⓔ ⊶Ⓔ⊶Ⓨ ⊶Ⓚ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓓ⊶Ⓚ⊶Ⓐ⊶Ⓓ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓣ⊶Ⓗ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓝ⊶Ⓔ ⊶Ⓦ⊶Ⓛ⊶Ⓘ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓜ⊶Ⓔ⊶Ⓘ ⊶Ⓚ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓙ⊶Ⓝ⊶Ⓣ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓞ ⊶Ⓚ⊶Ⓞ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓘ⊶Ⓐ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓐ ⊶Ⓥ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓝ⊶Ⓝ⊶Ⓐ ⊶Ⓢ⊶Ⓗ⊶Ⓘ ⊶Ⓣ⊶Ⓗ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓦ⊶Ⓞ ⊶Ⓖ⊶Ⓛ⊶Ⓣ ⊶Ⓝ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓦ⊶Ⓞ ⊶Ⓢ⊶Ⓗ⊶Ⓘ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓓ⊶Ⓚ⊶Ⓐ⊶Ⓓ ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓚ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓚ⊶Ⓘ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓞ⊶Ⓜ⊶Ⓕ⊶Ⓞ⊶Ⓞ",
+    "⊶Ⓑ⊶Ⓤ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓔ⊶Ⓔ⊶Ⓡ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓣ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓛ ⊶Ⓜ⊶Ⓔ ⊶Ⓛ⊶Ⓞ⊶Ⓓ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓚ⊶Ⓔ ⊶Ⓤ⊶Ⓢ⊶Ⓚ⊶Ⓘ ⊶Ⓓ⊶Ⓗ⊶Ⓐ⊶Ⓓ⊶Ⓚ⊶Ⓐ⊶Ⓝ ⊶Ⓡ⊶Ⓞ⊶Ⓚ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓛ⊶Ⓤ⊶Ⓛ⊶Ⓛ⊶Ⓔ ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓣ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓐ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓗ⊶Ⓝ ⊶Ⓚ⊶Ⓘ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ ⊶Ⓡ⊶Ⓝ⊶Ⓓ⊶Ⓘ ⊶Ⓑ⊶Ⓐ⊶ⒶⓉ ⊶Ⓚ⊶Ⓗ⊶ⓉⓂ",
+    "⊶Ⓢ⊶Ⓤ⊶Ⓝ ⊶Ⓔ⊶Ⓚ ⊶Ⓜ⊶Ⓐ⊶Ⓩ⊶Ⓔ ⊶Ⓚ⊶Ⓘ ⊶Ⓑ⊶Ⓐ⊶ⒶⓉ ⊶Ⓑ⊶Ⓐ⊶Ⓣ⊶Ⓐ⊶Ⓞ ⊶Ⓚ⊶Ⓨ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶रैं⊶डी ⊶Ⓗ⊶Ⓐ⊶Ⓘ",
+    "⊶Ⓒ⊶Ⓞ⊶Ⓓ⊶Ⓤ ⊶Ⓒ⊶Ⓞ⊶Ⓓ⊶Ⓤ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓞ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ",
+    "⊶Ⓐ⊶Ⓙ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓞ⊶Ⓨ⊶Ⓔ",
+    "⊶Ⓢ⊶Ⓤ⊶Ⓝ ⊶Ⓢ⊶Ⓤ⊶Ⓝ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓚ⊶Ⓘ⊶Ⓛ⊶Ⓐ⊶Ⓢ ⊶Ⓝ⊶Ⓨ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓨ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓙ⊶Ⓗ⊶Ⓔ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓟ⊶Ⓣ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓑ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ",
+    "⊶Ⓟ⊶Ⓡ ⊶Ⓟ⊶Ⓡ ⊶Ⓒ⊶Ⓨ⊶Ⓐ ⊶Ⓗ⊶Ⓞ⊶Ⓣ⊶Ⓔ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓜ⊶Ⓚ⊶Ⓒ",
+    "⊶Ⓣ⊶Ⓜ⊶Ⓒ⊶Ⓛ ⊶Ⓢ⊶Ⓤ⊶Ⓝ⊶Ⓛ⊶Ⓔ",
+    "⊶Ⓜ⊶Ⓞ⊶Ⓞ⊶Ⓣ ⊶Ⓓ⊶Ⓤ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓔ⊶Ⓨ",
+    "⊶Ⓑ⊶Ⓗ⊶Ⓖ⊶Ⓝ⊶Ⓨ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓚ⊶Ⓔ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓕ⊶Ⓡ",
+    "⊶Ⓕ⊶Ⓡ ⊶Ⓢ⊶Ⓔ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓛ⊶Ⓔ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓨ⊶Ⓔ ⊶Ⓥ⊶Ⓘ ⊶Ⓢ⊶Ⓗ⊶Ⓘ ⊶Ⓔ⊶Ⓨ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓚ⊶Ⓒ ⊶Ⓑ⊶Ⓢ",
+    "⊶Ⓐ⊶Ⓙ ⊶Ⓚ⊶Ⓤ⊶Ⓒ⊶Ⓗ ⊶Ⓝ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓣ⊶Ⓤ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓡ⊶Ⓨ ⊶Ⓚ⊶Ⓡ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓢ⊶Ⓚ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓞ⊶Ⓡ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓘ⊶Ⓑ⊶Ⓤ⊶Ⓡ ⊶Ⓢ⊶Ⓤ⊶Ⓝ",
+    "⊶Ⓣ⊶Ⓞ⊶Ⓡ ⊶Ⓜ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓕ⊶Ⓤ⊶Ⓓ⊶Ⓓ⊶Ⓘ ⊶Ⓞ⊶Ⓨ⊶Ⓔ",
+    "⊶Ⓗ⊶Ⓐ⊶Ⓨ⊶Ⓔ ⊶Ⓗ⊶Ⓐ⊶Ⓨ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓨ ⊶Ⓜ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓖ⊶Ⓐ⊶Ⓘ",
+    "⊶Ⓞ⊶Ⓨ⊶Ⓔ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ⊶Ⓚ⊶Ⓔ ⊶Ⓟ⊶Ⓐ⊶Ⓢ⊶Ⓘ⊶Ⓝ⊶Ⓔ..",
+    "⊶Ⓚ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓔ ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓐ⊶Ⓣ⊶Ⓣ⊶Ⓔ ⊶Ⓢ⊶Ⓤ⊶Ⓝ",
+    "⊶Ⓚ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓐ ⊶Ⓙ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓐ ⊶Ⓒ⊶Ⓤ⊶Ⓓ ⊶Ⓡ⊶Ⓗ⊶Ⓐ ⊶Ⓣ⊶Ⓤ",
+    "⊶Ⓜ⊶Ⓤ⊶Ⓗ ⊶Ⓜ⊶Ⓔ⊶Ⓘ ⊶Ⓛ⊶Ⓔ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓐ..",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓣ ⊶Ⓚ⊶Ⓔ ⊶Ⓕ⊶Ⓔ⊶Ⓝ⊶Ⓚ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓝ⊶Ⓞ⊶Ⓝ ⊶Ⓢ⊶Ⓣ⊶Ⓞ⊶Ⓟ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓕ⊶Ⓐ⊶ⒶⓉ ⊶Ⓖ⊶Ⓐ⊶Ⓨ⊶Ⓘ ⊶Ⓐ⊶Ⓙ⊶Ⓣ⊶Ⓞ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓗ⊶Ⓐ⊶Ⓝ ⊶Ⓚ⊶Ⓐ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ ⊶Ⓜ⊶Ⓔ ⊶Ⓚ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓐ ⊶Ⓚ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ ⊶Ⓒ⊶Ⓗ⊶Ⓘ⊶Ⓟ⊶Ⓚ⊶Ⓐ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓝ⊶Ⓞ⊶Ⓝ ⊶Ⓢ⊶Ⓣ⊶Ⓞ⊶Ⓟ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓖ⊶Ⓞ⊶Ⓛ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶ⒶⓇ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓤ⊶Ⓢ⊶Ⓢ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶100 ⊶Ⓒ⊶Ⓗ⊶Ⓔ⊶Ⓓ⊶Ⓓ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓓ⊶Ⓘ⊶Ⓓ⊶Ⓘ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶Ⓟ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓓ⊶Ⓘ⊶Ⓓ⊶Ⓘ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓦ⊶Ⓐ⊶Ⓢ⊶Ⓘ⊶Ⓡ ⊶Ⓗ⊶Ⓞ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓜ⊶Ⓔ⊶Ⓡ⊶Ⓔ ⊶Ⓛ⊶Ⓐ⊶Ⓥ⊶Ⓓ⊶Ⓔ ⊶Ⓟ⊶Ⓐ⊶Ⓡ ⊶Ⓤ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓛ ⊶Ⓤ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓛ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓣ⊶Ⓘ ⊶Ⓗ⊶Ⓐ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓘ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶Ⓟ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓘ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓣ⊶Ⓐ⊶Ⓜ⊶Ⓐ⊶Ⓣ⊶Ⓐ⊶Ⓡ ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓐ⊶Ⓡ⊶Ⓐ⊶Ⓗ ⊶Ⓛ⊶Ⓐ⊶ⒶⓁ ⊶Ⓗ⊶Ⓞ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓓ⊶Ⓘ⊶Ⓓ⊶Ⓘ ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓕ⊶Ⓐ⊶ⒶⓅ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓑ⊶Ⓘ⊶Ⓒ⊶Ⓗ ⊶Ⓑ⊶Ⓐ⊶Ⓙ⊶Ⓐ⊶Ⓡ ⊶Ⓜ⊶Ⓔ ⊶Ⓝ⊶Ⓘ⊶Ⓛ⊶Ⓐ⊶Ⓜ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓚ⊶Ⓐ⊶Ⓕ⊶Ⓕ⊶Ⓐ⊶Ⓝ ⊶Ⓜ⊶Ⓔ ⊶Ⓓ⊶Ⓐ⊶Ⓕ⊶Ⓐ⊶Ⓝ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓙ⊶Ⓐ⊶Ⓓ⊶Ⓐ ⊶Ⓝ⊶Ⓐ ⊶Ⓤ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓛ ⊶Ⓦ⊶Ⓐ⊶Ⓡ⊶Ⓝ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓔ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓢ⊶Ⓐ⊶Ⓢ⊶Ⓣ⊶Ⓐ ⊶Ⓚ⊶Ⓔ⊶Ⓨ⊶Ⓑ⊶Ⓞ⊶Ⓐ⊶Ⓡ⊶Ⓓ ⊶Ⓛ⊶Ⓐ⊶Ⓖ⊶Ⓐ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓐ⊶Ⓖ⊶Ⓐ⊶Ⓡ ⊶Ⓣ⊶Ⓤ ⊶Ⓒ⊶Ⓟ ⊶Ⓑ⊶Ⓞ⊶Ⓛ⊶Ⓔ⊶Ⓖ⊶Ⓐ ⊶Ⓣ⊶Ⓞ ⊶Ⓜ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓖ⊶Ⓐ⊶Ⓡ⊶Ⓐ⊶Ⓜ ⊶Ⓜ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓗ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓤ⊶Ⓡ ⊶Ⓜ⊶Ⓔ ⊶Ⓗ⊶Ⓐ⊶Ⓣ⊶Ⓗ⊶Ⓞ⊶Ⓡ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓚ⊶Ⓘ⊶Ⓛ⊶Ⓛ⊶Ⓘ ⊶Ⓣ⊶Ⓗ⊶Ⓞ⊶Ⓚ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓙ⊶Ⓙ⊶Ⓘ ⊶Ⓢ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶Ⓟ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ ⊶Ⓕ⊶Ⓐ⊶ⒶⓉ ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓙ⊶Ⓐ⊶ⒶⓃ ⊶Ⓚ⊶Ⓔ ⊶Ⓒ⊶Ⓐ⊶Ⓝ⊶Ⓒ⊶Ⓔ⊶Ⓡ ⊶Ⓦ⊶Ⓐ⊶Ⓛ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶Ⓟ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓝ⊶Ⓞ⊶Ⓝ ⊶Ⓢ⊶Ⓣ⊶Ⓞ⊶Ⓟ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓙ⊶Ⓐ⊶ⒶⓃ ⊶Ⓚ⊶Ⓔ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ ⊶Ⓖ⊶Ⓛ⊶Ⓘ⊶Ⓣ⊶Ⓒ⊶Ⓗ ⊶Ⓣ⊶Ⓨ⊶Ⓟ⊶Ⓘ⊶Ⓝ⊶Ⓖ ⊶Ⓚ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓥ⊶Ⓐ⊶Ⓢ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓗ⊶Ⓐ⊶Ⓘ ⊶Ⓢ⊶Ⓐ⊶Ⓑ⊶Ⓚ⊶Ⓐ ⊶Ⓜ⊶Ⓤ⊶Ⓗ ⊶Ⓜ⊶Ⓔ⊶Ⓗ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ ⊶Ⓛ⊶Ⓔ⊶Ⓚ⊶Ⓡ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓐ ⊶Ⓚ⊶Ⓗ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓐ⊶Ⓝ ⊶Ⓚ⊶Ⓞ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓛ⊶Ⓐ⊶Ⓣ⊶Ⓘ ⊶Ⓗ⊶Ⓐ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓤ ⊶Ⓞ⊶Ⓡ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓐ ⊶Ⓚ⊶Ⓗ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓐ⊶Ⓝ ⊶Ⓚ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓑ⊶Ⓘ⊶Ⓒ⊶Ⓗ ⊶Ⓑ⊶Ⓐ⊶Ⓙ⊶Ⓐ⊶Ⓡ ⊶Ⓜ⊶Ⓔ ⊶Ⓜ⊶Ⓞ⊶Ⓙ⊶Ⓡ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓦ⊶Ⓐ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓔ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ ⊶Ⓖ⊶Ⓞ⊶Ⓛ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶ⒶⓇ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓓ⊶Ⓤ⊶Ⓢ⊶Ⓡ⊶Ⓐ ⊶Ⓑ⊶Ⓛ⊶Ⓐ⊶Ⓒ⊶Ⓚ ⊶Ⓗ⊶Ⓞ⊶Ⓛ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓝ⊶Ⓐ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓚ⊶Ⓐ⊶Ⓕ⊶Ⓕ⊶Ⓐ⊶Ⓝ ⊶Ⓜ⊶Ⓔ ⊶Ⓓ⊶Ⓐ⊶Ⓕ⊶Ⓐ⊶Ⓝ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓑ⊶Ⓔ⊶Ⓣ⊶Ⓘ⊶ⓨ⊶Ⓞ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓖ⊶Ⓞ⊶Ⓓ⊶Ⓩ⊶Ⓘ⊶Ⓛ⊶Ⓛ⊶Ⓐ ⊶Ⓚ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ ⊶Ⓓ⊶Ⓐ⊶Ⓛ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓖ⊶Ⓞ⊶Ⓓ⊶Ⓩ⊶Ⓘ⊶Ⓛ⊶Ⓛ⊶Ⓐ ⊶Ⓚ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓕ⊶Ⓐ⊶ⒶⓇ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓢ⊶Ⓔ ⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓓ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓨ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓕ⊶Ⓛ⊶Ⓨ ⊶Ⓚ⊶Ⓘ⊶Ⓢ⊶Ⓢ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓟ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓘ ⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓓ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓤ⊶Ⓜ⊶Ⓜ⊶Ⓨ ⊶Ⓚ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓒ⊶Ⓗ⊶Ⓘ⊶ⓨ⊶Ⓞ ⊶Ⓚ⊶Ⓞ ⊶Ⓚ⊶Ⓐ⊶Ⓣ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓟ⊶Ⓐ⊶Ⓚ⊶Ⓚ⊶Ⓐ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓙ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓚ⊶Ⓗ⊶Ⓤ⊶Ⓝ⊶Ⓝ ⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓤ⊶Ⓢ⊶Ⓢ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓟ⊶Ⓐ⊶Ⓐ⊶Ⓝ⊶Ⓘ ⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓓ⊶Ⓞ⊶Ⓝ⊶Ⓐ⊶Ⓣ⊶Ⓔ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓟ⊶Ⓟ⊶Ⓐ⊶Ⓛ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓢ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓒ⊶Ⓗ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓗ⊶Ⓐ⊶Ⓡ ⊶Ⓝ⊶Ⓘ⊶Ⓚ⊶Ⓐ⊶Ⓛ ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓓ⊶Ⓘ⊶Ⓓ⊶Ⓘ ⊶Ⓚ⊶Ⓔ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ ⊶Ⓨ⊶Ⓞ⊶Ⓖ⊶Ⓘ ⊶Ⓙ⊶Ⓘ ⊶Ⓚ⊶Ⓐ ⊶Ⓑ⊶Ⓤ⊶Ⓛ⊶Ⓛ⊶Ⓓ⊶Ⓞ⊶Ⓩ⊶Ⓔ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓐ⊶Ⓛ⊶Ⓐ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓓ⊶Ⓘ⊶Ⓓ⊶Ⓘ ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓕ⊶Ⓛ⊶Ⓐ⊶Ⓣ ⊶Ⓗ⊶Ⓞ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓘ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓙ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓐ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ ⊶Ⓕ⊶Ⓐ⊶ⒶⓉ ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓓ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓐ⊶Ⓚ⊶49 ⊶Ⓢ⊶Ⓔ ⊶Ⓖ⊶Ⓞ⊶Ⓛ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓔ ⊶Ⓖ⊶Ⓞ⊶Ⓛ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶9 ⊶Ⓤ⊶Ⓝ⊶Ⓘ⊶Ⓥ⊶Ⓔ⊶Ⓡ⊶Ⓢ ⊶Ⓐ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓐ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓐ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓐ ⊶Ⓓ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓔ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ⊶ⓨ⊶Ⓞ ⊶Ⓚ⊶Ⓐ ⊶Ⓚ⊶Ⓞ⊶Ⓣ⊶Ⓗ⊶Ⓐ ⊶Ⓑ⊶Ⓐ⊶Ⓝ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓑ⊶Ⓔ⊶Ⓗ⊶Ⓔ⊶Ⓝ ⊶Ⓚ⊶Ⓞ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ⊶Ⓝ⊶Ⓔ ⊶Ⓚ⊶Ⓞ ⊶Ⓑ⊶Ⓐ⊶Ⓘ⊶Ⓣ⊶Ⓗ⊶Ⓐ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓚ⊶Ⓞ⊶Ⓣ⊶Ⓗ⊶Ⓔ ⊶Ⓟ⊶Ⓐ⊶Ⓡ⊶Ⓡ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓚ⊶Ⓞ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓒ⊶Ⓗ⊶Ⓐ ⊶Ⓡ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓘ ⊶Ⓑ⊶Ⓐ⊶Ⓗ⊶Ⓐ⊶Ⓝ⊶Ⓔ ⊶Ⓑ⊶Ⓐ⊶Ⓙ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓔ⊶Ⓖ⊶Ⓐ ⊶Ⓣ⊶Ⓞ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓐ⊶Ⓝ⊶Ⓒ⊶Ⓔ⊶Ⓡ ⊶Ⓦ⊶Ⓐ⊶Ⓛ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓔ ⊶Ⓚ⊶Ⓞ ⊶Ⓣ⊶Ⓘ⊶Ⓚ⊶Ⓣ⊶Ⓞ⊶Ⓚ ⊶Ⓚ⊶Ⓔ ⊶Ⓣ⊶Ⓐ⊶Ⓡ⊶Ⓐ⊶Ⓗ ⊶Ⓑ⊶Ⓐ⊶Ⓝ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓘ⊶Ⓢ⊶Ⓢ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓘ⊶Ⓨ⊶Ⓐ ⊶Ⓢ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓚ⊶Ⓐ ⊶Ⓟ⊶Ⓞ⊶Ⓦ⊶Ⓔ⊶Ⓡ ⊶Ⓓ⊶Ⓘ⊶Ⓚ⊶Ⓗ⊶Ⓐ",
+    "⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓐ⊶Ⓖ⊶Ⓔ⊶Ⓖ⊶Ⓐ ⊶Ⓣ⊶Ⓞ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓣ⊶Ⓞ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓘ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓣ ⊶Ⓜ⊶Ⓔ ⊶Ⓜ⊶Ⓤ⊶Ⓣ⊶Ⓣ⊶Ⓗ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶ⒶⓇ ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓟ⊶Ⓞ⊶Ⓛ⊶Ⓘ⊶Ⓒ⊶Ⓔ ⊶Ⓚ⊶Ⓐ ⊶Ⓓ⊶Ⓐ⊶Ⓝ⊶Ⓓ⊶Ⓐ ⊶Ⓜ⊶Ⓐ⊶Ⓡ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ ⊶Ⓤ⊶Ⓢ⊶Ⓢ⊶Ⓔ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓚ⊶Ⓐ ⊶Ⓦ⊶Ⓞ⊶Ⓡ⊶Ⓚ⊶Ⓞ⊶Ⓤ⊶Ⓣ ⊶Ⓗ⊶Ⓞ⊶Ⓙ⊶Ⓐ⊶Ⓨ⊶Ⓔ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ ⊶Ⓘ⊶Ⓣ⊶Ⓝ⊶Ⓐ ⊶Ⓔ⊶Ⓝ⊶Ⓔ⊶Ⓡ⊶Ⓖ⊶Ⓨ ⊶Ⓗ⊶Ⓐ⊶Ⓘ ⊶Ⓚ⊶Ⓘ ⊶Ⓔ⊶Ⓚ ⊶Ⓑ⊶Ⓐ⊶ⒶⓇ ⊶Ⓜ⊶Ⓔ ⊶10 ⊶Ⓛ⊶Ⓞ⊶Ⓖ⊶Ⓞ ⊶Ⓚ⊶Ⓐ ⊶Ⓛ⊶Ⓤ⊶Ⓝ⊶Ⓓ⊶Ⓐ ⊶Ⓛ⊶Ⓔ⊶Ⓛ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓜ⊶Ⓔ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓑ⊶Ⓐ⊶Ⓒ⊶Ⓒ⊶Ⓗ⊶Ⓐ ⊶Ⓐ⊶Ⓘ⊶Ⓢ⊶Ⓔ ⊶Ⓐ⊶Ⓟ⊶Ⓝ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓨ⊶Ⓐ ⊶Ⓒ⊶Ⓗ⊶Ⓤ⊶Ⓓ⊶Ⓦ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓑ⊶Ⓗ⊶Ⓐ⊶Ⓖ⊶Ⓔ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓜ⊶Ⓐ⊶Ⓐ⊶Ⓚ⊶Ⓔ ⊶Ⓑ⊶Ⓗ⊶Ⓞ⊶Ⓢ⊶Ⓓ⊶Ⓔ ⊶Ⓚ⊶Ⓞ ⊶Ⓤ⊶Ⓛ⊶Ⓣ⊶Ⓐ ⊶Ⓛ⊶Ⓐ⊶Ⓣ⊶Ⓚ⊶Ⓐ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓒ⊶Ⓗ⊶Ⓞ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ",
+    "⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ ⊶Ⓗ⊶Ⓞ⊶Ⓛ⊶Ⓛ⊶Ⓞ⊶Ⓦ ⊶Ⓟ⊶Ⓤ⊶Ⓡ⊶Ⓟ⊶Ⓛ⊶Ⓔ ⊶Ⓜ⊶Ⓐ⊶ⒶⓇ ⊶Ⓚ⊶Ⓐ⊶Ⓡ ⊶Ⓣ⊶Ⓔ⊶Ⓡ⊶Ⓘ ⊶Ⓐ⊶Ⓜ⊶Ⓜ⊶Ⓐ ⊶Ⓚ⊶Ⓘ ⊶Ⓖ⊶Ⓐ⊶Ⓝ⊶Ⓓ ⊶Ⓜ⊶Ⓔ ⊶Ⓒ⊶Ⓗ⊶Ⓔ⊶Ⓓ⊶Ⓓ ⊶Ⓚ⊶Ⓐ⊶Ⓡ⊶Ⓓ⊶Ⓤ⊶Ⓝ⊶Ⓖ⊶Ⓐ"
+    ]
+            ]
+            sqs2_texts = [
+        "⋰Ⓑ⋰⋰⒪⋰⋰⒧⋰ ⋰⒯⋰⋰⒪⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰Ⓓ⋰⋰⒤⋰⋰Ⓓ⋰⋰⒤⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒠⋰ ⋰⒨⋰⋰⒰⋰⋰⒣⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒭⋰⋰⒜⋰⋰⒢⋰⋰⒜⋰⋰⒟⋰ ⋰⒟⋰⋰⒰⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒮⋰⋰⒜⋰⋰⒧⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒡⋰⋰⒜⋰⋰⒨⋰⋰⒠⋰ ⋰⒧⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒫⋰⋰⒠⋰ ⋰⒯⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰⋰⒫⋰⋰⒜⋰⋰⒟⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒰⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰⋰⒰⋰",
+        "⋰⒳⋰⋰⒣⋰⋰⒜⋰⋰⒧⋰ ⋰⒰⋰⋰⒯⋰⋰⒣⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒣⋰⋰⒠⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰",
+        "⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒩⋰⋰⒜⋰ ⋰⒩⋰⋰⒜⋰⋰⒣⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒧⋰⋰⒜⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒝⋰⋰⒰⋰⋰⒟⋰⋰⒣⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒧⋰⋰⒜⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒣⋰⋰⒠⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰ ⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒧⋰ ⋰⒰⋰⋰⒯⋰⋰⒣⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒜⋰⋰⒦⋰⋰⒠⋰⋰⒧⋰⋰⒜⋰ ⋰⒫⋰⋰⒜⋰⋰⒩⋰ ⋰⒨⋰⋰⒤⋰⋰⒯⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒳⋰⋰⒣⋰⋰⒜⋰⋰⒧⋰ ⋰⒥⋰⋰⒤⋰⋰⒩⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒣⋰⋰⒪⋰ ⋰⒥⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰⋰⒯⋰⋰⒯⋰ ⋰⒫⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰ ⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰⋰⒫⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰⋰⒧⋰⋰⒧⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒩⋰⋰⒜⋰⋰⒩⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒦⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒝⋰⋰⒪⋰⋰⒪⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒠⋰⋰⒠⋰⋰⒭⋰⋰⒭⋰ ⋰⒡⋰⋰⒜⋰⋰⒜⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰⋰⒯⋰⋰⒯⋰ ⋰⒮⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒭⋰⋰⒭⋰ ⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰⋰⒧⋰⋰⒧⋰⋰⒧⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰⋰⒥⋰⋰⒥⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒝⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒡⋰⋰⒜⋰⋰⒜⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒠⋰⋰⒫⋰⋰⒧⋰⋰⒴⋰⋰⒴⋰⋰⒴⋰ ⋰⒦⋰⋰⒭⋰⋰⒭⋰⋰⒭⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰⋰⒩⋰ ⋰⒦⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒝⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒩⋰⋰⒤⋰⋰⒧⋰⋰⒜⋰⋰⒜⋰⋰⒨⋰⋰⒨⋰⋰⒨⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰⋰⒩⋰⋰⒩⋰ ⋰⒦⋰⋰⒪⋰⋰⒪⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰ ⋰⒤⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒜⋰⋰⒜⋰ ⋰⒮⋰⋰⒠⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒭⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰⋰⒢⋰⋰⒢⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒠⋰⋰⒫⋰⋰⒧⋰⋰⒴⋰⋰⒴⋰⋰⒴⋰ ⋰⒟⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒦⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒦⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰⋰⒯⋰⋰⒯⋰ ⋰⒨⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰ ⋰⒧⋰⋰⒰⋰⋰⒩⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰⋰⒩⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰⋰⒯⋰ ⋰⒨⋰⋰⒠⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰⋰⒩⋰ ⋰⒣⋰⋰⒜⋰⋰⒯⋰⋰⒣⋰⋰⒣⋰⋰⒣⋰ ⋰⒟⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰⋰⒧⋰⋰⒧⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰⋰⒥⋰⋰⒥⋰⋰⒥⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰⋰⒩⋰⋰⒩⋰",
+        "⋰⒮⋰⋰⒫⋰⋰⒠⋰⋰⒠⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒫⋰⋰⒜⋰⋰⒦⋰⋰⒜⋰⋰⒜⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰",
+        "⋰⒮⋰⋰⒫⋰⋰⒠⋰⋰⒠⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒧⋰⋰⒠⋰⋰⒦⋰⋰⒦⋰⋰⒜⋰⋰⒭⋰⋰⒭⋰⋰⒭⋰ ⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒟⋰⋰⒟⋰ ⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰⋰⒠⋰⋰⒠⋰",
+        "⋰⒭⋰⋰⒠⋰⋰⒫⋰⋰⒧⋰⋰⒴⋰⋰⒴⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰⋰⒤⋰⋰⒮⋰⋰⒠⋰ ⋰⒦⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰ ⋰⒩⋰⋰⒜⋰⋰⒩⋰⋰⒤⋰ ⋰⒦⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰⋰⒯⋰ ⋰⒦⋰⋰⒜⋰⋰⒜⋰ ⋰⒝⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒝⋰⋰⒜⋰⋰⒩⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒦⋰⋰⒜⋰⋰⒯⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒜⋰⋰⒰⋰⋰⒧⋰⋰⒜⋰⋰⒟⋰ ⋰⒣⋰⋰⒜⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒦⋰⋰⒜⋰⋰⒯⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒜⋰⋰⒰⋰⋰⒧⋰⋰⒜⋰⋰⒟⋰ ⋰⒣⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒟⋰ ⋰⒦⋰⋰⒤⋰⋰⒟⋰⋰⒟⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒮⋰⋰⒜⋰⋰⒯⋰⋰⒣⋰ ⋰⒮⋰⋰⒪⋰ ⋰⒥⋰⋰⒜⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒱⋰⋰⒪⋰⋰⒤⋰⋰⒞⋰⋰⒠⋰ ⋰⒣⋰⋰⒪⋰ ⋰⒥⋰⋰⒜⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒩⋰⋰⒜⋰⋰⒣⋰⋰⒤⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒮⋰⋰⒜⋰⋰⒦⋰⋰⒯⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒧⋰⋰⒜⋰⋰⒰⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒤⋰⋰⒢⋰⋰⒩⋰⋰⒪⋰⋰⒭⋰⋰⒠⋰ ⋰⒦⋰⋰⒜⋰⋰⒤⋰⋰⒮⋰⋰⒠⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒦⋰⋰⒜⋰⋰⒯⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒰⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒤⋰⋰⒢⋰⋰⒩⋰⋰⒪⋰⋰⒭⋰⋰⒠⋰ ⋰⒦⋰⋰⒜⋰⋰⒤⋰⋰⒮⋰⋰⒠⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒭⋰⋰⒜⋰ ⋰⒣⋰⋰⒜⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒡⋰⋰⒜⋰⋰⒯⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒜⋰ ⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒜⋰⋰⒧⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒜⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒪⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒞⋰⋰⒫⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒦⋰⋰⒜⋰⋰⒧⋰⋰⒤⋰ ⋰⒥⋰⋰⒰⋰⋰⒝⋰⋰⒜⋰⋰⒩⋰ ⋰⒦⋰⋰⒜⋰⋰⒯⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒡⋰⋰⒠⋰⋰⒩⋰⋰⒦⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒩⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒨⋰⋰⒜⋰⋰⒤⋰ ⋰⒦⋰⋰⒜⋰⋰⒝⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰ ⋰⒦⋰⋰⒠⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒥⋰⋰⒤⋰⋰⒩⋰⋰⒟⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒡⋰⋰⒜⋰⋰⒯⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒠⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒜⋰⋰⒝⋰ ⋰⒯⋰⋰⒰⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒟⋰⋰⒜⋰⋰⒡⋰⋰⒜⋰⋰⒩⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰??⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒠⋰ ⋰⒧⋰⋰⒜⋰⋰⒰⋰⋰⒟⋰⋰⒠⋰ ⋰⒫⋰⋰⒠⋰⋰⒭⋰ ⋰⒢⋰⋰??⋰⋰⒰⋰⋰⒨⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒟⋰⋰⒠⋰ ⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒟⋰⋰⒠⋰ ⋰⒧⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒧⋰⋰⒠⋰⋰⒦⋰⋰⒤⋰⋰⒩⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒥⋰⋰⒣⋰⋰⒰⋰⋰⒦⋰⋰⒩⋰⋰⒠⋰ ⋰⒩⋰⋰⒜⋰⋰⒤⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰ ⋰⒝⋰⋰⒜⋰⋰⒩⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒜⋰ ⋰⒭⋰⋰⒠⋰⋰⒫⋰⋰⒧⋰⋰⒴⋰ ⋰⒣⋰⋰⒪⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰ ⋰⒥⋰⋰⒜⋰⋰⒴⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒩⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒧⋰⋰⒰⋰ ⋰⒦⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒯⋰⋰⒪⋰ ⋰⒞⋰⋰⒫⋰ ⋰⒝⋰⋰⒪⋰⋰⒧⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒰⋰⋰⒢⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒜⋰⋰⒯⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒥⋰⋰⒤⋰⋰⒩⋰⋰⒟⋰⋰⒜⋰ ⋰⒣⋰⋰⒪⋰⋰⒥⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒰⋰⋰⒯⋰⋰⒣⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒡⋰⋰⒠⋰⋰⒩⋰⋰⒦⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒥⋰⋰⒤⋰⋰⒩⋰⋰⒟⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒦⋰⋰⒪⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰ ⋰⒥⋰⋰⒜⋰⋰⒴⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒠⋰ ⋰⒧⋰⋰⒜⋰⋰⒰⋰⋰⒟⋰⋰⒠⋰ ⋰⒫⋰⋰⒠⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒤⋰⋰⒮⋰⋰⒠⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒟⋰⋰⒜⋰⋰⒡⋰⋰⒜⋰⋰⒩⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰⋰⒪⋰ ⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒨⋰⋰⒠⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒮⋰⋰⒜⋰⋰⒯⋰⋰⒣⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒝⋰⋰⒣⋰⋰⒤⋰ ⋰⒟⋰⋰⒜⋰⋰⒡⋰⋰⒜⋰⋰⒩⋰ ⋰⒣⋰⋰⒪⋰ ⋰⒥⋰⋰⒜⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒜⋰ ⋰⒩⋰⋰⒜⋰⋰⒣⋰⋰⒤⋰ ⋰⒣⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰⋰⒟⋰⋰⒠⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒢⋰⋰⒜⋰⋰⒤⋰⋰⒭⋰⋰⒝⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒜⋰⋰⒰⋰⋰⒧⋰⋰⒜⋰⋰⒟⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒧⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒮⋰⋰⒫⋰⋰⒠⋰⋰⒠⋰⋰⒟⋰ ⋰⒨⋰⋰⒜⋰⋰⒯⋰⋰⒞⋰⋰⒣⋰ ⋰⒦⋰⋰⒭⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰ ⋰⒢⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰⋰⒝⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒞⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒯⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒡⋰⋰⒠⋰⋰⒦⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒠⋰⋰⒠⋰⋰⒥⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒩⋰⋰⒜⋰⋰⒣⋰⋰⒤⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰⋰⒟⋰⋰⒠⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒞⋰⋰⒫⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒩⋰⋰⒜⋰⋰⒣⋰⋰⒤⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒠⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒯⋰⋰⒜⋰⋰⒢⋰ ⋰⒦⋰⋰⒜⋰⋰⒤⋰⋰⒮⋰⋰⒠⋰ ⋰⒦⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒭⋰ ⋰⒧⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒥⋰⋰⒤⋰⋰⒩⋰⋰⒟⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒡⋰⋰⒜⋰⋰⒯⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒠⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒜⋰⋰⒝⋰ ⋰⒯⋰⋰⒰⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒟⋰⋰⒜⋰⋰⒡⋰⋰⒜⋰⋰⒩⋰ ⋰⒦⋰⋰⒜⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒠⋰ ⋰⒧⋰⋰⒜⋰⋰⒰⋰⋰⒟⋰⋰⒠⋰ ⋰⒫⋰⋰⒠⋰⋰⒭⋰ ⋰⒢⋰⋰⒣⋰⋰⒰⋰⋰⒨⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒟⋰⋰⒠⋰ ⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒟⋰⋰⒠⋰ ⋰⒧⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒧⋰⋰⒠⋰⋰⒦⋰⋰⒤⋰⋰⒩⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒥⋰⋰⒣⋰⋰⒰⋰⋰⒦⋰⋰⒩⋰⋰⒠⋰ ⋰⒩⋰⋰⒜⋰⋰⒤⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰ ⋰⒝⋰⋰⒜⋰⋰⒩⋰⋰⒜⋰⋰⒜⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒠⋰⋰⒤⋰⋰⒩⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒜⋰ ⋰⒭⋰⋰⒠⋰⋰⒫⋰⋰⒧⋰⋰⒴⋰ ⋰⒣⋰⋰⒪⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒜⋰⋰⒜⋰⋰⒥⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰ ⋰⒥⋰⋰⒜⋰⋰⒴⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒨⋰⋰⒰⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒩⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒧⋰⋰⒰⋰ ⋰⒦⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒯⋰⋰⒪⋰ ⋰⒞⋰⋰⒫⋰ ⋰⒝⋰⋰⒪⋰⋰",
+        "⋰Ⓑ⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰Ⓑ⋰⋰⒣⋰⋰⒤⋰ ⋰Ⓑ⋰⋰⒩⋰⋰⒜⋰⋰⒧⋰⋰⒠⋰ ⋰⒨⋰⋰⒰⋰⋰⒥⋰⋰⒠⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒜⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒵⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒴⋰⋰⒜⋰⋰⒜⋰⋰⒟⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒯⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒰⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒜⋰ ⋰⒩⋰⋰⒜⋰ ⋰⒯⋰⋰⒴⋰⋰⒨⋰⋰⒫⋰⋰⒜⋰⋰⒮⋰⋰⒮⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰ ⋰⒰⋰⋰⒩⋰⋰⒡⋰⋰⒰⋰⋰⒩⋰⋰⒩⋰⋰⒴⋰ ⋰⒮⋰⋰⒲⋰⋰⒤⋰⋰⒫⋰⋰⒠⋰ ⋰⒨⋰⋰⒯⋰⋰⒯⋰ ⋰⒦⋰⋰⒭⋰",
+        "⋰⒪⋰⋰⒣⋰ ⋰⒣⋰⋰⒠⋰⋰⒧⋰⋰⒧⋰⋰⒪⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒜⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒪⋰⋰⒭⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒱⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒜⋰⋰⒜⋰⋰⒰⋰⋰⒦⋰⋰⒜⋰⋰⒯⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒭⋰⋰⒣⋰⋰⒜⋰ ⋰⒦⋰⋰⒭⋰.",
+        "⋰⒪⋰⋰⒴⋰⋰⒴⋰ ⋰⒦⋰⋰⒤⋰⋰⒩⋰⋰⒩⋰⋰⒠⋰⋰⒭⋰ ⋰⒯⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰ ⋰⒢⋰⋰⒞⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒜⋰⋰⒜⋰⋰⒩⋰⋰⒠⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒫⋰⋰⒠⋰⋰⒭⋰⋰⒨⋰⋰⒤⋰⋰⒮⋰⋰⒮⋰⋰⒤⋰⋰⒪⋰⋰⒩⋰ ⋰⒦⋰⋰⒤⋰⋰⒮⋰⋰⒩⋰⋰⒠⋰ ⋰⒟⋰⋰⒤⋰.",
+        "⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰⋰⒜⋰",
+        "⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰⋰⒜⋰ ⋰⒠⋰⋰⒦⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒭⋰.",
+        "⋰⒮⋰⋰⒰⋰⋰⒩⋰ ⋰⒮⋰⋰⒰⋰⋰⒩⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒜⋰.",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒞⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰.",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒯⋰⋰⒤⋰ ⋰⒥⋰⋰⒜⋰⋰⒯⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒯⋰⋰⒨⋰⋰⒭⋰.",
+        "⋰⒦⋰⋰⒴⋰? ⋰⒥⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒦⋰⋰⒤⋰⋰⒟⋰⋰⒟⋰⋰⒠⋰.",
+        "⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒞⋰⋰⒪⋰⋰⒨⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒢⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒯⋰⋰⒜⋰⋰⒢⋰ ⋰⒞⋰⋰⒭⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰",
+        "⋰⒨⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒯⋰⋰⒨⋰⋰⒦⋰⋰⒞⋰ ⋰⒝⋰⋰⒮⋰",
+        "⋰⒥⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒵⋰ ⋰⒫⋰⋰⒜⋰⋰⒫⋰⋰⒜⋰ ⋰⒝⋰⋰⒪⋰⋰⒧⋰",
+        "⋰⒮⋰⋰⒤⋰⋰⒟⋰⋰⒠⋰ ⋰⒣⋰⋰⒪⋰⋰⒥⋰⋰⒜⋰ ⋰⒝⋰⋰⒤⋰⋰⒣⋰⋰⒜⋰⋰⒭⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒜⋰⋰⒝⋰",
+        "⋰⒣⋰⋰⒴⋰⋰⒠⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒝⋰⋰⒣⋰⋰⒢⋰ ⋰⒨⋰⋰⒜⋰⋰⒯⋰ ⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰",
+        "⋰⒝⋰⋰⒣⋰⋰⒢⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒜⋰⋰⒥⋰⋰⒥⋰",
+        "⋰⒣⋰⋰⒴⋰⋰⒠⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒨⋰⋰⒜⋰⋰⒯⋰",
+        "⋰⒣⋰⋰⒴⋰⋰⒠⋰ ⋰⒟⋰⋰⒰⋰⋰⒭⋰ ⋰⒣⋰⋰⒜⋰⋰⒯⋰⋰⒯⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒦⋰⋰⒪⋰⋰⒤⋰ ⋰⒝⋰⋰⒜⋰⋰⒯⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒠⋰⋰⒮⋰⋰⒧⋰⋰⒤⋰⋰⒴⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒡⋰ ⋰⒞⋰⋰⒭⋰ ⋰⒭⋰⋰⒣⋰⋰⒜⋰ ⋰⒣⋰⋰⒰⋰ ⋰⒯⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒦⋰⋰⒪⋰⋰⒤⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒯⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒨⋰⋰⒜⋰⋰⒡⋰⋰⒤⋰ ⋰⒟⋰⋰⒠⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒨⋰⋰⒜⋰⋰⒡⋰⋰⒤⋰ ⋰⒨⋰⋰⒤⋰⋰⒧⋰ ⋰⒥⋰⋰⒜⋰⋰⒴⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒯⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒰⋰⋰⒥⋰⋰⒠⋰ ⋰⒮⋰⋰⒲⋰⋰⒤⋰⋰⒫⋰⋰⒠⋰ ⋰⒞⋰⋰⒭⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒮⋰⋰⒲⋰⋰⒤⋰⋰⒫⋰⋰⒠⋰ ⋰⒞⋰⋰⒭⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒡⋰⋰⒭⋰ ⋰⒝⋰⋰⒪⋰⋰⒧⋰⋰⒩⋰⋰⒜⋰ ⋰⒩⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒧⋰⋰⒠⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒮⋰⋰⒲⋰⋰⒤⋰⋰⒫⋰⋰⒠⋰ ⋰⒞⋰⋰⒭⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒣⋰⋰⒰⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒫⋰⋰⒭⋰ ⋰⒦⋰⋰⒠⋰⋰⒮⋰⋰⒠⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰",
+        "⋰⒨⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰ ⋰⒫⋰⋰⒯⋰⋰⒜⋰ ⋰⒯⋰⋰⒣⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒨⋰⋰⒠⋰⋰⒴⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒩⋰⋰⒯⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰",
+        "⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒠⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒰⋰⋰⒯⋰⋰⒭⋰ ⋰⒨⋰⋰⒞⋰",
+        "⋰⒧⋰⋰⒰⋰⋰⒩⋰ ⋰⒨⋰⋰⒯⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒮⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒜⋰",
+        "⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒟⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒪⋰⋰⒴⋰⋰⒠⋰ ⋰⒢⋰⋰⒜⋰⋰⒮⋰⋰⒣⋰⋰⒯⋰⋰⒤⋰ ⋰⒦⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒨⋰⋰⒜⋰⋰⒦⋰⋰⒤⋰⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒨⋰⋰⒜⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒦⋰ ⋰⒣⋰⋰⒜⋰⋰⒯⋰⋰⒣⋰ ⋰⒯⋰⋰⒪⋰⋰⒟⋰⋰⒣⋰ ⋰⒦⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒦⋰ ⋰⒨⋰⋰⒰⋰⋰⒣⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒡⋰⋰⒜⋰⋰⒮⋰⋰⒜⋰⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒧⋰⋰⒠⋰⋰⒜⋰⋰⒱⋰⋰⒠⋰ ⋰⒧⋰⋰⒠⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒫⋰⋰⒜⋰⋰⒮⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒩⋰⋰⒜⋰⋰⒤⋰ ⋰⒜⋰⋰⒴⋰⋰⒜⋰ ⋰⒨⋰⋰⒠⋰⋰⒦⋰⋰⒪⋰",
+        "⋰⒧⋰⋰⒠⋰⋰⒜⋰⋰⒱⋰⋰⒠⋰ ⋰⒧⋰⋰⒠⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒤⋰⋰⒟⋰⋰⒠⋰⋰⒭⋰ ⋰⒮⋰⋰⒠⋰",
+        "⋰⒧⋰⋰⒠⋰⋰⒜⋰⋰⒱⋰⋰⒠⋰ ⋰⒧⋰⋰⒠⋰ ⋰⒥⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒲⋰⋰⒭⋰⋰⒩⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒧⋰⋰⒠⋰⋰⒜⋰⋰⒱⋰⋰⒠⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒧⋰⋰⒠⋰⋰⒢⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒮⋰⋰⒨⋰⋰⒥⋰⋰⒣⋰ ⋰⒝⋰⋰⒜⋰⋰⒯⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒧⋰⋰⒠⋰⋰⒜⋰⋰⒱⋰⋰⒠⋰ ⋰⒧⋰⋰⒠⋰",
+        "⋰⒡⋰⋰⒜⋰⋰⒮⋰⋰⒯⋰ ⋰⒧⋰⋰⒠⋰⋰⒜⋰⋰⒱⋰⋰⒠⋰ ⋰⒧⋰⋰⒠⋰ ⋰⒦⋰⋰⒜⋰⋰⒨⋰⋰⒥⋰⋰⒪⋰⋰⒭⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒰⋰⋰⒯⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰",
+        "⋰⒪⋰⋰⒴⋰ ⋰⒣⋰⋰⒤⋰⋰⒥⋰⋰⒟⋰⋰⒠⋰ ⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒩⋰⋰⒜⋰ ⋰⒦⋰⋰⒣⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒨⋰⋰⒵⋰⋰⒪⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒦⋰⋰⒪⋰ ⋰⒤⋰⋰⒧⋰⋰⒴⋰ ⋰⒭⋰⋰⒠⋰⋰⒴⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒯⋰⋰⒨⋰⋰⒦⋰⋰⒞⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰",
+        "⋰⒮⋰⋰⒣⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰",
+        "⋰⒡⋰⋰⒭⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰",
+        "⋰⒮⋰⋰⒣⋰⋰⒤⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒲⋰⋰⒭⋰⋰⒩⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒴⋰⋰⒰⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰⋰⒞⋰⋰⒣⋰⋰⒜⋰⋰⒫⋰",
+        "⋰⒫⋰⋰⒭⋰⋰⒪⋰⋰⒪⋰⋰⒡⋰ ⋰⒞⋰⋰⒭⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒫⋰⋰⒭⋰⋰⒪⋰⋰⒪⋰⋰⒡⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒠⋰⋰⒴⋰",
+        "⋰⒫⋰⋰⒭⋰⋰⒪⋰⋰⒪⋰⋰⒡⋰ ⋰⒣⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒦⋰⋰⒜⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒞⋰⋰⒣⋰⋰⒤⋰⋰⒧⋰⋰⒧⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰ ⋰⒝⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒪⋰⋰⒴⋰ ⋰⒣⋰⋰⒤⋰⋰⒥⋰⋰⒟⋰⋰⒠⋰ ⋰⒦⋰⋰⒣⋰⋰⒜⋰⋰⒩⋰⋰⒜⋰ ⋰⒦⋰⋰⒣⋰⋰⒜⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒨⋰⋰⒵⋰⋰⒪⋰⋰⒭⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰ ?",
+        "⋰⒜⋰⋰⒝⋰ ⋰⒯⋰⋰⒦⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒤⋰ ⋰⒣⋰⋰⒪⋰⋰⒢⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ?",
+        "⋰⒩⋰⋰⒴⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒦⋰⋰⒰⋰⋰⒞⋰⋰⒣⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒥⋰⋰⒜⋰⋰⒩⋰⋰⒯⋰⋰⒜⋰ ⋰⒝⋰⋰⒮⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰ ⋰⒠⋰⋰⒴⋰",
+        "⋰⒮⋰⋰⒝⋰⋰⒮⋰⋰⒠⋰ ⋰⒫⋰⋰⒣⋰⋰⒠⋰⋰⒧⋰⋰⒠⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒪⋰ ⋰⒝⋰⋰⒪⋰⋰⒧⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒩⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰⋰⒨⋰ ⋰⒦⋰⋰⒭⋰⋰⒠⋰",
+        "⋰⒴⋰⋰⒜⋰⋰⒣⋰⋰⒜⋰ ⋰⒝⋰⋰⒣⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒞⋰⋰⒠⋰ ⋰⒫⋰⋰⒤⋰⋰⒧⋰⋰⒧⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰⋰⒨⋰⋰⒜⋰⋰⒦⋰⋰⒜⋰⋰⒝⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒯⋰⋰⒪⋰ ⋰⒝⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒠⋰⋰⒢⋰⋰⒤⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒫⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒯⋰⋰⒪⋰⋰⒨⋰⋰⒨⋰⋰⒴⋰",
+        "⋰⒩⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰⋰⒧⋰ ⋰⒨⋰⋰⒜⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰⋰⒞⋰⋰⒣⋰⋰⒟⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰ ⋰⒴⋰⋰⒣⋰⋰⒜⋰ ⋰⒮⋰⋰⒠⋰",
+        "⋰⒞⋰⋰⒪⋰⋰⒵⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒣⋰⋰⒤⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒣⋰⋰⒠⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒯⋰⋰⒪⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒫⋰ ⋰⒝⋰⋰⒪⋰⋰⒧⋰ ⋰⒨⋰⋰⒰⋰⋰⒥⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒩⋰⋰⒴⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒣⋰⋰⒪⋰⋰⒢⋰⋰⒤⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰ ⋰⒥⋰⋰⒪⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰⋰⒯⋰⋰⒤⋰ ⋰⒥⋰⋰⒪⋰⋰⒢⋰⋰⒤⋰",
+        "⋰⒯⋰⋰⒭⋰⋰⒴⋰ ⋰⒜⋰⋰⒨⋰⋰⒨⋰⋰⒤⋰ ⋰⒞⋰⋰⒠⋰ ⋰⒝⋰⋰⒣⋰⋰⒪⋰⋰⒮⋰⋰⒟⋰⋰⒠⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒠⋰⋰⒨⋰⋰⒪⋰⋰⒥⋰⋰⒤⋰ ⋰⒟⋰⋰⒜⋰⋰⒧⋰ ⋰⒨⋰⋰⒞⋰",
+        "⋰⒞⋰⋰⒴⋰⋰⒜⋰ ? ⋰⒞⋰⋰⒣⋰⋰⒨⋰⋰⒭⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒜⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ?",
+        "⋰⒯⋰⋰⒨⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒭⋰⋰⒤⋰ ⋰⒣⋰⋰⒪⋰⋰⒢⋰⋰⒤⋰ ⋰⒡⋰⋰⒭⋰⋰⒭⋰⋰⒯⋰⋰⒪⋰",
+        "⋰⒞⋰⋰⒴⋰⋰⒜⋰ ? ⋰⒦⋰⋰⒝⋰ ? ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰⋰⒦⋰",
+        "⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒮⋰⋰⒞⋰⋰⒣⋰ ⋰⒨⋰⋰⒠⋰⋰⒴⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒧⋰⋰⒤⋰ ⋰⒯⋰⋰⒰⋰⋰⒩⋰⋰⒠⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰",
+        "⋰⒤⋰⋰⒯⋰⋰⒩⋰⋰⒜⋰ ⋰⒮⋰⋰⒞⋰⋰⒣⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒝⋰⋰⒪⋰⋰⒧⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰",
+        "⋰⒮⋰⋰⒞⋰⋰⒣⋰ ⋰⒨⋰⋰⒠⋰⋰⒴⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒜⋰⋰⒫⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒲⋰⋰⒜⋰ ⋰⒧⋰⋰⒤⋰⋰⒜⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒠⋰ ⋰⒮⋰⋰⒯⋰⋰⒣⋰",
+        "⋰⒨⋰⋰⒯⋰⋰⒧⋰⋰⒝⋰ ⋰⒯⋰⋰⒨⋰⋰⒭⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒯⋰⋰⒪⋰",
+        "⋰⒫⋰⋰⒰⋰⋰⒭⋰⋰⒜⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒨⋰⋰⒞⋰",
+        "⋰⒯⋰⋰⒨⋰⋰⒭⋰ ⋰⒡⋰⋰⒭⋰⋰⒭⋰⋰⒯⋰⋰⒪⋰",
+        "⋰⒪⋰⋰⒣⋰ ⋰⒪⋰⋰⒦⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒧⋰⋰⒠⋰ ⋰⒡⋰⋰⒤⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒟⋰⋰⒜⋰⋰⒨⋰⋰⒜⋰⋰⒟⋰",
+        "⋰⒞⋰⋰⒴⋰⋰⒜⋰ ? ⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰ ⋰⒮⋰⋰⒠⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰⋰⒠⋰ ⋰⒫⋰⋰⒠⋰⋰⒣⋰⋰⒧⋰⋰⒠⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒠⋰⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒯⋰⋰⒪⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒩⋰⋰⒠⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒱⋰⋰⒴⋰⋰⒜⋰⋰⒮⋰⋰⒯⋰ ⋰⒣⋰⋰⒰⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒯⋰⋰⒪⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒰⋰⋰⒞⋰⋰⒣⋰ ⋰⒝⋰⋰⒤⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰⋰⒠⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ? ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒴⋰⋰⒜⋰ ?",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒨⋰⋰⒯⋰ ⋰⒣⋰⋰⒮⋰⋰⒮⋰",
+        "⋰⒴⋰⋰⒰⋰⋰⒭⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰ ⋰⒨⋰⋰⒪⋰⋰⒨⋰",
+        "⋰⒜⋰⋰⒭⋰⋰⒠⋰ ⋰⒮⋰⋰⒝⋰⋰⒦⋰⋰⒤⋰ ⋰⒨⋰⋰??⋰⋰⒜⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰ ⋰⒪⋰⋰⒭⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒝⋰⋰⒤⋰",
+        "⋰⒜⋰⋰⒭⋰⋰⒠⋰ ⋰⒤⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰⋰⒧⋰⋰⒠⋰ ⋰⒠⋰⋰⒦⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒯⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒤⋰ ⋰⒯⋰⋰⒭⋰⋰⒣⋰",
+        "⋰⒠⋰⋰⒦⋰ ⋰⒧⋰⋰⒤⋰⋰⒩⋰⋰⒠⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒯⋰⋰⒨⋰⋰⒭⋰",
+        "⋰⒬⋰",
+        "⋰⒪⋰⋰⒞⋰⋰⒴⋰ ⋰⒜⋰⋰⒝⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒧⋰⋰⒠⋰",
+        "⋰⒫⋰⋰⒠⋰⋰⒣⋰⋰⒠⋰⋰⒧⋰⋰⒠⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒰⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒯⋰⋰⒪⋰",
+        "⋰⒬⋰ ?",
+        "⋰⒣⋰⋰⒴⋰⋰⒴⋰⋰⒴⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰ ⋰⒠⋰⋰⒦⋰ ⋰⒝⋰⋰⒜⋰⋰⒜⋰⋰⒭⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰⋰⒠⋰ ⋰⒮⋰⋰⒰⋰⋰⒩⋰ ⋰⒟⋰⋰⒪⋰⋰⒮⋰⋰⒯⋰ ⋰⒯⋰⋰⒨⋰⋰⒭⋰",
+        "⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒡⋰ ⋰⒞⋰⋰⒭⋰⋰⒭⋰ ⋰⒟⋰⋰⒰⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰⋰⒠⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒤⋰ ⋰⒤⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰ ⋰⒜⋰⋰⒜⋰",
+        "⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒯⋰⋰⒨⋰⋰⒭⋰ ⋰⒡⋰⋰⒭⋰⋰⒭⋰⋰⒯⋰⋰⒪⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰⋰⒠⋰ ⋰⒤⋰⋰⒟⋰⋰⒜⋰⋰⒭⋰ ⋰⒜⋰⋰⒜⋰⋰⒦⋰⋰⒠⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒧⋰⋰⒠⋰ ⋰⒞⋰⋰⒣⋰⋰⒨⋰⋰⒭⋰",
+        "⋰⒩⋰⋰⒴⋰⋰⒯⋰⋰⒪⋰ ⋰⒜⋰⋰⒠⋰⋰⒮⋰⋰⒠⋰ ⋰⒣⋰⋰⒤⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰⋰⒠⋰ ⋰⒣⋰⋰⒴⋰⋰⒴⋰ ⋰⒜⋰⋰⒤⋰⋰⒮⋰⋰⒠⋰ ⋰⒣⋰⋰⒤⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒧⋰⋰⒠⋰⋰⒩⋰⋰⒜⋰",
+        "⋰⒪⋰⋰⒭⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒧⋰⋰⒠⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒜⋰ ⋰⒪⋰⋰⒭⋰",
+        "⋰⒣⋰⋰⒴⋰⋰⒴⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒪⋰ ⋰⒩⋰⋰⒜⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒪⋰ ⋰⒨⋰⋰⒯⋰ ⋰⒝⋰⋰⒣⋰⋰⒜⋰⋰⒢⋰ ⋰⒥⋰⋰⒜⋰⋰⒪⋰",
+        "⋰⒝⋰⋰⒴⋰⋰⒴⋰⋰⒠⋰⋰⒠⋰ ⋰⒣⋰⋰⒴⋰⋰⒴⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ?",
+        "⋰⒬⋰⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒬⋰ ⋰⒭⋰⋰⒣⋰⋰⒠⋰ ⋰⒣⋰⋰⒪⋰ ?",
+        "⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒠⋰⋰⒴⋰ ⋰⒞⋰⋰⒴⋰⋰⒜⋰ ⋰⒨⋰⋰⒞⋰",
+        "⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰ ⋰⒨⋰⋰⒯⋰",
+        "⋰Ⓙ⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒠⋰⋰⒥⋰",
+        "⋰⒪⋰⋰⒭⋰ ⋰⒝⋰⋰⒟⋰⋰⒜⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰",
+        "⋰⒪⋰⋰⒭⋰ ⋰⒝⋰⋰⒟⋰⋰⒜⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰ ⋰⒦⋰⋰⒤⋰⋰⒟⋰⋰⒟⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒝⋰⋰⒰⋰⋰⒭⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰ ⋰⒦⋰⋰⒠⋰⋰⒠⋰⋰⒟⋰⋰⒠⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒧⋰⋰⒜⋰⋰⒟⋰⋰⒦⋰⋰⒠⋰",
+        "⋰Ⓙ⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒝⋰⋰⒠⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒰⋰",
+        "⋰⒨⋰⋰⒦⋰⋰⒧⋰ ⋰⒰⋰⋰⒯⋰⋰⒣⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒜⋰⋰⒞⋰⋰⒞⋰⋰⒣⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒩⋰⋰⒜⋰⋰⒩⋰⋰⒤⋰ ⋰⒨⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒧⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒥⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒞⋰⋰⒠⋰",
+        "⋰⒪⋰⋰⒴⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒦⋰⋰⒠⋰ ⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒠⋰ ⋰⒨⋰⋰⒭⋰⋰⒠⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒴⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒤⋰⋰⒴⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒢⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒟⋰⋰⒜⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒡⋰⋰⒰⋰⋰⒟⋰⋰⒟⋰⋰⒜⋰",
+        "⋰⒨⋰⋰⒦⋰⋰⒧⋰ ⋰⒰⋰⋰⒯⋰⋰⒣⋰ ⋰⒝⋰⋰⒠⋰⋰⒣⋰⋰⒠⋰⋰⒩⋰⋰⒞⋰⋰⒪⋰⋰⒟⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒤⋰ ⋰⒝⋰⋰⒰⋰⋰⒭⋰ ⋰⒟⋰⋰⒠⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒦⋰⋰⒜⋰ ⋰⒡⋰⋰⒰⋰⋰⒟⋰⋰⒟⋰⋰⒜⋰ ⋰⒨⋰⋰⒠⋰ ⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰⋰⒱⋰⋰⒜⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒠⋰⋰⒯⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰ ⋰⒢⋰⋰⒜⋰⋰⒴⋰⋰⒜⋰",
+        "⋰Ⓙ⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒭⋰ ⋰⒮⋰⋰⒫⋰⋰⒜⋰⋰⒨⋰",
+        "⋰⒨⋰⋰⒞⋰ ⋰⒮⋰⋰⒫⋰⋰⒜⋰⋰⒨⋰ ⋰⒭⋰⋰⒪⋰⋰⒦⋰⋰⒠⋰⋰⒩⋰⋰⒢⋰⋰⒜⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒦⋰⋰⒤⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒮⋰⋰⒫⋰⋰⒜⋰⋰⒨⋰ ⋰⒦⋰⋰⒭⋰",
+        "⋰⒮⋰⋰⒫⋰⋰⒜⋰⋰⒨⋰ ⋰⒦⋰⋰⒭⋰.⋰⒨⋰⋰⒜⋰⋰⒜⋰⋰⒦⋰⋰⒠⋰ ⋰⒧⋰⋰⒪⋰⋰⒟⋰⋰⒠⋰",
+        "⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒠⋰ ⋰⒮⋰⋰⒫⋰⋰⒜⋰⋰⒨⋰ ⋰⒦⋰⋰⒭⋰",
+        "⋰⒮⋰⋰⒫⋰⋰⒜⋰⋰⒨⋰ ⋰⒦⋰⋰⒭⋰ ⋰⒦⋰⋰⒤⋰⋰⒟⋰",
+        "⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒰⋰",
+        "⋰⒭⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒠⋰⋰⒯⋰⋰⒠⋰",
+        "⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰ ⋰Ⓙ⋰⋰⒜⋰⋰⒧⋰⋰⒟⋰⋰⒤⋰ ⋰⒧⋰⋰⒤⋰⋰⒦⋰⋰⒣⋰ ⋰⒲⋰⋰⒭⋰⋰⒩⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰",
+        "⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒢⋰⋰⒜⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰",
+        "⋰⒰⋰⋰⒯⋰⋰⒣⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒴⋰⋰⒦⋰⋰⒠⋰ ⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰",
+        "⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒣⋰⋰⒪⋰ ⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰",
+        "⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰ ⋰⒝⋰⋰⒩⋰⋰⒥⋰⋰⒜⋰ ⋰⒯⋰⋰⒰⋰ ⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰",
+        "⋰⒨⋰⋰⒜⋰⋰⒦⋰⋰⒤⋰⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰",
+        "⋰⒣⋰⋰⒜⋰⋰⒧⋰⋰⒦⋰⋰⒠⋰",
+        "⋰⒞⋰⋰⒰⋰⋰⒟⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒫⋰⋰⒢⋰⋰⒧⋰ ⋰⒩⋰⋰⒴⋰ ⋰⒣⋰⋰⒪⋰ ⋰⒩⋰⋰⒪⋰⋰⒪⋰⋰⒝⋰",
+        "⋰⒨⋰⋰⒜⋰⋰⒦⋰⋰⒤⋰⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒴⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰",
+        "⋰⒨⋰⋰⒜⋰⋰⒦⋰⋰⒤⋰⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒯⋰ ⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒰⋰⋰⒟⋰",
+        "⋰⒯⋰⋰⒠⋰⋰⒭⋰⋰⒤⋰ ⋰⒨⋰⋰⒜⋰⋰⒜⋰ ⋰⒞⋰⋰⒣⋰⋰⒪⋰⋰⒟⋰⋰⒱⋰⋰⒜⋰",
+        "⋰⒭⋰⋰⒜⋰⋰⒩⋰⋰⒟⋰⋰⒤⋰ ⋰⒦⋰⋰⒠⋰ ⋰⒝⋰⋰⒠⋰⋰⒯⋰⋰⒠⋰ ⋰⒨⋰⋰⒜⋰⋰⒭⋰ ⋰⒢⋰⋰⒜⋰⋰⒴⋰⋰⒜⋰",
+        "⋰Ⓓ⋰⋰⒪⋰⋰⒮⋰⋰⒯⋰",
+    ]
+            
+            cs_texts = [
+                    "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇦​ะ ะ🇧​ะะ🇴​ะะ🇸​ะะ🇪​ะะ🇼​ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะะ🇰​ะะ🇪​ะะ🇧​ะะ🇦​ะะ🇨​ะะ🇭​ะะ🇪​ะ, ะ🇹​ะะ🇺​ะ ะ🇧​ะะ🇭​ะะ🇮​ะ ะ🇰​ะะ🇮​ะะ🇸​ะะ🇸​ะะ🇦​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇦​ะะ🇦​ะะ🇯​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ, ะ🇹​ะะ🇺​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇭​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ, ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇧​ะะ🇭​ะะ🇪​ะะ🇳​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ, ะ🇹​ะะ🇺​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ",
+        "ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะ ะ🇯​ะะ🇦​ะ, ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇩​ะะ🇮​ะะ🇩​ะะ🇮​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇮​ะ",
+        "ะ🇸​ะะ🇱​ะะ🇴​ะะ🇼​ะ, ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇮​ะะ🇾​ะะ🇦​ะ ะ🇨​ะะ🇮​ะะ🇴​ะะ🇩​ะะ🇺​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ, ะ🇹​ะะ🇺​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇸​ะะ🇰​ะะ🇹​ะะ🇦​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇰​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ, ะ🇹​ะะ🇲​ะะ🇦​ะ ะ🇨​ะะ🇴​ะะ🇩​ะะ🇺​ะ",
+        "ะ🇸​ะะ🇱​ะะ🇴​ะะ🇼​ะ ะ🇫​ะะ🇮​ะะ🇷​ะะ🇸​ะะ🇪​ะ, ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ",
+        "ะ🇨​ะะ🇺​ะะ🇩​ะะ🇬​ะะ🇷​ะะ🇮​ะะ🇧​ะ, ะ🇹​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะ ะ🇩​ะะ🇴​ะะ🇺​ะ",
+        "ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇨​ะะ🇴​ะะ🇩​ะะ🇺​ะ, ะ🇳​ะะ🇪​ะะ🇹​ะ ะ🇴​ะะ🇳​ะ ะ🇴​ะะ🇫​ะะ🇫​ะ ะ🇼​ะะ🇦​ะะ🇱​ะะ??​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ??​ะ",
+        "ะ🇴​ะะ🇾​ะะ🇪​ะ ะ🇹​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะ ะ🇨​ะะ🇴​ะะ🇩​ะะ🇺​ะ, ะ🇮​ะะ🇩​ะะ🇭​ะะ🇦​ะะ🇷​ะ ะ🇦​ะะ🇦​ะะ🇰​ะะ🇪​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇷​ะะ🇩​ะะ🇺​ะ, ะ🇴​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇰​ะะ🇪​ะ ะ🇱​ะะ🇴​ะะ🇩​ะะ🇪​ะะ🇪​ะ",
+        "ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇪​ะะ🇯​ะ, ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะะ🇺​ะ",
+        "ะ🇸​ะะ🇺​ะะ🇦​ะะ🇷​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇪​ะะ🇯​ะ, ะ🇳​ะะ🇪​ะะ🇹​ะ ะ🇴​ะะ🇫​ะะ🇫​ะ ะ🇴​ะะ🇳​ะ ะ🇰​ะะ🇷​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ ะ🇱​ะะ🇦​ะะ🇩​ะะ🇰​ะะ🇪​ะ",
+        "ะ🇹​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะะ🇸​ะะ🇪​ะ, ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะ ะ🇸​ะะ🇱​ะะ🇴​ะะ🇼​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇭​ะะ🇦​ะะ🇷​ะะ🇨​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇨​ะะ🇴​ะะ🇩​ะะ🇺​ะ ะ🇰​ะะ🇷​ะ ะ🇲​ะะ🇸​ะะ🇬​ะ ะ🇩​ะะ🇪​ะะ🇱​ะะ🇪​ะะ🇹​ะะ🇪​ะ, ะ🇴​ะะ🇮​ะ ะ🇸​ะะ🇺​ะะ🇦​ะะ🇷​ะ ะ🇰​ะะ🇪​ะ ะ🇱​ะะ🇦​ะะ🇩​ะะ🇰​ะะ🇪​ะ",
+        "ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇫​ะะ🇺​ะะ🇫​ะะ🇮​ะ, ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇩​ะะ🇮​ะะ🇩​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇩​ะะ🇮​ะะ🇰​ะะ🇭​ะะ🇦​ะ, ะ🇨​ะะ🇺​ะะ🇩​ะ ะ🇦​ะะ🇧​ะ",
+        "ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ, ะ🇧​ะะ🇭​ะะ🇦​ะะ🇰​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ",
+        "ะ🇨​ะะ🇺​ะะ🇩​ะะ🇱​ะะ🇪​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇷​ะะ🇺​ะ, ะ🇹​ะะ🇲​ะะ🇰​ะะ🇱​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇱​ะะ🇪​ะ ะ🇬​ะะ🇷​ะะ🇮​ะะ🇧​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇧​ะะ🇪​ะะ🇭​ะะ🇪​ะะ🇳​ะ ะ🇻​ะะ🇪​ะะ🇸​ะะ🇮​ะะ🇾​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇮​ะ, ะ🇮​ะะ🇹​ะะ🇳​ะะ🇦​ะ ะ🇬​ะะ🇳​ะะ🇩​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะะ🇦​ะ ะ🇹​ะะ🇺​ะ ะ🇫​ะะ🇮​ะะ🇷​ะะ🇸​ะะ🇪​ะ ะ🇳​ะะ🇪​ะะ🇹​ะ ะ🇴​ะะ🇳​ะ ะ🇴​ะะ🇫​ะะ🇫​ะ",
+        "ะ🇬​ะะ🇷​ะะ🇮​ะะ🇧​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇹​ะะ🇪​ะ, ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇯​ะะ🇦​ะ ะ🇱​ะะ🇴​ะะ🇩​ะะ🇪​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇦​ะะ🇷​ะะ🇺​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇷​ะะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะะ🇦​ะ, ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ, ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇪​ะะ🇾​ะ ะ🇨​ะะ🇵​ะ",
+        "ะ🇨​ะะ🇵​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇪​ะะ🇭​ะะ🇭​ะ, ะ🇨​ะะ🇵​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇱​ะ ะ🇲​ะะ🇪​ะะ🇭​ะ",
+        "ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ, ะ🇦​ะะ🇧​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ",
+        "ะ🇩​ะะ🇴​ะะ🇺​ะะ🇧​ะะ🇱​ะะ🇪​ะ ะ🇸​ะะ🇪​ะะ🇳​ะะ🇩​ะ ะ🇰​ะะ🇴​ะ ะ🇨​ะะ🇵​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇨​ะะ🇴​ะะ🇩​ะะ🇺​ะ, ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇨​ะะ🇴​ะะ🇩​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇦​ะะ🇦​ะะ🇯​ะ ะ🇲​ะะ🇪​ะะ🇭​ะะ🇭​ะ",
+        "ะ🇭​ะะ🇹​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇩​ะะ🇦​ะะ🇱​ะะ🇦​ะะ🇱​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇹​ะะ🇪​ะ., ะ🇷​ะะ🇳​ะะ🇩​ะะ🇾​ะ ะ🇯​ะะ🇱​ะะ🇩​ะะ🇮​ะ ะ🇯​ะะ🇱​ะะ🇩​ะะ🇮​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇶​ะ ะ🇹​ะะ🇷​ะะ🇾​ะะ🇲​ะะ🇦​ะ",
+        "ะ🇵​ะะ🇦​ะะ🇷​ะะ🇦​ะ ะ🇱​ะะ🇮​ะะ🇰​ะะ🇭​ะะ🇪​ะะ🇬​ะะ🇦​ะ.., ะ🇹​ะะ🇷​ะะ🇦​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇭​ะะ🇧​ะะ🇭​ะะ🇦​ะะ🇰​ะ",
+        "ะ🇱​ะะ🇦​ะะ🇬​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะ ะ🇱​ะะ🇦​ะะ🇩​ะะ🇨​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ, ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇱​ะะ🇦​ะะ🇬​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇹​ะะ🇪​ะ..",
+        "ะ🇨​ะะ🇺​ะะ🇩​ะะ🇰​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ, ะ🇧​ะะ🇭​ะะ🇮​ะะ🇰​ะะ🇦​ะะ🇷​ะะ🇮​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ??​ะ ะ🇲​ะะ🇪​ะะ🇷​ะะ🇦​ะ.",
+        "ะ🇱​ะะ🇴​ะะ🇼​ะ ะ🇱​ะะ🇪​ะะ🇻​ะะ🇪​ะะ🇱​ะ ะ🇨​ะะ🇵​ะ ะ🇨​ะะ🇷​ะ, ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇱​ะะ🇴​ะะ🇼​ะ ะ🇱​ะะ🇪​ะะ🇻​ะะ🇪​ะะ🇱​ะ ะ🇼​ะะ🇪​ะะ🇦​ะะ🇰​ะ",
+        "ะ🇲​ะะ🇪​ะะ🇷​ะะ🇪​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ ะ🇵​ะะ🇪​ะ ะ🇪​ะะ🇾​ะ ะ🇹​ะะ🇺​ะ ะ🇭​ะะ🇮​ะะ🇯​ะะ🇩​ะะ🇪​ะ, ะ🇫​ะะ🇷​ะะ🇪​ะะ🇪​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇼​ะะ🇦​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇴​ะ",
+        "ะ🇫​ะะ🇷​ะะ🇪​ะะ🇪​ะ ะ🇲​ะะ🇪​ะะ🇾​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ ะ🇹​ะะ🇺​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ, ะ🇹​ะะ🇺​ะ ะ🇧​ะะ🇭​ะะ🇮​ะ ะ🇰​ะะ🇮​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇭​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇨​ะะ🇱​ะะ🇦​ะะ🇮​ะะ🇲​ะ ะ🇨​ะะ🇷​ะะ🇼​ะะ🇦​ะ, ะ🇹​ะะ🇺​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇮​ะ ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇸​ะะ🇰​ะะ🇹​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇧​ะะ🇭​ะะ🇪​ะะ🇳​ะ ะ🇻​ะะ🇪​ะะ🇸​ะะ🇮​ะะ🇾​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇮​ะ, ะ??​ะะ🇺​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇨​ะะ??​ะะ🇺​ะะ🇩​ะ ะ🇯​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇩​ะะ🇮​ะะ🇩​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะะ🇮​ะ, ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇩​ะะ🇮​ะะ🇰​ะะ🇭​ะะ🇦​ะ",
+        "ะ🇨​ะะ🇺​ะะ🇩​ะ ะ🇦​ะะ🇧​ะ, ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇰​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ, ะ🇨​ะะ🇺​ะะ🇩​ะะ🇱​ะะ🇪​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇷​ะะ🇺​ะ",
+        "ะ🇹​ะะ🇲​ะะ🇰​ะะ🇱​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇱​ะะ🇪​ะ ะ🇬​ะะ🇷​ะะ🇮​ะะ🇧​ะ, ะ🇹​ะะ🇪​ะะ??​ะะ🇾​ะ ะ🇧​ะะ🇪​ะะ🇭​ะะ🇪​ะะ🇳​ะ ะ🇻​ะะ🇪​ะะ🇸​ะะ🇮​ะะ🇾​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇮​ะ",
+        "ะ🇮​ะะ🇹​ะะ🇳​ะะ🇦​ะ ะ🇬​ะะ🇳​ะะ🇩​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะะ🇦​ะ ะ🇹​ะะ🇺​ะ ะ🇫​ะะ🇮​ะะ🇷​ะะ🇸​ะะ🇪​ะ ะ🇳​ะะ🇪​ะะ🇹​ะ ะ🇴​ะะ🇳​ะ ะ🇴​ะะ🇫​ะะ🇫​ะ, ะ🇬​ะะ🇷​ะะ🇮​ะะ🇧​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇹​ะะ🇪​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇯​ะะ🇦​ะ ะ🇱​ะะ🇴​ะะ🇩​ะะ🇪​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇦​ะะ🇷​ะะ🇺​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ, ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇷​ะะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ, ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ",
+        "ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇪​ะะ🇾​ะ ะ🇨​ะะ🇵​ะ, ะ🇨​ะะ🇵​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇪​ะะ🇭​ะะ🇭​ะ",
+        "ะ🇨​ะะ🇵​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇱​ะ ะ🇲​ะะ🇪​ะะ🇭​ะ, ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ",
+        "ะ??​ะะ🇧​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ, ะ🇩​ะะ🇴​ะะ🇺​ะะ🇧​ะะ🇱​ะะ🇪​ะ ะ🇸​ะะ🇪​ะะ🇳​ะะ🇩​ะ ะ🇰​ะะ🇴​ะ ะ🇨​ะะ🇵​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ ะ🇨​ะะ🇴​ะะ🇩​ะะ🇺​ะ",
+        "ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇲​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇨​ะะ🇴​ะะ🇩​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇦​ะะ🇦​ะะ🇯​ะ ะ🇲​ะะ🇪​ะะ🇭​ะะ🇭​ะ, ะ🇭​ะะ🇹​ะ ะ🇹​ะะ🇧​ะะ🇰​ะะ🇨​ะ ะ🇩​ะะ🇦​ะะ🇱​ะะ🇦​ะะ🇱​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇹​ะะ🇪​ะ.",
+        "ะ🇷​ะะ🇳​ะะ🇩​ะะ🇾​ะ ะ🇯​ะะ🇱​ะะ🇩​ะะ🇮​ะ ะ🇯​ะะ🇱​ะะ🇩​ะะ🇮​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇶​ะ ะ🇹​ะะ🇷​ะะ🇾​ะะ🇲​ะะ🇦​ะ, ะ🇵​ะะ🇦​ะะ🇷​ะะ🇦​ะ ะ🇱​ะะ🇮​ะะ🇰​ะะ🇭​ะะ🇪​ะะ🇬​ะะ🇦​ะ..",
+        "ะ🇹​ะะ🇷​ะะ🇦​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇭​ะะ🇧​ะะ🇭​ะะ🇦​ะะ🇰​ะ, ะ🇱​ะะ🇦​ะะ🇬​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะ ะ🇱​ะะ🇦​ะะ🇩​ะะ🇨​ะะ🇪​ะ ะ??​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ",
+        "ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇱​ะะ🇦​ะะ🇬​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะะ🇹​ะะ🇪​ะ.., ะ🇨​ะะ🇺​ะะ🇩​ะะ🇰​ะะ🇪​ะ ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ",
+        "ะ🇧​ะะ🇭​ะะ🇮​ะะ🇰​ะะ🇦​ะะ🇷​ะะ🇮​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇸​ะ ะ🇲​ะะ🇪​ะะ🇷​ะะ🇦​ะ., ะ🇱​ะะ🇴​ะะ🇼​ะ ะ🇱​ะะ🇪​ะะ🇻​ะะ🇪​ะะ🇱​ะ ะ🇨​ะะ🇵​ะ ะ🇨​ะะ🇷​ะ",
+        "ะ🇨​ะะ🇵​ะ ะ🇧​ะะ🇴​ะะ🇱​ะ ะ🇱​ะะ🇴​ะะ🇼​ะ ะ🇱​ะะ🇪​ะะ🇻​ะะ🇪​ะะ🇱​ะ ะ🇼​ะะ🇪​ะะ🇦​ะะ🇰​ะ, ะ🇲​ะะ🇪​ะะ🇷​ะะ🇪​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ ะ🇵​ะะ🇪​ะ ะ🇪​ะะ🇾​ะ ะ🇹​ะะ🇺​ะ ะ🇭​ะะ🇮​ะะ🇯​ะะ🇩​ะะ🇪​ะ",
+        "ะ🇫​ะะ🇷​ะะ🇪​ะะ🇪​ะ ะ🇨​ะะ🇺​ะะ🇩​ะะ🇼​ะะ🇦​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇴​ะ, ะ🇫​ะะ🇷​ะะ🇪​ะะ🇪​ะ ะ🇲​ะะ🇪​ะะ🇾​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ ะ🇹​ะะ🇺​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇾​ะะ🇰​ะะ🇪​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇨​ะะ🇱​ะะ🇦​ะะ🇮​ะะ🇲​ะ ะ🇨​ะะ🇷​ะะ🇼​ะะ🇦​ะ, ะ🇹​ะะ🇺​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇮​ะ ะ🇧​ะะ🇭​ะะ🇦​ะะ🇬​ะ ะ🇸​ะะ🇰​ะะ🇹​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇧​ะะ🇭​ะะ🇪​ะะ🇳​ะ ะ🇻​ะะ🇪​ะะ🇸​ะะ🇮​ะะ🇾​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇳​ะะ🇩​ะะ🇮​ะ, ะ🇹​ะะ🇺​ะ ะ🇰​ะะ🇾​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะ ะ🇯​ะะ🇦​ะ"
+        "ะ🇯ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇱ะะ🇮ะะ🇰ะะ🇭ะ ะ🇷ะะ🇳ะะ🇩ะะ🇾ะะ🇰ะะ🇪ะ ะ🇧ะะ🇪ะะ🇯ะ",
+        "ะ🇴ะะ🇷ะ ะ🇧ะะ🇩ะะ🇦ะ ะ🇱ะะ🇮ะะ🇰ะะ🇭ะ",
+        "ะ🇴ะะ🇷ะ ะ🇧ะะ🇩ะะ🇦ะ",
+        "ะ🇴ะะ🇷ะ ะ🇧ะะ🇩ะะ🇦ะ ะ🇴ะะ🇾ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇰ะะ🇦ะ ะ🇧ะะ🇺ะะ🇷ะ",
+        "ะ🇴ะะ🇾ะะ🇪ะ ะ🇰ะะ🇪ะะ🇩ะะ🇪ะ",
+        "ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇦ะะ🇩ะะ🇰ะะ🇪ะ",
+        "ะ🇯ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇱ะะ🇮ะะ🇰ะะ🇭ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะะ🇳ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ",
+        "ะ🇲ะะ🇰ะะ🇱ะ ะ??ะะ🇹ะะ🇭ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇨ะะ🇨ะะ🇭ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇳ะะ🇦ะะ🇳ะะ🇮ะ ะ🇲ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇱ะ",
+        "ะ🇹ะะ🇪ะะ🇯ะ ะ🇱ะะ🇮ะะ🇰ะะ🇭ะ ะ🇷ะะ🇳ะะ🇩ะะ🇨ะะ🇪ะ",
+        "ะ🇴ะะ🇾ะะ🇪ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇪ะ ะ🇱ะะ🇴ะะ🇩ะะ🇪ะ ะ🇲ะะ🇷ะะ🇪ะะ🇳ะะ🇬ะะ🇦ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇾ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇮ะะ🇾ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇬ะะ🇦ะะ🇳ะะ🇩ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇩ะะ🇦ะะ🇩ะะ🇮ะ ะ🇰ะะ🇦ะ ะ🇫ะะ🇺ะะ🇩ะะ🇩ะะ🇦ะ",
+        "ะ🇲ะะ🇰ะะ🇱ะ ะ🇺ะะ🇹ะะ🇭ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะะ🇳ะะ🇨ะะ🇴ะะ🇩ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ??ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇧ะะ🇺ะะ🇷ะ ะ🇩ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇰ะะ🇦ะ ะ🇫ะะ🇺ะะ🇩ะะ🇩ะะ🇦ะ ะ🇲ะะ🇪ะ ะ🇱ะะ🇦ะะ🇺ะะ🇩ะะ🇦ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇨ะะ🇭ะะ🇺ะะ🇩ะะ🇻ะะ🇦ะ",
+        "ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇪ะะ🇹ะะ🇪ะ ะ🇲ะะ🇦ะะ🇷ะ ะ🇬ะะ🇦ะะ🇾ะะ🇦ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ ะ🇲ะะ🇷ะะ🇺ะ",
+        "ะ🇯ะะ🇦ะะ🇱ะะ🇮ะะ🇩ะ ะ🇰ะะ🇷ะ ะ🇸ะะ🇵ะะ🇦ะะ🇲ะ",
+        "ะ🇲ะะ🇨ะ ะ🇸ะะ🇵ะะ🇦ะะ🇲ะ ะ🇷ะะ🇴ะะ🇰ะะ🇪ะะ🇳ะะ🇬ะะ🇦ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ ะ🇸ะะ🇵ะะ🇦ะะ🇲ะ ะ🇰ะะ🇷ะ",
+        "ะ🇸ะะ🇵ะะ🇦ะะ🇲ะ ะ🇰ะะ🇷ะ.ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇪ะ ะ🇱ะะ🇴ะะ🇩ะะ🇪ะ",
+        "ะ🇷ะะ🇳ะะ🇮ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇪ะ ะ🇸ะะ🇵ะะ🇦ะะ🇲ะ ะ🇰ะะ🇷ะ",
+        "ะ🇸ะะ🇵ะะ🇦ะะ🇲ะ ะ🇰ะะ🇷ะ ะ🇰ะะ🇮ะะ🇩ะ",
+        "ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ",
+        "ะ🇷ะะ🇳ะะ🇩ะะ🇮ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇪ะะ🇹ะะ🇪ะ",
+        "ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ ะ??ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇱ะะ🇮ะะ🇰ะะ🇭ะ ะ🇼ะะ🇷ะะ🇳ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะ",
+        "ะ🇨ะะ🇺ะะ🇩ะ ะ🇬ะะ🇦ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ",
+        "ะ🇺ะะ🇹ะะ🇭ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇾ะะ🇰ะะ🇪ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ",
+        "ะ🇨ะะ🇭ะะ🇱ะ ะ🇨ะะ🇺ะะ🇩ะะ🇰ะะ🇪ะ ะ🇩ะะ🇮ะะ🇰ะะ🇭ะะ🇦ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ",
+        "ะ🇯ะะ🇱ะะ🇩ะะ🇮ะ ะ🇹ะะ🇾ะะ🇵ะ ะ🇨ะะ🇷ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ ะ🇭ะะ🇦ะะ🇱ะะ🇰ะะ🇪ะ",
+        "ะ🇨ะะ🇺ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇬ะะ🇱ะ ะ🇳ะะ🇾ะ ะ🇭ะะ🇴ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ",
+        "ะ🇨ะะ🇺ะะ🇩ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะ ะ🇧ะะ🇳ะะ🇯ะะ🇦ะ ะ🇹ะะ🇺ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ",
+        "ะ🇲ะะ🇦ะะ🇰ะะ🇮ะะ🇨ะะ🇭ะะ🇺ะะ🇹ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇳ะะ🇴ะะ🇴ะะ🇧ะ",
+        "ะ🇬ะะ🇦ะะ🇳ะะ🇩ะะ🇦ะ ะ🇨ะะ🇾ะะ🇺ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇷ะะ🇭ะะ🇦ะ ะ🇹ะะ🇺ะ ?",
+        "ะ🇮ะะ🇹ะะ🇳ะะ🇦ะ ะ🇬ะะ🇳ะะ🇩ะะ🇦ะ ะ🇳ะะ🇾ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇦ะะ🇨ะะ🇭ะะ🇪ะ ะ🇸ะะ🇪ะ ะ🇨ะะ🇺ะะ🇩ะ",
+        "ะ🇲ะะ🇦ะะ🇦ะ⍟ ะ🇱ะะ🇪ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇬ะะ🇾ะะ🇦ะ ะ🇹ะะ🇺ะ ะ🇸ะะ🇺ะ⍟ ะ🇧ะะ🇦ะะ🇹ะ ะ🇦ะะ🇧",
+        "ะ🇲ะะ🇦ะะ🇰ะะ🇦ะะ🇫ะะ🇺ะะ🇩ะะ🇩ะะ🇦ะ ะ🇫ะะ🇦ะะ🇹ะ ะ🇬ะะ🇾ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇷ะะ🇺ะะ🇰ะ",
+        "ะ🇸ะะ🇭ะะ🇦ะะ🇳ะะ🇹ะ ะ🇧ะะ🇪ะะ🇹ะะ🇭ะ ะ🇲ะะ🇦ะะ🇩ะะ🇷ะะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇼ะะ🇷ะะ🇳ะะ🇦ะ ะ🇲ะะ🇦ะะ🇰ะะ🇦ะะ🇧ะะ🇴ะะ🇸ะะ🇩ะะ🇦ะ ะ🇹ะะ🇪ะะ🇪ะะ🇾ะ.",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ..",
+        "ะ🇱ะะ🇼ะะ🇩ะะ🇪ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇦ะะ🇱ะะ🇱ะะ🇱ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇨ะะ🇺ะะ🇩ะะ🇰ะะ🇪ะ ะ🇵ะะ🇬ะะ🇱ะ ะ🇩ะะ🇪ะะ🇰ะะ🇭ะ.",
+        "ะ🇲ะะ🇦ะะ🇨ะะ🇭ะะ🇦ะะ🇷ะ ะ🇰ะะ🇮ะ ะ🇯ะะ🇭ะะ🇦ะะ🇦ะะ🇹ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇱ะะ🇱ะะ🇱ะะ🇱ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇦ะะ🇨ะะ🇭ะะ🇪ะ ะ🇸ะะ🇪ะ ะ🇾ะะ🇭ะะ🇦ะะ🇵ะะ🇪ะ ะ🇹ะะ🇺ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ ะ🇲ะ ะ🇩ะะ🇺ะ ะ🇹ะะ🇦ะะ🇵ะะ🇦ะ ะ🇹ะะ🇦ะะ🇵ะ?",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇦ะ ะ🇧ะะ🇭ะะ🇴ะꜱะะ🇩ะะ🇦ะะ??ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇭ะะ🇳ะ ꜱะ🇧ะꜱะ🇧ะะ🇪ะ ะ🇧ะะ🇩ะะ🇮ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ.",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇴ะꜱะꜱะะ🇪ะ ะ🇧ะะ🇦ะะ🇩ะะ🇮ะ ะ??ะะ🇦ะะ🇳ะะ🇩ะะ🇩ะะ🇩ะะ🇩ะะ🇩ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇦ะ ะ🇧ะะ🇦ะะ🇦ะะ🇵ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇧ะะ🇦ะะ🇦ะะ🇿ะ ะ🇪ะะ🇾ะ ะ🇩ะะ🇪ะะ🇰ะะ🇭ะ",
+        "ะ🇰ะะ🇮ะะ🇹ะะ🇳ะะ🇮ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇦ะะ🇧ะ ะ🇴ะะ🇷..",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇮ะ ะ🇭ะะ🇲ะ ะ🇳ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇪ะ ꜱะ🇹ะะ🇭ะ ะ🇷ะะ🇪ะะ🇪ะะ🇱ะꜱะ ะ🇧ะะ🇳ะะ🇪ะะ🇬ะะ🇦ะ ะ🇷ะะ🇴ะะ🇦ะะ🇩ะ ะ🇵ะะ🇪ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ ะ🇪ะะ🇰ะ ะ🇩ะะ🇦ะะ🇲ะ ะ🇹ะะ🇴ะะ🇵ะ ꜱะ🇪ะxะ🇾ะ",
+        "ะ🇲ะะ🇦ะะ🇱ะะ🇺ะ🇲ะ ะ🇳ะะ🇦ะ ะ🇵ะะ🇭ะ🇷ะ ะ🇰ะะ🇪ꜱะะ🇪ะ ะ🇱ะะ🇪ะะ🇹ะะ🇦ะ ะ🇭ะะ🇺ะ ะ🇲ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ ะ🇹ะะ🇦ะะ🇵ะะ🇦ะ ะ🇹ะะ🇦ะะ🇵ะะ🇵ะะ🇵ะะ🇵ะะ🇵ะ",
+        "ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇪ะ ะ🇹ะะ🇺ะ ะ🇰ะะ🇪ะะ🇷ะะ🇪ะะ🇬ะะ🇦ะ ะ🇹ะะ🇾ะะ🇵ะะ🇮ะะ🇳ะะ🇬ะ ะ🇰ะะ🇷ะะ🇪ะะ🇬ะะ🇦ะ ะ🇹ะะ🇲ะะ🇰ะะ🇨ะ",
+        "ꜱะ🇵ะะ🇪ะะ🇪ะะ🇩ะ ะ🇵ะะ🇰ะะ🇩ะ ะ🇱ะะ🇼ะะ🇩ะะ🇪ะะ🇪ะะ🇪ะะ🇪ะ ะ🇼ะะ🇷ะะ🇳ะะ🇦ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇵ะะ🇰ะะ🇩ะ",
+        "ะ🇧ะะ🇦ะะ🇦ะะ🇵ะ ะ🇰ะะ🇮ะ ꜱะ🇵ะะ🇪ะะ🇪ะะ🇩ะ ะ🇲ะะ🇹ะะ🇨ะะ🇭ะ ะ🇰ะะ🇷ะะ🇷ะะ🇷ะ",
+        "ะ🇱ะะ🇼ะะ🇩ะะ🇦ะ ะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇯ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇸ะะ🇪ะ ะ🇹ะะ🇺ะ",
+        "ะ🇵ะะ🇦ะะ🇵ะะ🇦ะ ะ🇰ะะ🇮ะ ꜱะ🇵ะะ🇪ะะ🇪ะะ🇩ะ ะ🇲ะะ🇹ะะ🇨ะะ🇭ะ ะ🇳ะะ🇭ะะ🇮ะ ะ🇭ะะ🇴ะ ะ🇷ะะ🇭ะะ🇮ะ ะ🇰ะะ🇾ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇪ะะ🇸ะะ🇪ะ",
+        "ะ🇦ะะ🇱ะะ🇪ะ ะ🇦ะะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะะ🇱ะะ🇦ะ ะ🇧ะะ🇨ะะ🇭ะะ🇦ะะ🇦ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะะ🇰ะะ🇦ะ ะ🇧ะะ🇴ะะ🇸ะะ🇩ะะ🇦ะ ะ🇸ะะ🇺ะะ🇳ะ",
+        "ะ🇨ะะ🇭ะะ🇺ะะ🇩ะ ะ🇬ะะ🇾ะะ🇦ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇧ะะ🇦ะะ🇦ะะ🇿ะ ะ🇵ะะ🇦ะะ🇵ะะ🇦ะ ꜱะ🇪ะะ🇪ะะ🇪ะ ะ🇹ะะ🇺ะ",
+        "ะ🇲ะะ🇪ะะ🇳ะะ🇺ะ ะ🇰ะะ🇮ะ ะ🇵ะะ🇹ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇬ะะ🇦ะะ🇮ะ",
+        "ะ🇰ะะ🇴ะะ🇮ะ ะ🇧ะะ🇦ะะ🇦ะะ🇹ะ ะ🇳ะะ🇾ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇾ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ",
+        "ะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะ ะ🇲ะะ🇦ะะ🇰ะะ🇦ะะ🇧ะะ🇴ะะ🇸ะะ🇩ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ",
+        "ะ🇽ะะ🇭ะะ🇺ะะ🇩ะ ะ🇬ะะ🇦ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇰ะะ🇮ะะ🇩ะꜱะꜱะꜱะꜱะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇨ะะ🇭ะะ🇺ะะ🇩ะ ะ🇬ะะ🇾ะะ🇮ะ ะ🇦ะะ🇧ะ ꜰะ🇷ะะ🇦ะ🇷ะ ะ🇲ะะ🇹ะ ะ🇭ะะ🇴ะะ🇳ะะ🇦ะ",
+        "ะ🇾ะะ🇪ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇨ะะ🇭ะะ🇱ะ ะ🇯ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇸ะะ🇪ะ",
+        "ะ🇰ะะ🇮ะะ🇩ะꜱะꜱะꜱะ ꜰะ🇷ะะ🇦ะ🇷ะ ะ🇳ะะ🇦ะ ะ🇭ะะ🇴ะ ะ🇹ะะ🇺ะ ะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇭ะ",
+        "ะ🇧ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇼ะะ🇩ะะ🇪ะ ꜱะ🇭ะ🇷ะ🇲ะ ะ🇰ะะ🇷ะ",
+        "ะ🇰ะะ🇮ะะ🇹ะะ🇳ะะ🇮ะ ะ🇬ะะ🇱ะะ🇮ะะ🇾ะะ🇦ะ ะ🇵ะะ🇩ะะ🇼ะะ🇪ะะ🇬ะะ🇦ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇴ะ",
+        "ะ🇨ะะ🇭ะะ🇺ะะ🇵ะ ะ🇳ะะ🇦ะะ🇱ะะ🇱ะะ🇮ะะ🇮ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇾ะะ🇰ะะ🇪ะ ะ🇱ะะ🇦ะะ🇩ะะ🇰ะะ🇪ะ",
+        "ꜱะ🇺ะะ🇦ะ🇷ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ꜱะ🇦ะะ🇩ะะ🇦ะ🇰ะ ะ🇵ะ🇷ะ ะ🇱ะะ🇮ะะ🇹ะะ🇦ะะ🇰ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ 😂😆🤤",
+        "ะ🇦ะะ🇧ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇦ะ ะ🇧ะะ🇭ะะ🇴ꜱะะ🇩ะะ🇦ะ ะ🇲ะะ🇦ะะ🇩ะะ🇪ะ🇷ะะ🇨ะะ🇭ะะ🇴ะะ🇴ะะ🇩ะ ะ🇰ะ🇷ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ ะ🇵ะะ🇦ะะ🇵ะะ🇦ะ ꜱะ🇪ะ ะ🇱ะะ🇦ะะ🇩ะะ🇪ะะ🇬ะะ🇦ะ ะ🇹ะะ🇺ะ 😼😂🤤",
+        "ะ🇬ะะ🇦ะะ🇱ะะ🇮ะ ะ🇬ะะ🇦ะะ🇱ะะ🇮ะ ะ🇳ะะ🇪ะ ꜱะ🇭ะ🇴ะ🇷ะ ะ🇭ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇨ะะ🇭ะะ🇴ะ🇷ะ ะ🇭ะะ🇪ะ 💋💋💦",
+        "ะ🇦ะะ🇧ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ ะ🇰ะะ🇺ะะ🇹ะะ🇹ะะ🇪ะ ะ🇰ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇪ะ 😂👻🔥",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇦ะะ🇮ꜱะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇦ะ ะ🇦ะะ🇮ꜱะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇦ะ ะ🇧ะะ🇪ะะ🇩ะ ะ🇵ะะ🇪ะะ🇭ะะ🇮ะ ะ🇲ะะ🇺ะะ🇹ะะ🇭ะ ะ🇩ะะ🇮ะะ🇦ะ 💦💦💦💦",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇭ะะ🇴ꜱะะ🇩ะะ🇪ะ ะ🇲ะะ🇪ะ ะ🇦ะะ🇦ะะ🇦ะ🇬ะ ะ🇱ะะ🇦ะะ🇬ะะ🇦ะะ🇩ะะ🇮ะะ🇦ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇲ะะ🇴ะะ🇹ะะ🇦ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇩ะะ🇦ะะ🇱ะะ🇰ะะ🇪ะ 🔥🔥💦😆😆",
+        "ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇨ะะ🇭ะะ🇭ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ ะ🇨ะะ🇭ะะ🇦ะะ🇱ะ ะ🇳ะะ🇮ะะ🇰ะะ🇦ะะ🇱ะ",
+        "ะ🇰ะะ🇮ะะ🇹ะะ🇳ะะ🇦ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇦ะะ🇧ะะ🇧ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะ ะ🇧ะะ🇭ะะ🇪ะะ🇯ะ 😆👻🤤",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะะ🇹ะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇰ะะ🇪ะ ะ🇵ะะ🇺ะะ🇷ะะ🇦ะ ꜰะ🇦ะะ🇦ะะ🇩ะ ะ🇩ะะ🇮ะะ🇦ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇦ะะ🇧ะะ🇧ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇬ะꜰะ ะ🇰ะะ🇴ะ ะ🇧ะะ🇭ะะ🇪ะะ🇯ะ 😆💦🤤",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇬ะꜰะ ะ🇰ะะ🇴ะ ะ🇪ะะ🇹ะะ🇳ะะ🇦ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇦ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇴ะะ🇩ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇬ะꜰะ ะ🇹ะะ🇴ะ ะ🇲ะะ🇪ะะ🇷ะะ🇮ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇧ะะ🇦ะะ🇳ะะ🇬ะะ🇦ะะ🇾ะะ🇮ะ ะ🇦ะะ🇧ะะ🇧ะ ะ🇨ะะ🇭ะะ🇦ะะ🇱ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇹ะะ🇦ะ ꜰะ🇮ะ🇷ꜱะะ🇪ะ ♥️💦😆😆😆😆",
+        "ะ🇭ะะ🇦ะะ🇷ะะ🇮ะ ะ🇭ะะ🇦ะะ🇷ะะ🇮ะ ะ🇬ะะ🇭ะะ🇦ะะ🇦ꜱะ ะ🇲ะะ🇪ะ ะ🇯ะะ🇭ะะ🇴ะะ🇵ะะ🇩ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇦ะ ะ🇧ะะ🇭ะะ🇴ꜱะะ🇩ะะ🇦ะ 🤣🤣💋💦",
+        "ะ🇨ะะ🇭ะะ🇦ะะ🇱ะ ะ🇹ะะ🇪ะะ🇷ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇵ะ ะ🇰ะะ🇴ะ ะ🇧ะะ🇭ะะ🇪ะะ🇯ะ ะ🇹ะะ🇪ะะ🇷ะะ🇦ะ ะ🇧ะะ🇦ꜱะะ🇰ะะ🇦ะ ะ🇳ะะ🇭ะะ🇮ะ ะ🇭ะะ🇪ะ ะ🇵ะะ🇦ะะ🇵ะะ🇦ะ ꜱะ🇪ะ ะ🇱ะะ🇦ะะ🇩ะะ🇪ะะ🇬ะะ🇦ะ ะ🇹ะะ🇺ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇲ะะ🇪ะ ะ🇧ะะ🇴ะะ🇲ะ🇧ะ ะ🇩ะะ🇦ะะ🇱ะะ🇰ะะ🇪ะ ะ🇺ะะ🇩ะะ🇦ะ ะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇪ะ ะ🇱ะะ🇦ะะ🇼ะะ🇩ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇹ะะ🇷ะะ🇦ะะ🇮ะ🇳ะ ะ🇲ะะ🇪ะ ะ🇱ะะ🇪ะะ🇯ะะ🇦ะะ🇰ะะ🇪ะ ะ🇹ะะ🇴ะะ🇵ะ ะ🇧ะะ🇪ะะ🇩ะ ะ🇵ะะ🇪ะ ะ🇱ะะ🇮ะะ🇹ะะ🇦ะะ🇰ะะ🇪ะ ะ🇨ะะ??ะะ🇴ะะ🇩ะ ะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ꜱะ🇺ะะ🇦ะ🇷ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ 🤣🤣💋💋",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇪ะ ะ🇳ะะ🇺ะะ🇩ะะ🇪ꜱะ ะ🇬ะะ🇴ะะ🇴ะ🇬ะ🇱ะะ🇪ะ ะ🇵ะะ🇪ะ ะ🇺ะะ🇵ะะ🇱ะะ🇴ะะ🇦ะ🇩ะ ะ🇰ะะ🇦ะ🇷ะะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇦ะะ🇪ะะ🇼ะะ🇩ะะ🇪ะ 👻🔥",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇪ะ ะ🇳ะะ🇺ะะ🇩ะะ🇪ꜱะ ะ🇬ะะ🇴ะะ🇴ะ🇬ะ🇱ะะ🇪ะ ะ🇵ะะ🇪ะ ะ🇺ะะ🇵ะะ🇱ะะ🇴ะะ🇦ะ🇩ะ ะ🇰ะะ🇦ะ🇷ะะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇦ะะ🇪ะะ🇼ะะ🇩ะะ🇪ะ 👻🔥",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇰ะะ🇪ะ ะ🇻ะะ🇮ะะ🇩ะะ🇪ะ🇴ะ ะ🇧ะะ🇦ะะ🇳ะะ🇦ะะ🇰ะะ🇪ะ ะ🇽ะ🇳🇽🇽.🇨🇴🇲 ะ🇵ะะ🇪ะ ะ🇳ะะ🇪ะะ🇪ะะ🇱ะะ🇦ะ🇲ะ ะ🇰ะะ🇦ะ🇷ะะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇰ะะ🇺ะะ🇹ะะ🇹ะะ🇪ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ 💦💋",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇩ะะ🇦ะะ🇮ะ ะ🇰ะะ🇴ะ ะ🇵ะ🇴🇷🇳🇭🇺🇧.🇨🇴🇲 ะ🇵ะะ🇪ะ ะ🇺ะะ🇵ะะ🇱ะะ🇴ะะ🇦ะ🇩ะ ะ🇰ะะ🇦ะ🇷ะะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ꜱะ🇺ะะ🇦ะ🇷ะ ะ🇰ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇪ะ 🤣💋💦",
+        "ะ🇦ะะ🇧ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇨ะะ🇭ะะ🇭ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇪ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇦ะะ🇰ะะ🇰ะ🇴ะ ꜱะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇼ะะ🇦ะะ🇻ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇨ะะ🇭ะะ🇭ะะ🇪ะ 🤣🤣",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ꜰะะ🇦ะะ🇦ะะ🇩ะะ🇰ะะ🇪ะ ะ🇷ะะ🇦ะะ🇰ะะ🇩ะะ🇮ะะ🇦ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇪ะ ะ🇱ะะ🇴ะะ🇩ะะ🇪ะ ะ🇯ะะ🇦ะะ🇦ะ ะ🇦ะะ🇧ะะ🇧ะ ꜱะะ🇮ะะ🇱ะะ🇼ะะ🇦ะะ🇱ะะ🇪ะ 👄👄",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇲ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇰ะะ🇦ะะ🇦ะะ🇱ะะ🇦ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇱ะะ🇪ะะ🇹ะะ🇮ะ ะ🇲ะะ🇪ะะ🇷ะะ🇮ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇧ะะ🇦ะะ🇩ะะ🇪ะ ะ🇲ะะ🇦ꜱะะ🇹ะะ🇮ะ ꜱะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะ ะ🇲ะะ🇪ะะ🇳ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇦ะะ🇱ะะ🇦ะ ะ🇧ะะ🇴ะะ🇭ะะ🇴ะะ🇹ะ ꜱะะ🇦ꜱะะ🇹ะะ🇪ะ ꜱะะ🇪ะ",
+        "ะ🇧ะะ🇪ะะ🇹ะะ🇪ะ ะ🇹ะะ🇺ะ ะ🇧ะะ🇦ะะ🇦ะะ🇵ะ ꜱะะ🇪ะ ะ🇱ะะ🇪ะะ🇬ะะ🇦ะ ะ🇵ะะ🇦ะะ🇳ะะ🇬ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇦ะ ะ🇰ะะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇰ะะ🇦ะ🇷ะะ🇰ะะ🇪ะ ะ🇳ะะ🇦ะะ🇳ะะ🇬ะะ🇦ะ 💦💋",
+        "ะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะ ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ ะ🇧ะะ🇪ะะ🇹ะะ🇪ะ ะ🇦ะะ🇬ะะ🇱ะะ🇮ะ ะ🇧ะะ🇦ะะ🇦ะ🇷ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇱ะะ🇪ะะ🇰ะะ🇪ะ ะ🇦ะะ🇦ะะ🇾ะะ🇦ะ ะ🇲ะะ🇦ะะ🇹ะะ🇭ะ ะ🇰ะะ🇦ะะ🇹ะ ะ🇴ะ🇷ะ ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ ะ🇲ะะ🇴ะะ🇹ะะ🇪ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ꜱะะ🇪ะ ะ🇨ะะ🇭ะะ🇺ะะ🇩ะะ🇼ะะ🇦ะะ🇾ะะ🇦ะ ะ🇲ะะ🇦ะะ🇹ะะ🇭ะ ะ🇰ะะ🇦ะ🇷ะ",
+        "ะ🇨ะะ🇭ะะ🇦ะะ🇱ะ ะ🇧ะะ🇪ะะ🇹ะะ🇦ะ ะ🇹ะะ🇺ะะ🇯ะะ🇭ะะ🇪ะ ะ🇲ะะ🇦ะะ🇦ꜱะ🇫ะ ะ🇰ะะ🇮ะะ🇦ะ 🤣ะ🇹ะะ🇺ะ ะ🇦ะะ🇧ะะ🇧ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะะ🇰ะ🇴ะ ะ🇧ะะ🇭ะะ🇪ะะ🇯ะ",
+        "ꜱะ🇭ะะ🇦ะะ🇷ะะ🇦ะ🇲ะ ะ🇰ะะ🇦ะ🇷ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇦ะ ะ🇧ะะ🇭ะะ🇴ꜱะะ🇩ะะ🇦ะ ะ🇰ะะ🇮ะะ🇹ะะ🇳ะะ🇦ะ ะ🇬ะะ🇦ะะ🇦ะะ🇱ะะ🇮ะะ🇦ะ ꜱะ🇺ะะ🇳ะะ🇼ะะ🇦ะะ🇾ะะ🇪ะะ🇬ะะ🇦ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇦ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇺ะะ🇵ะะ🇪ะ🇷ะ",
+        "ะ🇦ะะ🇧ะะ🇪ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇨ะะ🇭ะะ🇭ะะ🇪ะ ะ🇦ะะ🇺ะะ🇰ะะ🇦ะะ🇹ะ ะ🇳ะะ🇭ะะ🇮ะ ะ🇭ะะ🇪ะะ🇹ะ🇴ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇱ะะ🇪ะะ🇰ะะ🇪ะ ะ🇦ะะ🇦ะะ🇾ะะ🇦ะ ะ🇲ะะ🇦ะะ🇹ะะ🇭ะ ะ🇰ะะ🇦ะ??ะ ะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะ",
+        "ะ🇰ะะ🇮ะะ🇩ะ🇿ะ ะ🇲ะะ🇦ะะ🇩ะะ🇦ะ🇷ะะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇰ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะ🇷ะ ะ🇱ะะ🇮ะะ🇾ะะ🇪ะ ะ🇧ะะ🇭ะะ🇦ะะ🇮ะ ะ🇩ะะ🇪ะะ🇩ะะ🇮ะะ🇾ะะ🇦ะ",
+        "ะ🇯ะะ🇺ะะ🇳ะะ🇬ะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะ ะ🇳ะะ🇦ะะ🇨ะะ🇭ะะ🇹ะะ🇦ะ ะ🇭ะะ🇪ะ ะ🇲ะะ🇴ะ🇷ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇩ะะ🇦ะะ🇮ะ ะ🇩ะะ🇪ะะ🇰ะะ🇰ะะ🇪ะ ꜱะ🇦ะ🇧ะ ะ🇧ะะ🇴ะะ🇱ะะ🇹ะะ🇪ะ ะ🇴ะะ🇳ะ🇨ะะ🇪ะ ะ🇲ะะ🇴ะ🇷ะะ🇪ะ ะ🇴ะะ🇳ะ🇨ะะ🇪ะ ะ🇲ะะ🇴ะ🇷ะะ🇪ะ 🤣🤣💦💋",
+        "ะ🇬ะะ🇦ะะ🇱ะะ🇮ะ ะ🇬ะะ🇦ะะ🇱ะะ🇮ะ ะ🇲ะะ🇪ะ ะ🇷ะะ🇪ะะ🇭ะะ🇹ะะ🇦ะ ะ🇭ะะ🇪ะ ꜱะ🇦ะะ🇳ะะ🇩ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇦ะะ🇱ะะ🇦ะ ะ🇴ะ🇷ะ ะ🇧ะะ🇦ะะ🇳ะะ🇦ะ ะ🇩ะะ🇮ะะ🇦ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะ 🤤🤣",
+        "ꜱะ🇦ะ🇧ะ ะ🇧ะะ🇴ะะ🇱ะะ🇹ะะ🇪ะ ะ🇲ะะ🇺ะะ🇯ะะ🇭ะะ🇰ะ🇴ะ ะ🇵ะะ🇦ะะ🇵ะะ🇦ะ ะ🇨ะะ🇾ะะ🇺ะะ🇰ะะ🇮ะ ะ🇲ะะ🇪ะะ🇳ะะ🇪ะ ะ🇰ะ🇷ะะ??ะะ🇮ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇵ะ🇷ะะ🇪ะะ🇬ะะ🇳ะะ🇪ะะ🇳ะะ🇹ะ 🤣🤣",
+        "ꜱะ🇺ะะ🇦ะ🇷ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇲ะะ🇪ะ ꜱะ🇺ะะ🇦ะ🇷ะ ะ🇰ะะ🇦ะ ะ🇱ะะ🇴ะะ🇺ะะ🇩ะะ🇦ะ ะ🇴ะ🇷ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇲ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇱ะะ🇴ะะ🇩ะะ🇦ะ",
+        "ะ🇨ะะ🇭ะะ🇦ะะ🇱ะ ะ🇨ะะ🇭ะะ🇦ะะ🇱ะ ะ🇹ะะ🇺ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇨ะะ🇭ะะ🇮ะะ🇾ะะ🇦ะ ะ🇩ะะ🇮ะะ🇰ะะ🇦ะ",
+        "ะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะ ะ🇧ะะ🇦ะะ🇨ะะ🇭ะะ🇭ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇮ะะ🇦ะ ะ🇳ะะ🇦ะะ🇳ะะ🇬ะะ🇦ะ ะ🇰ะะ🇦ะ🇷ะะ🇰ะะ🇪ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇬ะꜰะ ะ🇭ะะ🇪ะ ะ🇧ะะ🇦ะะ🇩ะะ🇮ะ ꜱะ🇪xะ🇾ะ ะ🇺ꜱะะ🇰ะ??ะ ะ🇵ะะ🇮ะะ🇱ะะ🇦ะะ🇰ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇴ะะ🇩ะะ🇪ะะ🇳ะะ🇬ะะ🇪ะ ะ🇵ะะ🇪ะะ🇵ꜱะะ🇮ะ",
+        "2 ะ🇷ะะ🇺ะะ🇵ะะ🇦ะ🇾ะ ะ🇰ะะ🇮ะ ะ🇵ะะ🇪ะะ🇵ꜱะะ🇮ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇺ะะ🇲ะะ🇲ะะ🇾ะ ꜱะ🇦ะ🇧ꜱะะ🇪ะ ꜱะ🇪xะ🇾ะ 💋💦",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇨ะะ🇭ะะ🇪ะะ🇪ะ🇲ꜱะ ꜱะะ🇪ะ ะ🇨ะะ🇭ะะ🇺ะะ🇩ะะ🇼ะะ🇦ะะ🇻ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇲ะะ🇦ะะ🇩ะะ🇪ะ🇷ะะ🇨ะะ🇭ะะ🇴ะะ🇴ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ 💦🤣",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะะ🇭ะ ะ🇲ะะ🇪ะ ะ🇲ะะ🇺ะะ🇹ะะ🇭ะะ🇰ะะ🇪ะ ꜰะะ🇦ะ🇷ะะ🇦ะ🇷ะ ะ🇭ะะ🇴ะะ🇯ะะ🇦ะะ🇻ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ ะ🇭ะะ🇺ะะ🇮ะ ะ🇭ะะ🇺ะะ🇮ะ ะ🇭ะะ🇺ะะ🇮ะ",
+        "ꜱะ🇵ะะ🇪ะะ🇪ะะ🇩ะ ะ🇱ะะ🇦ะะ🇦ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇺ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇮ะะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ 💋💦🤣",
+        "ะ🇦ะะ🇷ะะ🇪ะ ะ🇷ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ ะ🇧ะะ🇪ะะ🇹ะะ🇪ะ ะ🇨ะะ🇾ะะ🇺ะ ꜱะ🇵ะะ🇪ะะ🇪ะะ🇩ะ ะ🇵ะะ🇦ะะ🇰ะะ🇦ะะ🇩ะ ะ🇳ะะ🇦ะ ะ🇵ะะ🇦ะะ🇦ะะ🇦ะ ะ🇷ะะ🇦ะะ🇭ะะ🇦ะ ะ🇦ะะ🇵ะะ🇳ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇵ะ ะ🇰ะะ🇦ะ ะ🇭ะะ🇦ะะ🇭ะะ🇦ะะ🇭ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇬ะะ🇦ะะ🇮ะ🤣🤣",
+        "ꜱะ🇺ะะ🇳ะ ꜱะ🇺ะะ🇳ะ ꜱะ🇺ะะ🇦ะ🇷ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ะะ🇱ะะ🇱ะะ🇪ะ ะ🇯ะะ🇭ะะ🇦ะะ🇳ะะ🇹ะ🇴ะ ะ🇰ะะ🇪ะ ꜱะ🇴ะะ🇺ะะ🇩ะะ🇦ะะ🇬ะะ🇦ะ🇷ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇺ะะ🇲ะะ🇲ะะ🇾ะ ะ🇰ะะ🇮ะ ะ🇳ะะ🇺ะะ🇩ะะ🇪ꜱะ ะ🇧ะะ🇭ะะ🇪ะะ🇯ะ",
+        "ะ🇦ะะ🇧ะะ🇪ะ ꜱะ🇺ะะ🇳ะ ะ🇱ะะ🇴ะะ🇩ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇧ะะ🇪ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇦ะ ะ🇧ะะ🇭ะะ🇴ꜱะะ🇩ะะ🇦ะ ꜰะะ🇦ะะ🇦ะะ🇩ะ ะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะะ🇦ะะ🇰ะ🇴ะ ะ🇰ะะ🇭ะะ🇺ะะ🇱ะะ🇪ะ ะ🇧ะะ🇦ะะ🇯ะะ🇦ะ🇷ะ ะ🇲ะะ🇪ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะ ะ🇩ะะ🇦ะะ🇱ะะ🇦ะ 🤣🤣💋",
+        "ꜱะ🇭ะ🇷ะ🇲ะ ะ🇰ะ🇷ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะะ🇦ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇬ะะ🇦ะะ🇮ะ ะ🇾ะะ🇭ะะ🇦ะ",
+        "ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะะ🇱ะะ🇱ะะ🇱ะะ🇱ะะ🇱ะ ะ🇵ะะ🇰ะะ🇩ะ ะ🇯ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇸ะะ🇪ะ",
+        "ะ🇹ะะ🇺ะ ะ🇪ะะ🇰ะ ะ🇰ะะ🇦ะะ🇦ะ🇲ะ ะ🇰ะ🇷ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇧ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇴ะ ะ🇨ะะ🇺ะะ🇩ะะ🇼ะะ🇦ะ ะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ ะ🇸ะะ🇹ะะ🇭ะ",
+        "ะ🇷ะะ🇳ะะ🇩ะะ🇮ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇩ะะ🇰ะะ🇪ะะ🇪ะะ🇪ะะ🇪ะะ🇪ะะ🇪ะะ🇪ะะ🇪ะ ะ🇨ะะ🇭ะะ🇺ะะ🇵ะ ะ🇴ะ🇷ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇾ะะ🇭ะะ🇦ะ",
+        "ะ🇨ะะ🇭ะะ🇺ะะ🇵ะ ะ🇹ะะ🇲ะะ🇰ะะ🇨ะ ะ🇰ะะ🇮ะะ🇩ꜱะꜱะꜱะꜱะꜱะꜱะꜱะꜱะꜱะꜱะꜱะꜱะ",
+        "ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇬ะะ🇦ะะ🇦ะะ🇳ะะ🇩ะ ะ🇲ะะ🇪ะะ??ะ🇳ะ ะ🇲ะะ🇺ะะ🇹ะะ🇭ะะ🇮ะ ะ🇩ะะ🇦ะะ🇦ะะ🇱ะ",
+        "ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇨ะะ🇭ะะ🇴ะะ🇴ꜱะ ะ🇯ะะ🇦ะะ🇱ะะ🇩ะะ🇮ะ ะ🇸ะะ🇪ะ",
+        "ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇴ะ ะ🇨ะะ🇺ꜱะะ🇼ะะ🇦ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ",
+        "ะ🇧ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇱ะะ🇦ะะ🇺ะะ🇩ะะ🇪ะ ะ🇹ะะ🇲ะะ🇨ะ",
+        "ะ🇧ะะ🇭ะะ🇪ะ🇳ะ ะ🇰ะะ🇪ะ ะ🇹ะะ🇦ะะ🇰ะะ🇰ะะ🇪ะ ะ🇹ะะ🇲ะะ🇱ะ",
+        "ะ🇦ะะ🇧ะะ🇱ะะ🇦ะ ะ🇹ะะ🇪ะะ🇷ะะ🇦ะ ะ🇰ะะ🇭ะะ🇦ะ🇳ะ ะ🇩ะะ🇦ะ🇳ะ ะ🇨ะะ🇭ะะ🇴ะะ🇩ะะ🇳ะะ🇪ะ ะ🇰ะะ🇮ะ ะ🇧ะะ🇦ะ🇷ะะ🇮ะะ🇮ะ",
+        "ะ🇧ะะ🇪ะะ🇹ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ꜱะ🇧ꜱะะ🇪ะ ะ🇧ะะ🇩ะะ🇮ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะ",
+        "ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇦ะะ🇱ะ ะ🇯ะะ🇭ะะ🇦ะะ🇹ะ ะ??ะะ🇪ะ ะ🇵ะะ🇮ꜱะꜱะꜱะ🇺ะะ🇺ะะ🇺ะะ🇺ะะ🇺ะะ🇺ะะ🇺ะ ะ🇹ะะ🇲ะะ🇰ะะ🇨ะ",
+        "ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇵ะะ🇪ะ ะ🇱ะะ🇹ะะ🇰ะะ🇮ะะ🇹ะ ะ🇲ะะ🇦ะะ🇦ะะ🇦ะะ🇱ะะ🇱ะะ🇱ะะ🇱ะ ะ🇰ะะ🇮ะ ะ🇧ะะ🇴ะะ🇳ะะ🇩ะ ะ🇭ะ ะ🇹ะะ🇺ะะ🇺ะะ🇺ะ",
+        "ะ🇰ะะ🇦ꜱะะ🇭ะ ะ🇴ꜱะ ะ🇩ะะ🇮ะ🇳ะ ะ🇲ะะ🇺ะะ🇹ะะ🇭ะ ะ🇲ะ🇷ะะ🇰ะะ🇪ะ ꜱะ🇴ะะ🇯ะะ🇹ะะ🇦ะ ะ🇲ะ ะ🇹ะะ🇺ะ ะ🇵ะะ🇦ะะ🇮ะะ🇩ะะ🇦ะ ะ🇳ะะ🇦ะ ะ🇭ะะ🇴ะะ🇹ะะ🇦ะะ🇦ะ",
+        "ะ🇬ะะ🇱ะะ🇹ะะ🇮ะ ะ🇰ะ🇷ะะ🇩ะะ🇮ะ ะ🇹ะะ🇺ะะ🇯ะะ🇼ะ ะ🇵ะะ🇦ะะ🇮ะะ🇩ะะ🇦ะ ะ🇰ะ🇷ะะ🇰ะะ🇪ะ ะ🇹ะะ🇪ะะ🇷ะะ🇾ะ ะ🇲ะะ🇦ะ ะ🇳ะะ🇪ะ ะ🇦ะะ🇧ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇹ะะ🇺ะ ะ🇾ะะ🇭ะะ🇦ะ",
+        "ꜱะ🇵ะะ🇪ะะ🇪ะะ🇩ะ ะ🇵ะะ🇰ะะ🇩ะะ🇩ะะ??ะ",
+        "ะ🇬ะะ🇦ะะ🇦ะะ🇳ะะ🇩ะ ะ🇲ะะ🇦ะะ🇮ะ🇳ะ ะ🇱ะะ🇼ะะ🇩ะะ🇦ะ ะ🇩ะะ🇦ะะ🇱ะ ะ🇱ะะ🇪ะ ะ🇦ะะ🇵ะะ🇳ะะ🇮ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะะ🇦ะะ🇦ะ",
+        "ะ🇬ะะ🇦ะะ🇦ะะ🇳ะะ🇩ะ ะ🇲ะะ🇪ะะ🇮ะ🇳ะ ะ🇧ะะ🇦ะะ🇲ะะ🇧ะ🇺ะ ะ🇩ะะ🇪ะะ🇩ะะ🇺ะะ🇳ะะ🇬ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะ",
+        "ะ🇬ะะ🇦ะะ🇳ะะ🇩ะ ꜰะะ🇹ะะ🇮ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇱ะะ🇰ะะ🇰ะะ🇰ะ ะ🇹ะะ🇺ะ ะ🇨ะะ🇺ะะ🇩ะ ะ🇾ะะ🇭ะะ🇦ะ",
+        "ะ🇬ะะ🇴ะะ🇹ะะ🇪ะ ะ🇰ะะ🇮ะะ🇹ะะ🇳ะะ🇪ะ ะ🇧ะะ🇭ะะ🇮ะ ะ🇧ะะ🇦ะะ🇩ะะ🇪ะ ะ🇭ะะ🇴ะ, ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇳ะะ🇮ะะ🇨ะะ🇭ะะ🇪ะ ะ🇭ะะ🇮ะ ะ🇷ะะ🇪ะะ🇭ะะ🇹ะะ🇪ะ ะ🇭ะะ🇦ะ",
+        "ะ🇭ะะ🇦ะะ🇿ะะ🇦ะะ🇦ะ🇷ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇬ะะ🇦ะะ🇦ะะ🇳ะะ🇩ะ ะ🇲ะะ🇦ะะ🇮ะ🇳ะ",
+        "ะ🇯ะะ🇭ะะ🇦ะะ🇦ะะ🇳ะะ🇹ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇮ꜱะꜱะ🇺ะ ะ🇹ะะ🇲ะะ🇰ะะ🇨ะ ะ🇸ะะ🇺ะะ🇳ะ",
+        "ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇮ะ ะ🇰ะะ🇦ะะ🇱ะะ🇮ะ ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ",
+        "ะ🇰ะะ🇭ะะ🇴ะะ🇹ะะ🇪ะ🇾ะ ะ🇰ะะ🇮ะ ะ🇦ะะ🇺ะะ🇱ะะ🇩ะะ🇦ะ ะ🇪ะะ🇾ะ ะ🇹ะะ🇺ะ ะ🇷ะะ🇦ะะ🇳ะะ🇩ะะ🇾ะะ🇰ะะ🇪ะ",
+        "ะ🇰ะะ🇺ะะ🇹ะะ🇹ะะ🇪ะ ะ🇰ะะ🇦ะ ะ🇦ะะ🇼ะะ🇱ะะ🇦ะะ🇹ะ ะ🇯ะะ🇦ะะ🇮ะꜱะะ🇦ะ ะ🇱ะะ🇬ะ ะ🇷ะะ🇭ะะ🇦ะ ะ🇹ะะ🇺ะ",
+        "ะ🇰ะะ🇺ะะ🇹ะะ🇹ะะ🇪ะ ะ🇰ะะ🇮ะ ะ🇯ะะ🇦ะะ🇹ะ ะ🇯ะะ🇦ะะ🇮ꜱะะ🇦ะ ะ🇪ะะ🇾ะ ะ🇹ะะ🇺ะ ",
+        "ะ🇰ะะ🇺ะะ🇹ะะ🇹ะะ🇪ะ ะ🇰ะะ🇪ะ ะ🇹ะะ🇦ะะ🇹ะะ🇹ะะ🇦ะ ะ🇪ะะ🇾ะ ะ🇹ะะ🇺ะ",
+        "ะ🇹ะะ🇪ะะ🇹ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇰ะะ🇮ะ.ะ🇨ะะ🇭ะะ🇺ะะ🇹ะ , ะ🇹ะะ🇪ะะ🇷ะะ🇮ะ ะ🇲ะะ🇦ะ ะ🇷ะะ🇳ะะ🇩ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะะ🇮ะ",
+        "ะ🇱ะะ🇦ะะ🇻ะะ🇩ะะ🇪ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇱ะ ะ🇵ะะ🇰ะะ🇩ะ ะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ",
+        "ะ🇲ะะ🇺ะะ🇭ะ ะ🇲ะะ🇪ะะ🇮ะ ะ🇱ะะ🇪ะะ🇱ะะ🇪ะ ะ🇲ะะ🇪ะะ🇷ะะ🇦ะ ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ",
+        "ะ🇱ะะ🇺ะะ🇳ะะ🇩ะ ะ🇰ะะ🇪ะ ะ🇵ะะ🇦ꜱะะ🇮ะะ🇳ะะ🇪ะ ะ🇨ะะ🇭ะะ🇺ะะ🇵ะ ะ🇧ะะ🇪ะะ🇹ะะ🇭ะ ะ🇴ะ🇷ะ ะ🇨ะะ🇺ะะ🇩ะ",
+        "ะ🇲ะะ🇪ะะ🇷ะะ🇪ะ ะ🇱ะะ🇼ะะ🇩ะะ🇪ะ ะ🇰ะะ🇪ะ ะ🇧ะะ🇦ะะ🇦ะะ🇦ะะ🇦ะะ🇱ะะ🇱ะะ🇱ะ",
+        "ะ🇭​ะะ🇦​ะะ🇭​ะะ🇦​ะะ🇭​ะะ🇦​ะะ🇦​ะะ🇦​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ ะ🇬​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇺​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇩​ะ ะ🇬​ะะ🇾​ะะ🇦​ะะ🇦​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇭​ะะ🇦​ะะ🇳​ะะ🇪​ะ ะ🇰​ะะ🇮​ะ ะ🇺​ะะ🇱​ะะ🇦​ะะ🇩​ะะ🇩​ะะ🇩​ะ",
+        "ꜱ​ะ🇦​ะะ🇩​ะะ🇮​ะ ะ🇭​ะะ🇺​ะะ🇮​ะ ะ🇬​ะะ🇦​ะะ🇦​ะะ🇳​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇬​ะะ🇦​ะะ🇦​ะะ🇳​ะะ🇩​ะ ะ🇲​ะะ🇦​ะะ🇮​ะ🇳​ะ ะ🇰​ะะ🇺​ะะ🇹​ะะ🇪​ะ ะ🇰​ะะ🇦​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇴​ꜱ​ะะ🇩​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇪​ะ ะ🇬​ะะ🇦​ะะ🇦​ะะ🇳​ะะ🇩​ะ ะ🇲​ะะ🇪​ะะ🇮​ะ🇳​ะ ะ🇰​ะะ🇪​ะะ🇪​ะะ🇩​ะะ🇪​ะ ะ🇵​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇾​ะ",
+        "ะ🇳​ะะ🇾​ะ ะ🇳​ะะ🇾​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ",
+        "ꜱ​ะ🇺​ะะ🇳​ะะ🇳​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇪​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ ะ🇹​ะะ🇲​ะะ🇱​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇴​ꜱ​ะะ🇩​ะะ🇦​ะ",
+        "ะ🇧​ะะ🇪​ะะ🇭​ะะ🇪​ะ🇳​ะ ะ🇰​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะะ🇨​ะะ🇭​ะะ🇦​ะะ🇵​ะ ะ🇨​ะะ🇺​ะะ🇩​ะ ะ🇾​ะะ🇭​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇹​ะะ🇳​ะะ🇮​ะะ🇮​ะะ🇮​ะ",
+        "ะ🇲​ะะ🇪​ะะ🇷​ะะ🇦​ะ ะ🇱​ะะ🇦​ะะ🇼​ะะ🇩​ะะ🇦​ะ ะ🇱​ะะ🇪​ะะ🇱​ะะ🇪​ะ ะ🇹​ะะ🇺​ะ ะ🇦​ะะ🇬​ะะ🇦​ะ🇷​ะ ะ🇨​ะะ🇭​ะะ🇦​ะะ🇮​ะะ🇾​ะะ🇪​ะ ะ🇹​ะะ🇴​ะะ🇭​ะ",
+        "ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะ ะ🇬​ะะ🇦​ะะ🇦​ะะ🇳​ะะ🇩​ะ🇺​ะ",
+        "ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะะ🇮​ะะ🇾​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇵​ะะ🇪​ะ ะ🇯​ะ🇨​ะ🇧​ะ ะ🇨​ะะ🇭​ะะ🇦​ะะ🇩​ะะ🇭​ะะ🇦​ะะ🇦​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ꜱ​ะ🇦​ะะ🇲​ะะ🇯​ะะ🇭​ะะ🇦​ะะ🇦​ะ ะ🇱​ะะ🇦​ะะ🇼​ะะ🇩​ะะ🇪​ะ",
+        "ะ🇾​ะะ🇦​ะ ะ🇩​ะะ🇺​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇬​ะะ🇦​ะะ🇦​ะะ🇳​ะะ🇩​ะ ะ🇲​ะะ🇪​ะ ะ🇹​ะะ🇦​ะะ🇵​ะะ🇦​ะะ🇦​ะ ะ🇹​ะะ🇦​ะะ🇵​",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇧​ะะ🇪​ะะ🇭​ะะ🇪​ะ🇳​ะ ะ🇲​ะะ🇪​ะะ🇷​ะะ🇦​ะ ะ🇷​ะะ🇴​ะะ🇿​ะ ะ🇱​ะะ🇪​ะะ🇹​ะะ🇮​ะ ะ🇭​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇪​ะ ꜱ​ะะ🇦​ะะ🇦​ะะ🇹​ะะ🇭​ะ ะ🇲​ะ🇲​ꜱ​ะ ะ🇧​ะะ🇦​ะะ🇳​ะะ🇦​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇰​ะะ🇦​ะ ะ🇭​ะะ🇺​",
+        "ะ🇹​ะะ🇺​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะะ🇮​ะะ🇾​ะะ🇦​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇦​ะ ะ🇰​ะะ🇭​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇦​ะะ🇦​ะ🇳​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะะ🇮​ะะ🇾​ะะ🇦​ะ",
+        "ะ🇦​ะะ🇺​ะ🇷​ะ ะ🇰​ะะ🇮​ะะ🇹​ะะ🇳​ะะ🇦​ะ ะ🇧​ะะ🇴​ะะ🇱​ะะ🇺​ะ ะ🇧​ะะ🇪​ะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇳​ะะ🇳​ะ ะ🇧​ะะ🇭​ะะ🇦​ะ🇷​ะ ะ🇬​ะะ🇦​ะะ🇾​ะะ🇦​ะ ะ🇲​ะะ🇪​ะะ🇷​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇮​ะะ🇮​ะะ🇮​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะะ🇹​ะะ🇹​ะ ะ🇲​ะะ🇪​ะ ะ🇦​ะะ🇧​ะ🇨​ะ🇩​ะ ะ🇱​ะะ🇮​ะะ🇰​ะะ🇭​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇪​ะ ะ🇱​ะะ🇴​ะะ🇩​ะะ🇪​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ะ ะ🇱​ะะ🇪​ะะ🇰​ะะ🇦​ะ🇷​ะ ะ🇲​ะะ🇦​ะะ🇮​ะ ꜰ​ะะ🇦​ะ🇷​ะะ🇦​ะ🇷​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇮​ะะ🇩​ะะ🇮​ะะ🇮​ะ",
+        "ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะ ะ🇧​ะะ🇦​ะะ🇨​ะะ🇭​ะะ🇪​ะะ🇪​ะ ะ🇹​ะะ🇲​ะะ🇰​ะะ🇨​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ ะ🇲​ะะ🇦​ะะ??​ะ🇴​ะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะะ🇺​ะ",
+        "ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇾​ะ",
+        "ะ🇹​ะะ🇺​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะ ะ🇵​ะะ🇮​ะะ🇱​ะะ🇱​ะะ🇦​ะ ะ🇪​ะะ🇾​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇮​ะะ🇮​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ะ ะ🇧​ะะ🇭​ะะ🇪​ะะ🇯​ะะ🇯​ะะ🇯​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇦​ะะ🇦​ะ ะ🇧​ะะ🇦​ะะ🇦​ะะ🇦​ะะ🇵​ะ ะ🇭​ะะ🇺​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇲​ะะ🇪​ะ ะ🇭​ะะ🇦​ะะ🇦​ะะ🇹​ะ ะ🇩​ะะ🇦​ะะ🇦​ะะ🇱​ะะ🇱​ะะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇭​ะะ🇦​ะะ🇦​ะ🇬​ะ ะ🇯​ะะ🇦​ะะ🇦​ะะ🇳​ะะ🇺​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ะ ꜱ​ะะ🇦​ะ🇷​ะะ🇦​ะะ🇰​ะ ะ🇵​ะะ🇪​ะ ะ🇱​ะะ🇪​ะะ🇹​ะะ🇦​ะะ🇦​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ ะ🇬​ะ🇧​ะ ะ🇷​ะ🇴​ะ🇦​ะ🇩​ะ ะ🇵​ะะ🇪​ะ ะ🇱​ะะ🇪​ะะ🇯​ะะ🇦​ะะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇪​ะ🇨​ะ🇭​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇲​É​ะ ะ🇰​ะะ🇦​ะะ🇦​ะะ🇱​ะะ🇮​ะ ะ🇲​ะะ🇮​ะะ🇹​ะ🇨​ะ🇭​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ꜱ​ะะ🇦​ꜱ​ะะ🇹​ะะ🇮​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇭​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇲​ะะ🇪​ะ ะ🇰​ะะ🇦​ะะ🇧​ะะ🇺​ะะ🇹​ะะ🇦​ะ🇷​ะ ะ??​ะะ🇦​ะะ🇦​ะะ🇱​ะ ะ🇰​ะะ🇪​ะ ꜱ​ะ🇴​ะะ🇺​ะะ🇵​ะ ะ🇧​ะะ🇦​ะะ🇳​ะะ🇦​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇭​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇲​ะะ🇪​ะ ะ🇩​ะะ🇪​ะะ🇹​ะ🇴​ะ🇱​ะ ะ🇩​ะะ??​ะะ🇦​ะะ🇱​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇴​ꜱ​ะะ🇩​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇲​ะะ🇪​ะ ะ🇱​ะะ🇦​ะะ🇵​ะะ🇹​ะ🇴​ะ🇵​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇭​ะะ🇦​ะะ🇮​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ ะ🇧​ะะ🇮​ꜱ​ะะ🇹​ะะ🇦​ะ🇷​ะ ะ🇵​ะะ🇪​ะ ะ🇱​ะะ🇪​ะะ🇹​ะะ🇦​ะะ🇦​ะะ🇰​ะะ🇪​ะ ะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ??​ะะ🇴​ ะ🇦​ะะ🇲​ะะ🇪​ะ🇷​ะะ🇮​ะ🇨​ะะ🇦​ะ ะ🇬​ะะ🇭​ะะ🇺​ะะ🇲​ะะ🇦​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇲​ะะ🇪​ะ ะ🇳​ะะ🇦​ะะ🇦​ะ🇷​ะะ🇮​ะะ🇾​ะะ🇦​ะ🇱​ะ ะ🇵​ะะ🇭​ะ🇴​ะ🇷​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇪​ะ ะ🇬​ะะ🇦​ะะ🇳​ะะ🇩​ะ ะ🇲​ะะ🇪​ะ ะ🇩​ะะ🇪​ะะ🇹​ะ🇴​ะ🇱​ะ ะ🇩​ะะ🇦​ะะ🇦​ะะ🇱​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ ะ🇭​ะ🇴​🇷​🇱​🇮​🇨​🇰​ꜱ​ะ ะ🇵​ะะ🇮​ะะ🇱​ะะ🇦​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇴​ ꜱ​ะะ🇦​ะ🇷​ะะ🇦​ะะ🇰​ะ ะ🇵​ะะ🇪​ะ ะ🇱​ะะ🇪​ะะ🇹​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇩​ะะ🇺​ะะ🇳​ะะ🇬​ะะ🇦​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇴​ꜱ​ะะ🇩​ะะ🇦​ะ",
+        "ะ🇲​ะะ🇪​ะะ🇷​ะะ🇦​ะะ🇦​ะ ะ🇱​ะะ🇺​ะะ🇳​ะะ🇩​ะ ะ🇵​ะะ🇦​ะะ🇰​ะะ🇦​ะะ🇩​ะ ะ🇱​ะะ🇪​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะ ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇦​ะะ🇰​ะะ🇦​ะะ🇦​ะ ะ🇧​ะะ🇭​ะะ🇴​ꜱ​ะะ🇩​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇨​ะะ🇭​ะะ🇺​ꜱ​ะ ะ🇬​ะะ🇪​ะะ🇾​ะะ🇮​ะ ะ🇰​ะะ🇾​ะะ🇦​ะะ🇦​ะ ะ🇱​ะะ🇦​ะะ🇼​ะะ🇩​ะะ🇪​ะะ🇪​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะะ🇦​ะ ะ🇧​ะะ🇯​ꜱ​ะะ🇴​ะะ🇩​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะ🇽​ะะ🇭​ะะ🇴​ะะ🇩​ะะ🇩​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇺​ะะ🇺​ะ🇮​ะ ะ🇲​ะะ🇦​ะะ🇦​ะะ🇦​ะ ะ🇰​ะะ🇦​ะะ🇦​ะ ะ🇧​ะะ🇭​ꜱ​ะะ🇴​ะะ🇩​ะะ🇦​ะะ🇦​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะะ🇮​ะะ🇮​ะะ🇮​ะะ🇮​ะ ะ🇧​ะะ🇪​ะะ🇭​ะะ🇪​ะ🇳​ะะ🇳​ะะ🇳​ะ ะ🇰​ะะ🇴​ะ ะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะะ🇩​ะะ🇩​ะะ🇺​ะะ🇺​ะะ🇺​ะะ🇺​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะ🇽​ะะ🇭​ะะ🇴​ะะ🇩​ะะ🇩​ะะ🇩​ะะ🇩​ะ",
+        "ะ🇹​ะะ🇺​ะ ะ🇳​ะะ🇮​ะะ🇰​ะะ🇦​ะะ🇱​ะ ะ🇲​ะะ🇦​ะะ🇩​ะะ🇦​ะ🇷​ะะ🇨​ะะ🇭​ะะ🇴​ะะ🇩​ะ",
+        "ะ🇨​ะะ🇭​ะะ🇺​ะะ🇵​ะ ะ🇷​ะะ🇦​ะะ🇳​ะะ🇩​ะะ🇮​ะ ะ🇰​ะะ🇪​ะ ะ🇧​ะะ🇦​ะะ🇨​ะะ🇭​ะะ🇪​ะ",
+        "ะ??​ะะ🇪​ะะ🇷​ะะ🇦​ะ ะ🇲​ะะ🇦​ะะ🇦​ะ ะ🇲​ะะ🇪​ะะ🇷​ะะ🇮​ะ ะ🇯​ะะ🇦​ะะ🇦​ะ🇳​ะ ะ🇪​ะะ🇾​ะ",
+        "ะ🇹​ะะ🇪​ะะ🇷​ะะ🇮​ะ ꜱ​ะ🇪​x​ะ🇾​ะ ะ🇧​ะะ🇦​ะะ🇭​ะะ🇪​ะ🇳​ะ ะ🇰​ะะ🇮​ะ ะ🇨​ะะ🇭​ะะ🇺​ะะ🇹​ะ ะ🇴​ะะ🇵​ะ",
+        "⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇧⚡🇭⚡?? ⚡🇧⚡🇳⚡🇦⚡🇱⚡🇪 ⚡🇲⚡🇺⚡🇯⚡🇪 ⚡🇷⚡🇳⚡🇩⚡🇮⚡🇰⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇦 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇪⚡🇾 ⚡🇾⚡🇦⚡🇦⚡🇩 ⚡🇪⚡🇾 ⚡🇹⚡🇺⚡🇯⚡🇭⚡🇪",
+        "⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇦 ⚡🇳⚡🇦 ⚡🇹⚡🇾⚡🇲⚡🇵⚡🇦⚡🇸⚡🇸",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇺⚡🇳⚡🇫⚡🇺⚡🇳⚡🇳⚡🇾 ⚡🇸⚡🇼⚡🇮⚡🇵⚡🇪 ⚡🇲⚡🇹⚡🇹 ⚡🇰⚡🇷",
+        "⚡🇴⚡🇭 ⚡🇭⚡🇪⚡🇱⚡🇱⚡🇴 ⚡🇧⚡🇮⚡🇭⚡🇦⚡🇷⚡🇮 ⚡🇹⚡🇪⚡??⚡🇦 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇧⚡🇮⚡🇭⚡🇦⚡🇷⚡🇮 ⚡🇴⚡🇷 ⚡🇹⚡🇺 ⚡🇻 ⚡🇧⚡🇮⚡🇭⚡🇦⚡🇷⚡🇮 ⚡🇦⚡🇺⚡🇰⚡🇦⚡🇹 ⚡🇲⚡🇪 ⚡🇷⚡🇭⚡🇦 ⚡🇰⚡🇷.",
+        "⚡🇴⚡🇾⚡🇾 ⚡🇰⚡🇮⚡🇳⚡🇳⚡🇪⚡🇷 ⚡🇹⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇬⚡🇨 ⚡🇲⚡🇪 ⚡🇦⚡🇦⚡🇳⚡🇪 ⚡🇰⚡🇮 ⚡🇵⚡🇪⚡🇷⚡🇲⚡🇮⚡🇸⚡🇸⚡🇮⚡🇴⚡🇳 ⚡🇰⚡🇮⚡🇸⚡🇳⚡🇪 ⚡🇩⚡🇮.",
+        "⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦",
+        "⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦 ⚡🇪⚡🇰 ⚡🇧⚡🇦⚡🇦⚡🇷.",
+        "⚡🇸⚡🇺⚡🇳 ⚡🇸⚡🇺⚡🇳 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇦.",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇨⚡🇦 ⚡🇧⚡🇭⚡🇴⚡🇸⚡🇩⚡🇦.",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇨⚡🇭⚡🇴⚡🇹⚡🇮 ⚡🇯⚡🇦⚡🇹⚡🇮 ⚡🇰⚡🇪 ⚡🇹⚡🇲⚡🇷.",
+        "⚡🇰⚡🇾? ⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇰⚡🇮⚡🇩⚡🇩⚡🇪.",
+        "⚡🇧⚡🇮⚡🇭⚡🇦⚡🇷⚡🇮 ⚡🇨⚡🇴⚡🇲 ⚡🇬⚡🇦⚡🇳⚡🇬 ⚡🇰⚡🇪 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇰⚡🇴 ⚡🇹⚡🇦⚡🇬 ⚡🇨⚡🇷⚡🇪⚡🇬⚡🇦 ⚡🇹⚡🇺",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇨⚡🇾⚡🇦 ⚡🇹⚡🇺 ⚡🇧⚡🇮⚡🇭⚡🇦⚡🇷⚡🇮 ⚡🇪⚡🇾 ⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇧⚡🇸",
+        "⚡🇯⚡🇦⚡🇱⚡🇩⚡🇮 ⚡🇸⚡🇪 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇵⚡🇦⚡🇵⚡🇦 ⚡🇧⚡🇴⚡🇱",
+        "⚡🇸⚡🇮⚡🇩⚡🇪 ⚡🇭⚡🇴⚡🇯⚡🇦 ⚡🇧⚡🇮⚡🇭⚡🇦⚡🇷⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇦⚡🇧",
+        "⚡🇭⚡🇾⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇧⚡🇭⚡🇬 ⚡🇲⚡🇦⚡🇹 ⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇧⚡🇭⚡🇬 ⚡🇳⚡🇾 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇹⚡🇺 ⚡🇦⚡🇯⚡🇯",
+        "⚡🇭⚡🇾⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇰⚡🇪 ⚡🇧⚡🇨⚡🇭⚡🇪 ⚡🇧⚡🇭⚡🇦⚡🇬 ⚡🇲⚡🇦⚡🇹",
+        "⚡🇭⚡🇾⚡🇪 ⚡🇩⚡🇺⚡🇷 ⚡🇭⚡🇦⚡🇹⚡🇹 ⚡🇲⚡🇦⚡🇩⚡🇭⚡🇦⚡🇷⚡🇨⚡🇭⚡🇴⚡🇩 ⚡🇰⚡🇪 ⚡🇧⚡🇦⚡🇨⚡🇭⚡🇪",
+        "⚡🇰⚡🇴⚡🇮 ⚡🇧⚡🇦⚡🇹 ⚡🇳⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾 ⚡🇪⚡🇸⚡🇱⚡🇮⚡🇾⚡🇪 ⚡🇲⚡🇦⚡🇫 ⚡🇨⚡🇷 ⚡🇷⚡🇭⚡🇦 ⚡🇭⚡🇺 ⚡🇹⚡🇺⚡🇯⚡🇭⚡🇪",
+        "⚡🇰⚡🇴⚡🇮 ⚡🇧⚡🇦⚡🇦⚡🇹 ⚡🇳⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇹⚡🇺 ⚡🇲⚡🇦⚡🇫⚡🇮 ⚡🇩⚡🇪 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦",
+        "⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇹⚡🇺 ⚡🇲⚡🇦⚡🇫⚡🇮 ⚡🇲⚡🇮⚡🇱 ⚡🇯⚡🇦⚡🇾⚡🇪⚡🇬⚡🇮 ⚡🇹⚡🇺⚡🇯⚡🇭⚡🇪",
+        "⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦 ⚡🇲⚡🇦⚡🇹 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇦 ⚡🇲⚡🇺⚡🇯⚡🇪 ⚡🇸⚡🇼⚡🇮⚡🇵⚡🇪 ⚡🇨⚡🇷⚡🇰⚡🇪",
+        "⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇺 ⚡🇸⚡🇼⚡🇮⚡🇵⚡🇪 ⚡🇨⚡🇷⚡🇰⚡🇪",
+        "⚡🇫⚡🇷 ⚡🇧⚡🇴⚡🇱⚡🇳⚡🇦 ⚡🇳⚡🇦 ⚡🇰⚡🇮 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦 ⚡🇸⚡🇼⚡🇮⚡🇵⚡🇪 ⚡🇨⚡🇷⚡🇰⚡🇪",
+        "⚡🇨⚡🇾⚡🇦 ⚡🇭⚡🇺⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇵⚡🇷 ⚡🇰⚡🇪⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇵⚡🇹⚡🇦 ⚡🇹⚡🇭⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇪⚡🇾 ⚡🇳⚡🇾 ⚡🇲⚡🇦⚡🇳⚡🇹⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇾",
+        "⚡🇱⚡🇴⚡🇩⚡🇪 ⚡🇸⚡🇪 ⚡🇺⚡🇹⚡🇷 ⚡🇲⚡🇨",
+        "⚡🇱⚡🇺⚡🇳 ⚡🇲⚡🇹 ⚡🇨⚡🇭⚡🇺⚡🇸 ⚡🇲⚡🇪⚡🇷⚡🇦",
+        "⚡🇳⚡🇮⚡🇰⚡🇦⚡🇱 ⚡🇲⚡🇦⚡🇩⚡🇦⚡🇷⚡🇨⚡🇭⚡🇩",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇴⚡🇾⚡🇪 ⚡🇬⚡🇦⚡🇸⚡🇭⚡🇹⚡🇮 ⚡🇰 ⚡🇧⚡🇦⚡🇨⚡🇭⚡🇪",
+        "⚡🇲⚡🇦⚡🇰⚡🇮⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇹⚡🇪⚡🇷⚡🇮",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇷⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇲⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇮",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇰 ⚡🇭⚡🇦⚡🇹⚡🇭 ⚡🇹⚡🇴⚡🇩⚡🇭 ⚡🇰 ⚡🇹⚡🇪⚡🇷⚡🇪 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇰 ⚡🇲⚡🇺⚡🇭 ⚡🇲⚡🇪 ⚡🇫⚡🇦⚡🇸⚡🇦⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇱⚡🇪⚡🇦⚡🇻⚡🇪 ⚡🇱⚡🇪 ⚡🇹⚡🇺 ⚡🇷⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇵⚡🇦⚡🇸⚡🇦⚡🇳⚡🇩 ⚡🇳⚡🇦⚡🇮 ⚡🇦⚡🇾⚡🇦 ⚡🇲⚡🇪⚡🇰⚡🇴",
+        "⚡🇱⚡🇪⚡🇦⚡🇻⚡🇪 ⚡🇱⚡🇪 ⚡🇹⚡🇺 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇮⚡🇩⚡🇪⚡🇷 ⚡🇸⚡🇪",
+        "⚡🇱⚡🇪⚡🇦⚡🇻⚡🇪 ⚡🇱⚡🇪 ⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇸⚡🇪 ⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇱⚡🇪⚡🇦⚡🇻⚡🇪 ⚡🇳⚡🇾 ⚡🇱⚡🇪⚡🇬⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇸⚡🇲⚡🇯⚡🇭 ⚡🇧⚡🇦⚡🇹 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇱⚡🇪⚡🇦⚡🇻⚡🇪 ⚡🇱⚡🇪",
+        "⚡🇫⚡🇦⚡🇸⚡🇹 ⚡🇱⚡🇪⚡🇦⚡🇻⚡🇪 ⚡🇱⚡🇪 ⚡🇰⚡🇦⚡🇲⚡🇯⚡🇴⚡🇷 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇹⚡🇺⚡🇹⚡🇴 ⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇷⚡🇳⚡🇩⚡🇾⚡🇰",
+        "⚡🇴⚡🇾 ⚡🇭⚡🇮⚡🇯⚡🇩⚡🇪 ⚡🇰⚡🇭⚡??⚡🇳⚡🇦 ⚡🇰⚡🇭⚡🇦 ⚡🇰⚡🇪 ⚡🇦⚡🇦 ⚡🇰⚡🇦⚡🇲⚡🇿⚡🇴⚡🇷",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇮⚡🇱⚡🇾 ⚡🇷⚡🇪⚡🇾 🌚😂",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇨⚡🇭⚡🇦⚡🇵 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇹⚡🇲⚡🇰⚡🇨",
+        "⚡🇨⚡🇭⚡🇺⚡🇵⚡🇨⚡🇭⚡🇦⚡🇵 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇹⚡🇺",
+        "⚡🇸⚡🇭⚡🇮 ⚡🇸⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡??⚡🇺 ⚡🇨⚡🇭⚡🇺⚡🇵⚡🇨⚡🇭⚡🇦⚡🇵",
+        "⚡🇫⚡🇷 ⚡🇸⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇵⚡🇨⚡🇭⚡🇦⚡🇵",
+        "⚡🇸⚡🇭⚡🇮 ⚡🇸⚡🇪 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡??⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇦 ⚡🇨⚡🇾⚡🇺 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇨⚡🇭⚡🇺⚡🇵⚡🇨⚡🇭⚡🇦⚡🇵",
+        "⚡🇵⚡🇷⚡🇴⚡🇴⚡🇫 ⚡🇨⚡🇷 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇵⚡🇷⚡🇴⚡🇴⚡🇫 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇵⚡🇷⚡🇴⚡🇴⚡🇫 ⚡🇭⚡🇴 ⚡🇨⚡🇭⚡🇺⚡🇰⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇨⚡🇭⚡🇮⚡🇱⚡🇱⚡🇦⚡🇷",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇲⚡🇦⚡🇦 ⚡🇰 ⚡🇧⚡🇴⚡🇸⚡🇩⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇴⚡🇾 ⚡🇭⚡🇮⚡🇯⚡🇩⚡🇪 ⚡🇰⚡🇭⚡🇦⚡🇳⚡🇦 ⚡🇰⚡🇭⚡🇦 ⚡🇰⚡🇪 ⚡🇦⚡🇦 ⚡🇰⚡🇦⚡🇲⚡🇿⚡🇴⚡🇷",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇲⚡🇦⚡🇩⚡🇷⚡🇨⚡🇭⚡🇴⚡🇩 ?",
+        "⚡🇦⚡🇧 ⚡🇹⚡🇰 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇭⚡🇴⚡🇬⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ?",
+        "⚡🇳⚡🇾 ⚡🇳⚡🇾 ⚡🇲⚡🇪 ⚡🇰⚡🇺⚡🇨⚡🇭 ⚡🇳⚡🇾 ⚡🇯⚡🇦⚡🇳⚡🇹⚡🇦 ⚡🇧⚡🇸 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇸⚡🇧⚡🇸⚡🇪 ⚡🇵⚡🇭⚡🇪⚡🇱⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇴 ⚡🇧⚡🇴⚡🇱 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇳⚡🇦 ⚡🇰⚡🇦⚡🇲 ⚡🇰⚡🇷⚡🇪",
+        "⚡🇾⚡🇦⚡🇭⚡🇦 ⚡🇧⚡🇭⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇦 ⚡🇹⚡🇺 ⚡🇷⚡🇳⚡🇩⚡🇾⚡🇨⚡🇪 ⚡🇵⚡🇮⚡🇱⚡🇱⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇮⚡🇲⚡🇦⚡🇰⚡🇦⚡🇧⚡🇴⚡🇸⚡🇩⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇹⚡🇴 ⚡🇧⚡🇭⚡🇪⚡🇳 ⚡🇨⚡🇺⚡🇩⚡🇪⚡🇬⚡🇮",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇷⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇹⚡🇴⚡🇲⚡🇲⚡🇾",
+        "⚡🇳⚡🇮⚡🇰⚡🇦⚡🇱 ⚡🇲⚡🇦⚡🇩⚡🇦⚡🇷⚡🇨⚡🇭⚡🇩 ⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇾⚡🇭⚡🇦 ⚡🇸⚡🇪",
+        "⚡🇨⚡🇴⚡🇿 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇦⚡🇳⚡🇩⚡🇭⚡🇮 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮 ⚡🇭⚡🇪",
+        "⚡🇳⚡🇾⚡🇹⚡🇴 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇧⚡🇴⚡🇱 ⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪",
+        "⚡🇳⚡🇾⚡🇳⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇭⚡🇴⚡🇬⚡🇮 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇯⚡🇴 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦⚡🇹⚡🇮 ⚡🇯⚡🇴⚡🇬⚡🇮",
+        "⚡🇹⚡🇷⚡🇾 ⚡🇦⚡🇲⚡🇲⚡🇮 ⚡🇨⚡🇪 ⚡🇧⚡🇭⚡🇴⚡🇸⚡🇩⚡🇪 ⚡🇲⚡🇪 ⚡🇪⚡🇲⚡🇴⚡🇯⚡🇮 ⚡🇩⚡🇦⚡🇱 ⚡🇲⚡🇨",
+        "⚡🇨⚡🇾⚡🇦 ? ⚡🇨⚡🇭⚡🇲⚡🇷 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇦 ⚡🇨⚡🇾⚡🇦 ?",
+        "⚡🇹⚡🇲 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇷⚡🇮 ⚡🇭⚡🇴⚡🇬⚡🇮 ⚡🇫⚡🇷⚡🇷⚡🇹⚡🇴",
+        "⚡🇨⚡🇾⚡🇦 ? ⚡🇰⚡🇧 ? ⚡🇵⚡🇬⚡🇱 ⚡🇪⚡🇾 ⚡🇨⚡🇾⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇰⚡🇪⚡🇰",
+        "⚡🇨⚡🇾⚡🇦 ⚡🇸⚡🇨⚡🇭 ⚡🇲⚡🇪⚡🇾 ⚡🇵⚡🇬⚡🇱 ⚡🇪⚡🇾 ⚡🇨⚡🇾⚡🇦 ⚡🇹⚡🇺 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇨⚡🇺⚡🇩⚡🇼⚡?? ⚡🇱⚡🇮 ⚡🇹⚡🇺⚡🇳⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦",
+        "⚡🇮⚡🇹⚡🇳⚡🇦 ⚡🇸⚡🇨⚡🇭 ⚡🇳⚡🇾 ⚡🇧⚡🇴⚡🇱 ⚡🇲⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇸⚡🇨⚡🇭 ⚡🇲⚡🇪⚡🇾 ⚡🇵⚡🇬⚡🇱 ⚡🇪⚡🇾 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇮⚡🇦 ⚡🇲⚡🇪⚡🇷⚡🇪 ⚡🇸⚡🇹⚡🇭",
+        "⚡🇲⚡🇹⚡🇱⚡🇧 ⚡🇹⚡🇲⚡🇷",
+        "⚡🇳⚡🇾⚡🇹⚡🇴",
+        "⚡🇵⚡🇺⚡🇷⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇲⚡🇨",
+        "⚡🇹⚡🇲⚡🇷 ⚡🇫⚡🇷⚡🇷⚡🇹⚡🇴",
+        "⚡🇴⚡🇭 ⚡🇴⚡🇰 ⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇫⚡🇮⚡🇷",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇦 ⚡🇩⚡🇦⚡🇲⚡🇦⚡🇩",
+        "⚡🇨⚡🇾⚡🇦 ? ⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇱⚡🇮⚡🇰⚡🇭⚡🇪 ⚡🇵⚡🇪⚡🇭⚡🇱⚡🇪 ⚡🇷⚡🇳⚡🇩⚡🇮⚡🇰⚡🇪⚡🇧⚡🇦⚡🇨⚡🇭⚡🇪",
+        "⚡🇳⚡🇾⚡🇹⚡🇴 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇳⚡🇪 ⚡🇲⚡🇪 ⚡🇻⚡🇾⚡🇦⚡🇸⚡🇹 ⚡🇭⚡🇺",
+        "⚡🇳⚡🇾⚡🇹⚡🇴 ⚡🇵⚡🇬⚡🇱 ⚡🇪⚡🇾 ⚡🇨⚡🇾⚡🇦 ⚡🇰⚡🇺⚡🇨⚡🇭 ⚡🇧⚡🇮",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇨⚡🇾⚡🇦 ? ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇦 ?",
+        "⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇲⚡🇹 ⚡🇭⚡🇸⚡🇸",
+        "⚡🇾⚡🇺⚡🇷 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇲⚡🇴⚡🇲",
+        "⚡🇦⚡🇷⚡🇪 ⚡🇸⚡🇧⚡🇰⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇴⚡🇷 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇧⚡🇮",
+        "⚡🇦⚡🇷⚡🇪 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇪⚡🇰 ⚡🇧⚡🇦⚡🇦⚡🇷",
+        "⚡🇹⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇮 ⚡🇹⚡🇷⚡🇭",
+        "⚡🇪⚡🇰 ⚡🇱⚡🇮⚡🇳⚡🇪 ⚡🇲⚡🇪 ⚡🇹⚡🇲⚡🇷",
+        "⚡🇶",
+        "⚡🇴⚡🇨⚡🇾 ⚡🇦⚡🇧 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇱⚡🇪",
+        "⚡🇵⚡🇪⚡🇭⚡🇪⚡🇱⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇺",
+        "⚡🇳⚡🇾⚡🇹⚡🇴",
+        "⚡?? ?",
+        "⚡🇭⚡🇾⚡🇾⚡🇾 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇦 ⚡🇪⚡🇰 ⚡🇧⚡🇦⚡🇦⚡🇷",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇸⚡🇺⚡🇳 ⚡🇩⚡🇴⚡🇸⚡🇹 ⚡🇹⚡🇲⚡🇷",
+        "⚡🇧⚡🇭⚡🇦⚡🇬 ⚡🇯⚡🇦 ⚡🇷⚡🇦⚡🇦⚡🇳⚡🇩 ⚡🇲⚡🇦⚡🇦⚡🇫 ⚡🇨⚡🇷⚡🇷 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦",
+        "⚡🇨⚡🇾⚡🇦 ⚡🇹⚡🇲⚡🇷 ⚡🇫⚡🇷⚡🇷⚡🇹⚡🇴",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦⚡🇰⚡🇪 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇱⚡🇪 ⚡🇨⚡🇭⚡🇲⚡🇷",
+        "⚡🇳⚡🇾⚡🇹⚡🇴 ⚡🇦⚡🇪⚡🇸⚡🇪 ⚡🇭⚡🇮 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇭⚡🇾⚡🇾 ⚡🇦⚡🇮⚡🇸⚡🇪 ⚡🇭⚡🇮 ⚡🇨⚡🇺⚡🇩 ⚡🇱⚡🇪⚡🇳⚡🇦",
+        "⚡🇴⚡🇷 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇱⚡🇪",
+        "⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇦 ⚡🇴⚡🇷",
+        "⚡🇭⚡🇾⚡🇾 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇴 ⚡🇳⚡🇦",
+        "⚡🇨⚡🇭⚡🇺⚡🇩⚡🇴 ⚡🇲⚡🇹 ⚡🇧⚡🇭⚡🇦⚡🇬 ⚡🇯⚡🇦⚡🇴",
+        "⚡🇧⚡🇾⚡🇾⚡🇪⚡🇪 ⚡🇭⚡🇾⚡🇾 ⚡🇨⚡🇾⚡🇦 ?",
+        "⚡🇶⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇶 ⚡🇷⚡🇭⚡🇪 ⚡🇭⚡🇴 ?",
+        "⚡🇵⚡🇬⚡🇱 ⚡🇪⚡🇾 ⚡🇨⚡🇾⚡🇦 ⚡🇲⚡🇨",
+        "⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇲⚡🇹",
+        "⚡🇨⚡🇾⚡🇦 ⚡🇵⚡🇬⚡🇱 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇦⚡🇲⚡🇲⚡🇮 ⚡🇨⚡🇪 ⚡🇧⚡🇭⚡🇴⚡🇸⚡🇩⚡🇪 ⚡🇲⚡🇪 ⚡🇨⚡🇭⚡🇦⚡🇵⚡🇵⚡🇦⚡🇱",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦 ⚡🇲⚡🇨",
+        "⚡🇰⚡🇲⚡🇿⚡🇷⚡🇴⚡🇷 ⚡🇪⚡🇾 ⚡🇨⚡??⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮⚡🇪⚡🇰",
+        "⚡🇨⚡🇾⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇷⚡🇭⚡🇦 ?",
+        "⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇹⚡🇭⚡🇦 ⚡🇨⚡🇾⚡🇦 ?",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇸⚡🇱⚡🇮⚡🇩⚡🇪 ⚡🇱⚡🇪⚡🇰⚡🇪 ⚡🇧⚡🇦⚡🇦⚡🇹 ⚡🇨⚡🇷⚡🇲⚡🇨",
+        "⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇺",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇨⚡🇵 ⚡🇲⚡🇹 ⚡🇨⚡🇷⚡🇷 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇱⚡🇪",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇭⚡🇾⚡🇾 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇦",
+        "⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦 ⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇸⚡🇨⚡🇭⚡🇴⚡🇫⚡🇺 ⚡🇰⚡🇭⚡🇦⚡🇨⚡🇭⚡🇦⚡🇷 ⚡🇰⚡🇭⚡🇦⚡🇨⚡🇭⚡🇦⚡🇷",
+        "⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦 ⚡🇯⚡🇦 ⚡🇲⚡🇨",
+        "⚡🇭⚡🇾⚡🇾 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦⚡🇰⚡🇪 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇱⚡🇪",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇰⚡🇲⚡🇿⚡🇴⚡🇷 ⚡🇲⚡🇨 ⚡🇮⚡🇩⚡🇦⚡🇷 ⚡🇦⚡🇦",
+        "⚡🇾⚡🇪 ⚡🇨⚡🇾⚡🇦 ⚡🇹⚡🇲⚡🇷",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇳⚡🇾 ⚡🇨⚡🇵 ⚡🇳⚡🇾 ⚡🇨⚡🇷⚡🇷",
+        "⚡🇴⚡🇾⚡🇪⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇲⚡🇹 ⚡🇨⚡🇷⚡🇷",
+        "⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇦⚡🇷⚡🇦⚡🇲 ⚡🇸⚡🇪 ⚡🇲⚡🇨",
+        "⚡🇵⚡🇬⚡🇱 ⚡🇪⚡🇾 ⚡🇨⚡🇾⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮⚡🇪⚡🇰",
+        "⚡🇨⚡🇵 ⚡🇨⚡🇷⚡🇨⚡🇪 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇪⚡🇬⚡🇦 !",
+        "⚡🇧⚡🇦⚡🇦⚡🇵 ? ⚡🇲⚡🇨 ⚡🇲⚡🇪⚡🇷⚡🇦 ⚡🇨⚡🇴⚡🇮 ⚡🇲⚡🇦 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇳⚡🇾 ⚡🇪⚡🇾 ⚡🇲⚡🇦⚡🇮 ⚡🇺⚡🇵⚡🇦⚡🇷 ⚡🇸⚡🇪 ⚡🇷⚡🇴⚡🇨⚡🇰⚡🇪⚡🇹 ⚡🇵⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇭 ⚡🇨⚡🇪 ⚡🇧⚡🇸⚡🇸 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇳⚡🇪 ⚡🇦⚡🇾⚡🇦 ⚡🇭⚡🇺",
+        "⚡🇨⚡🇭⚡🇴⚡🇹⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇰 ⚡🇧⚡🇦⚡🇨⚡🇭⚡🇪",
+        "⚡🇨⚡🇭⚡🇴⚡🇹⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭⚡🇦 ⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇾",
+        "⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇧⚡🇦⚡🇰⚡🇦 ⚡🇨⚡🇴⚡🇩⚡🇪⚡🇬⚡🇦",
+        "⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇲⚡🇦⚡🇮⚡🇳 ⚡🇧⚡🇺⚡🇷⚡🇫",
+        "⚡🇧⚡🇭⚡🇮⚡🇰⚡🇦⚡🇷⚡🇮 ⚡🇰⚡🇮 ⚡🇯⚡🇭⚡🇦⚡🇹 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇦 ⚡🇱⚡🇪",
+        "⚡🇨⚡🇭⚡🇴⚡🇩⚡🇰⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇲⚡🇦⚡🇷⚡🇯⚡🇦⚡🇾⚡🇪⚡🇬⚡🇮",
+        "⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇲⚡🇦⚡🇮⚡🇳 ⚡🇲⚡🇴⚡🇺⚡🇳⚡🇹 ⚡🇪⚡🇻⚡🇪⚡🇷⚡🇪⚡🇸⚡🇹",
+        "⚡🇲⚡🇺⚡🇭 ⚡🇲⚡🇪⚡🇾 ⚡🇱⚡🇪⚡🇬⚡🇦 ⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇲⚡🇪⚡🇷⚡🇦",
+        "⚡🇭⚡🇮⚡🇯⚡🇩⚡🇪 ⚡🇰⚡🇮 ⚡🇯⚡🇭⚡🇦⚡🇹 ⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮",
+        "⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇳⚡🇾 ⚡🇵⚡🇹⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾",
+        "⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇰⚡🇮 ⚡🇵⚡🇹⚡🇦 ⚡🇲⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇵⚡🇹⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇸⚡🇧 ⚡🇵⚡🇹⚡🇦 ⚡🇲⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇵⚡🇷 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾",
+        "⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇵⚡🇹⚡🇦",
+        "⚡🇹⚡🇪⚡🇳⚡🇺 ⚡🇴⚡🇷 ⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇵⚡🇹⚡🇦 ⚡🇪⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇧⚡🇸 ⚡🇧⚡🇸 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇦⚡🇵⚡🇳⚡🇮",
+        "⚡🇧⚡🇸 ⚡🇧⚡🇸 ⚡🇲⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇹⚡🇭⚡🇳⚡🇰⚡🇸⚡🇸",
+        "⚡🇧⚡🇸 ⚡??⚡🇸 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇮⚡🇦 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦⚡🇦",
+        "⚡🇧⚡🇸 ⚡🇧⚡🇸 ⚡🇰⚡🇦⚡🇲⚡🇯⚡🇴⚡🇷 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇸⚡🇲⚡🇯⚡🇭 ⚡🇬⚡🇾⚡🇦 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪 ⚡🇦⚡🇧",
+        "⚡🇸⚡🇲⚡🇯⚡🇭 ⚡🇬⚡🇾⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇸⚡🇲⚡🇯⚡🇭 ⚡🇬⚡🇾⚡🇦 ⚡🇹⚡🇺 ⚡🇸⚡🇦⚡🇧⚡🇮⚡🇹 ⚡🇰⚡🇷 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇨⚡🇾⚡🇦 ⚡🇭⚡🇺⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮",
+        "⚡🇪⚡🇦⚡🇸⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇹⚡🇺",
+        "⚡🇪⚡🇦⚡🇸⚡🇾 ⚡🇼8 ⚡🇲⚡?? ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇦⚡🇧",
+        "⚡🇸⚡🇦⚡🇳⚡🇸 ⚡🇦⚡🇷⚡🇮 ⚡🇭⚡🇦 ⚡🇰⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇬⚡🇮 ⚡🇦⚡🇯⚡🇯",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇴 ⚡🇧⚡🇮⚡🇳⚡🇦 ⚡🇸⚡🇦⚡🇳⚡🇸⚡🇸 ⚡🇱⚡🇪⚡🇹⚡🇪 ⚡🇭⚡🇺⚡🇪 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇰⚡🇪 ⚡🇰⚡🇦⚡🇲⚡🇯⚡🇴⚡🇷",
+        "⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦 ⚡🇳⚡🇴⚡🇷⚡🇲⚡🇮⚡🇪 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪 ⚡🇹⚡🇺",
+        "⚡🇫⚡🇷 ⚡🇨⚡🇾⚡🇦 ⚡🇳⚡🇴⚡🇷⚡🇲⚡🇮⚡🇪 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇧⚡🇦⚡🇸 ⚡🇹⚡🇭⚡🇪⚡🇰 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾",
+        "⚡🇧⚡🇦⚡🇸 ⚡🇹⚡🇭⚡🇪⚡🇰 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮",
+        "⚡🇰⚡🇦⚡🇲⚡🇯⚡🇴⚡🇷 ⚡🇹⚡🇭⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇪⚡🇸⚡🇱⚡🇮⚡🇾⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮",
+        "⚡🇲⚡🇦⚡🇮 ⚡🇸⚡🇧 ⚡🇯⚡🇦⚡🇳⚡🇹⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇨⚡🇭⚡🇱 ⚡🇨⚡🇭⚡🇱 ⚡🇭⚡🇹 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮",
+        "⚡🇫⚡🇷 ⚡🇰⚡🇦⚡🇮⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇦⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇧⚡🇦⚡🇸 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇫⚡🇷 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇲⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇰⚡🇦⚡🇲⚡🇯⚡🇴⚡🇷 ⚡🇲⚡🇦 ⚡🇰⚡🇦 ⚡🇧⚡🇨⚡🇭⚡🇦 ⚡🇹⚡🇺 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇧⚡🇭⚡🇴⚡🇹 ⚡🇬⚡🇳⚡🇩⚡🇮 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇵⚡🇷 ⚡🇰⚡🇦⚡🇮⚡🇸⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇮⚡🇹⚡🇳⚡🇦 ⚡🇬⚡🇳⚡🇩⚡🇦",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇨⚡🇾⚡🇦 ⚡🇧⚡🇹⚡🇦 ⚡🇷⚡🇭⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇨⚡🇾⚡🇦 ⚡🇵⚡🇹⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇫⚡🇮⚡🇷 ⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇳⚡🇾 ⚡🇵⚡🇹⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇵⚡🇹⚡🇦 ⚡🇳⚡🇾 ⚡🇰⚡🇴⚡🇳 ⚡🇨⚡🇴⚡🇩 ⚡🇩⚡🇮⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇴",
+        "⚡🇷⚡🇺⚡🇰 ⚡🇦⚡🇦⚡🇾⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇴⚡🇩⚡🇰⚡🇪",
+        "⚡🇼⚡🇦⚡🇮⚡🇹 ⚡🇨⚡🇷 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇴⚡🇩 ⚡🇷⚡🇭⚡🇦 ⚡🇭⚡🇺",
+        "⚡🇼⚡🇦⚡🇮⚡🇹 ⚡🇨⚡🇷 ⚡🇷⚡🇦⚡🇧⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇷⚡🇭⚡🇮 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇼⚡🇦⚡🇮⚡🇹 ⚡🇰⚡🇷 ⚡🇸⚡🇲⚡🇯⚡🇭 ⚡🇷⚡🇭⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇴⚡🇩⚡🇰⚡🇪",
+        "⚡🇼⚡🇦⚡🇮⚡🇹 ⚡🇱⚡🇪 ⚡🇹⚡🇭⚡🇴⚡🇩⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇳⚡🇪 ⚡🇩⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴",
+        "⚡🇷⚡🇺⚡🇰 ⚡🇯⚡🇦 ⚡🇦⚡🇦⚡🇳⚡🇩 ⚡🇷⚡🇰⚡🇭 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇪 ⚡🇱⚡🇮⚡🇾⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇫⚡🇦⚡🇲⚡🇴⚡🇺⚡🇸 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇲⚡🇦⚡🇦⚡🇳 ⚡🇱⚡🇮⚡🇦 ⚡🇲⚡🇪⚡🇳⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇸⚡🇦⚡🇱⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇦⚡🇦⚡🇳 ⚡🇱⚡🇮⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇸⚡🇭⚡🇦⚡🇳⚡🇹 ⚡🇧⚡🇪⚡🇹⚡🇭 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮",
+        "⚡🇸⚡🇭⚡🇦⚡🇳⚡🇹 ⚡🇧⚡🇪⚡🇹⚡🇭⚡🇰⚡🇪 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇹⚡🇺",
+        "⚡🇫⚡🇷 ⚡🇸⚡🇪 ⚡🇸⚡🇭⚡🇦⚡🇳⚡🇹 ⚡🇧⚡🇪⚡🇹⚡🇭 ⚡🇹⚡🇺 ⚡🇨⚡🇺⚡🇩 ⚡🇦⚡🇧 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇾⚡🇭⚡🇦",
+        "⚡🇲⚡🇪⚡🇷⚡🇪 ⚡🇸⚡🇲⚡🇯⚡🇭 ⚡🇳⚡🇾 ⚡🇦⚡🇾⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇱⚡🇪 ⚡🇰⚡🇪⚡🇱⚡🇦 ⚡🇰⚡🇭⚡🇦 ⚡🇹⚡🇺 ⚡🇲⚡🇦⚡🇩⚡🇷⚡🇨⚡🇭⚡🇴⚡🇩",
+        "⚡🇭⚡🇾⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇮 ⚡🇨⚡🇾⚡🇦",
+        "⚡🇭⚡🇾⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇲⚡🇦⚡🇷 ⚡🇬⚡🇦⚡🇮 ⚡🇨⚡🇾⚡🇦",
+        "⚡🇭⚡🇾⚡🇪 ⚡🇸⚡🇨⚡🇭 ⚡🇧⚡🇹⚡🇦 ⚡🇨⚡🇴⚡🇲 ⚡🇨⚡??⚡🇩 ⚡🇩⚡🇮⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴",
+        "⚡🇨⚡🇭⚡🇱 ⚡🇨⚡🇭⚡🇴⚡🇩 ⚡🇩⚡🇮⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇴 ⚡🇸⚡🇲⚡🇯⚡🇭⚡🇱⚡🇪",
+        "⚡🇧⚡🇦⚡🇰⚡🇮 ⚡🇰⚡🇴⚡🇮 ⚡🇩⚡🇮⚡🇰⚡🇰⚡🇦⚡🇹 ⚡🇳⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇧⚡🇦⚡🇰⚡🇮 ⚡🇸⚡🇧 ⚡🇯⚡🇦⚡🇳⚡🇹⚡🇪 ⚡🇪⚡🇾 ⚡🇰⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇩⚡🇰⚡🇦⚡🇩 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇨⚡🇾⚡🇦 ⚡🇵⚡🇹⚡🇦 ⚡🇹⚡🇭⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇳⚡🇪 ⚡🇼⚡🇱⚡🇮 ⚡🇪⚡🇾",
+        "⚡🇵⚡🇷 ⚡🇲⚡🇪⚡🇮 ⚡🇰⚡🇦⚡🇮⚡🇸⚡🇪 ⚡🇯⚡🇳⚡🇹⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇰⚡🇴 ⚡🇰⚡🇴⚡🇮 ⚡🇨⚡🇭⚡🇴⚡🇩 ⚡🇩⚡🇮⚡🇦",
+        "⚡🇵⚡🇷 ⚡🇲⚡🇪⚡🇷⚡🇦 ⚡🇻⚡🇮 ⚡🇲⚡🇦⚡🇳⚡🇳⚡🇦 ⚡🇸⚡🇭⚡🇮 ⚡🇹⚡🇭⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇵⚡🇷 ⚡🇼⚡🇴 ⚡🇬⚡🇱⚡🇹 ⚡🇳⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇵⚡🇷 ⚡🇼⚡🇴 ⚡🇸⚡🇭⚡🇮 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇩⚡🇰⚡🇦⚡🇩 ⚡🇪⚡🇾",
+        "⚡🇵⚡🇷 ⚡🇰⚡🇦⚡🇮⚡🇸⚡🇪 ⚡🇰⚡🇮⚡🇦 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇴⚡🇲⚡🇫⚡🇴⚡🇴",
+        "⚡🇧⚡🇺⚡🇷 ⚡🇨⚡🇭⚡🇪⚡🇪⚡🇷 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦 ⚡🇹⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇰⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇱 ⚡🇲⚡🇪 ⚡🇱⚡🇴⚡🇩⚡🇦 ⚡🇲⚡🇦⚡🇷⚡🇰⚡🇪 ⚡🇺⚡🇸⚡🇰⚡🇮 ⚡🇩⚡🇭⚡🇦⚡🇩⚡🇰⚡🇦⚡🇳 ⚡🇷⚡🇴⚡🇰 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦",
+        "⚡🇱⚡🇺⚡🇱⚡🇱⚡🇪 ⚡🇰⚡🇭⚡🇦 ⚡🇹⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇰⚡🇦⚡🇧⚡🇭⚡🇴⚡🇸⚡🇩⚡🇦",
+        "⚡🇹⚡🇷⚡🇮 ⚡🇧⚡🇭⚡🇳 ⚡🇰⚡🇮 ⚡🇧⚡🇭⚡🇴⚡🇸⚡🇩⚡🇮 ⚡🇧⚡🇪⚡🇹⚡🇦",
+        "⚡🇹⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮 ⚡🇧⚡🇦⚡🇦⚡🇹 ⚡🇰⚡🇭⚡🇹⚡🇲",
+        "⚡🇸⚡🇺⚡🇳 ⚡🇪⚡🇰 ⚡🇲⚡🇦⚡🇿⚡🇪 ⚡🇰⚡🇮 ⚡🇧⚡🇦⚡🇦⚡🇹 ⚡🇧⚡🇦⚡🇹⚡🇦⚡🇴 ⚡🇰⚡🇾⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇭⚡🇦⚡🇮",
+        "⚡🇨⚡🇴⚡🇩⚡🇺 ⚡🇨⚡🇴⚡🇩⚡🇺 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇦⚡🇯 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇴⚡🇾⚡🇪",
+        "⚡🇸⚡🇺⚡🇳 ⚡🇸⚡🇺⚡🇳 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇪 ⚡🇧⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇹⚡🇺",
+        "⚡🇰⚡🇮⚡🇱⚡🇦⚡🇸 ⚡🇳⚡🇾 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇨⚡🇾⚡🇦 ⚡🇵⚡🇹⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇧⚡🇭⚡🇪⚡🇳 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮",
+        "⚡🇵⚡?? ⚡🇵⚡🇷 ⚡🇨⚡🇾⚡🇦 ⚡🇭⚡🇴⚡🇹⚡🇪 ⚡🇪⚡🇾 ⚡🇹⚡🇲⚡🇰⚡🇨",
+        "⚡🇹⚡🇲⚡🇨⚡🇱 ⚡🇸⚡🇺⚡🇳⚡🇱⚡🇪",
+        "⚡🇲⚡🇴⚡🇴⚡🇹 ⚡🇩⚡🇺 ⚡🇹⚡🇪⚡🇷⚡?? ⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇲⚡🇪⚡🇾",
+        "⚡🇧⚡🇭⚡🇬⚡🇳⚡🇾 ⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦 ⚡🇫⚡🇷",
+        "⚡🇫⚡🇷 ⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇹⚡🇺",
+        "⚡🇾⚡🇪 ⚡🇻⚡🇮 ⚡🇸⚡🇭⚡🇮 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇰⚡🇸 ⚡🇧⚡🇸",
+        "⚡🇦⚡🇯 ⚡🇰⚡🇺⚡🇨⚡🇭 ⚡🇳⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮",
+        "⚡🇹⚡🇷⚡🇾 ⚡🇰⚡🇷 ⚡🇲⚡🇪⚡🇷⚡🇦 ⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇨⚡🇭⚡🇺⚡🇸⚡🇰⚡🇪",
+        "⚡🇹⚡🇴⚡🇷⚡🇲⚡🇦⚡🇰⚡🇮⚡🇧⚡🇺⚡🇷 ⚡🇸⚡🇺⚡🇳",
+        "⚡🇹⚡🇴⚡🇷 ⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇫⚡🇺⚡🇩⚡🇩⚡🇮 ⚡🇴⚡🇾⚡🇪",
+        "⚡🇭⚡🇦⚡🇾⚡🇪 ⚡🇭⚡🇦⚡🇾⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇱⚡🇺⚡🇳⚡🇩⚡🇰⚡🇪 ⚡🇵⚡🇦⚡🇸⚡🇮⚡🇳⚡🇪..",
+        "⚡🇰⚡🇺⚡🇹⚡🇹⚡🇪 ⚡🇰⚡🇪 ⚡🇹⚡🇦⚡🇹⚡🇹⚡🇪 ⚡🇸⚡🇺⚡🇳",
+        "⚡🇰⚡🇺⚡🇹⚡🇹⚡🇦 ⚡🇯⚡🇦⚡🇮⚡🇸⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇷⚡🇭⚡🇦 ⚡🇹⚡🇺",
+        "⚡🇲⚡🇺⚡🇭 ⚡🇲⚡🇪⚡🇮 ⚡🇱⚡🇪 ⚡🇲⚡🇪⚡🇷⚡🇦..",
+        "⚡🇯⚡🇭⚡🇦⚡🇹 ⚡🇰⚡🇪 ⚡🇵⚡🇮⚡🇸⚡🇸⚡🇺 ⚡🇸⚡🇺⚡🇳 ⚡🇹⚡🇲⚡🇰⚡🇨",
+        "⚡🇭⚡🇦⚡🇭⚡🇦⚡🇭⚡🇭⚡🇦 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇹⚡🇦⚡🇹⚡🇹⚡🇪 ⚡🇺⚡🇹⚡🇭",
+        "⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇪⚡🇾 ⚡🇹⚡🇺 ⚡🇨⚡🇺⚡🇩 ⚡🇷⚡🇭⚡🇦",
+        "⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇹⚡🇺",
+        "⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇷⚡🇭⚡🇮 ⚡🇩⚡🇪⚡🇰⚡🇭",
+        "⚡🇼⚡🇪⚡🇪⚡🇰 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇦⚡🇧",
+        "⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇳⚡🇾 ⚡🇷⚡🇴⚡🇰 ⚡🇹⚡🇺 ⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇪⚡🇾",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇭⚡🇮⚡🇿⚡🇩⚡🇪",
+        "⚡🇴⚡🇰⚡🇦⚡🇹 ⚡🇳⚡🇾 ⚡🇲⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮",
+        "⚡🇱⚡🇺⚡🇳 ⚡🇱⚡🇪⚡🇬⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇬⚡🇦⚡🇳⚡🇩 ⚡🇲⚡🇪⚡🇮 ?",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇧⚡🇦⚡🇨⚡🇭⚡🇮 ⚡🇨⚡🇴⚡🇩⚡🇺..",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇧⚡🇭⚡🇪⚡🇳 ⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇦⚡🇯 ⚡🇫⚡🇦⚡🇩 ⚡🇩⚡🇺",
+        "⚡🇸⚡🇵⚡🇪⚡🇪⚡🇩 ⚡🇱⚡🇪⚡🇰⚡🇷 ⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦",
+        "⚡🇸⚡🇵⚡🇪⚡🇪⚡🇩 ⚡🇳⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇪 ⚡🇦⚡🇳⚡🇩⚡🇷 ⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇵⚡🇷⚡🇴⚡🇸⚡🇳",
+        "⚡🇺⚡🇬⚡🇱⚡🇾 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇨⚡🇭⚡🇺⚡🇵",
+        "⚡🇲⚡🇦⚡🇰⚡🇦⚡🇫⚡🇺⚡🇩⚡🇩⚡🇦⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇹⚡🇪⚡🇷⚡🇦 ⚡🇧⚡🇦⚡🇦⚡🇵 ⚡🇰⚡🇴 ⚡🇹⚡🇦⚡🇬 ⚡🇰⚡🇷..?",
+        "⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇹⚡🇦⚡🇬 ⚡🇰⚡🇷 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇧⚡🇭⚡🇦⚡🇬⚡🇼⚡🇳 ⚡🇰⚡🇴..",
+        "⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇳⚡🇾 ⚡🇭⚡🇴 ⚡🇹⚡🇺",
+        "⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇭⚡🇴 ⚡🇷⚡🇭⚡🇦 ⚡🇹⚡🇺 ⚡🇰⚡🇮⚡🇩",
+        "⚡🇲⚡🇦 ⚡🇹⚡🇴 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇭⚡🇦⚡🇼⚡🇦⚡🇧⚡🇿⚡🇮 ⚡🇨⚡🇷..",
+        "⚡🇧⚡🇸 ⚡🇲⚡🇦 ⚡🇨⚡🇴⚡🇩⚡🇳⚡🇮 ⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇹⚡🇴⚡🇼⚡🇳 ⚡🇲⚡🇪⚡🇮 ⚡🇨⚡🇺⚡🇩 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇱⚡🇪⚡🇰⚡🇷",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇸⚡🇪⚡🇽⚡🇾 ⚡🇰⚡🇴 ⚡🇧⚡🇪⚡🇯 - ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇧⚡🇭⚡🇬⚡🇼⚡🇳 ⚡🇵⚡🇪",
+        "⚡🇸⚡🇵⚡🇪⚡🇪⚡🇩 ⚡🇵⚡🇰⚡🇩 ⚡🇨⚡🇵 ⚡🇳⚡🇾 ⚡🇰⚡🇷",
+        "⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇷⚡🇪⚡🇳⚡🇩⚡🇾",
+        "⚡🇧⚡🇭⚡🇰⚡🇰 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇹⚡🇪⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇧⚡🇪⚡🇭⚡🇪⚡🇳 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮",
+        "⚡🇨⚡🇺⚡🇩 ⚡🇯⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇩⚡🇮⚡🇩⚡🇮 ⚡🇷⚡🇳⚡🇩⚡🇮",
+        "⚡🇸⚡🇱⚡🇴⚡🇼",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇮⚡🇾⚡🇦 ⚡🇨⚡🇮⚡🇴⚡🇩⚡🇺",
+        "⚡🇧⚡🇭⚡🇦⚡🇬?",
+        "⚡🇧⚡🇭⚡🇦⚡🇰 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇹⚡🇲⚡🇦 ⚡🇨⚡🇴⚡🇩⚡🇺",
+        "⚡🇸⚡🇱⚡🇴⚡🇼",
+        "⚡🇸⚡🇱⚡🇴⚡🇼 ⚡🇫⚡🇮⚡🇷⚡🇸⚡🇪",
+        "⚡🇨⚡🇺⚡🇩⚡🇬⚡🇷⚡🇮⚡🇧",
+        "⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇩⚡🇴⚡🇺",
+        "⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇨⚡🇴⚡🇩⚡🇺",
+        "⚡🇳⚡🇪⚡🇹 ⚡🇴⚡🇳 ⚡🇴⚡🇫⚡🇫 ⚡🇼⚡🇦⚡🇱⚡🇮 ⚡🇷⚡🇳⚡🇩⚡🇾",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇴⚡🇩⚡🇺",
+        "⚡🇮⚡🇩⚡🇭⚡🇦⚡🇷 ⚡🇦⚡🇦⚡🇰⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇨⚡🇭⚡🇦⚡🇦⚡🇵",
+        "⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇲⚡🇷⚡🇩⚡🇺",
+        "⚡🇴⚡🇮 ⚡🇲⚡🇦⚡🇦⚡🇰⚡🇪 ⚡🇱⚡🇴⚡🇩⚡🇪⚡🇪",
+        "⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇪⚡🇯",
+        "⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇺",
+        "⚡🇸⚡🇺⚡🇦⚡🇷 ⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇪⚡🇯",
+        "⚡🇳⚡🇪⚡🇹 ⚡🇴⚡🇫⚡🇫 ⚡🇴⚡🇳 ⚡🇰⚡🇷 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇱⚡🇦⚡🇩⚡🇰⚡🇪",
+        "⚡🇹⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇮 ⚡🇰⚡🇪⚡🇸⚡🇪",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇸⚡🇱⚡🇴⚡🇼 ⚡🇲⚡🇦⚡🇩⚡🇭⚡🇦⚡🇷⚡🇨⚡🇴⚡🇩",
+        "⚡🇹⚡??⚡🇰⚡🇨 ⚡🇨⚡🇴⚡🇩⚡🇺 ⚡🇰⚡🇷 ⚡🇲⚡🇸⚡🇬 ⚡🇩⚡🇪⚡🇱⚡🇪⚡🇹⚡🇪",
+        "⚡🇴⚡🇮 ⚡🇸⚡🇺⚡🇦⚡🇷 ⚡🇰⚡🇪 ⚡🇱⚡🇦⚡🇩⚡🇰⚡🇪",
+        "⚡🇹⚡??⚡🇰⚡🇨 ⚡🇫⚡🇺⚡🇫⚡🇮",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇩⚡🇮⚡🇩⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇮",
+        "⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦",
+        "⚡🇨⚡🇺⚡🇩 ⚡🇦⚡🇧",
+        "⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇧⚡🇭⚡🇦⚡🇰 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇲⚡🇷⚡🇺",
+        "⚡🇹⚡🇲⚡🇰⚡🇱 ⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇬⚡🇷⚡🇮⚡🇧",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇧⚡🇪⚡🇭⚡🇪⚡🇳 ⚡🇻⚡🇪⚡🇸⚡🇮⚡🇾⚡🇦⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇮",
+        "⚡🇮⚡🇹⚡🇳⚡🇦 ⚡🇬⚡🇳⚡🇩⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇦 ⚡🇹⚡🇺 ⚡🇫⚡🇮⚡🇷⚡🇸⚡🇪 ⚡🇳⚡🇪⚡🇹 ⚡🇴⚡🇳 ⚡🇴⚡🇫⚡🇫",
+        "⚡🇬⚡🇷⚡🇮⚡🇧 ⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇪",
+        "⚡🇧⚡🇭⚡🇦⚡🇬 ⚡🇯⚡🇦 ⚡🇱⚡🇴⚡🇩⚡🇪 ⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇲⚡🇦⚡🇷⚡🇺 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦",
+        "⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇲⚡🇷⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦⚡🇦",
+        "⚡🇧⚡🇭⚡🇦⚡🇬 ⚡🇹⚡🇲⚡🇰⚡🇨",
+        "⚡🇧⚡🇭⚡🇦⚡🇬 ⚡🇹⚡🇧⚡🇰⚡🇨",
+        "⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇲⚡🇪⚡🇾 ⚡🇨⚡🇵",
+        "⚡🇨⚡🇵 ⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇲⚡🇪⚡🇭⚡🇭",
+        "⚡🇨⚡🇵 ⚡🇹⚡🇲⚡🇰⚡🇱 ⚡🇲⚡🇪⚡🇭",
+        "⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇦⚡🇧⚡🇪 ⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇩⚡🇴⚡🇺⚡🇧⚡🇱⚡🇪 ⚡🇸⚡🇪⚡🇳⚡🇩 ⚡🇰⚡🇴 ⚡🇨⚡🇵 ⚡🇹⚡🇲⚡🇰⚡🇨 ⚡🇨⚡🇴⚡🇩⚡🇺",
+        "⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇲⚡🇪 ⚡🇨⚡🇵 ⚡🇨⚡🇴⚡🇩 ⚡🇩⚡🇺⚡🇳⚡🇬⚡🇦 ⚡🇦⚡🇦⚡🇯 ⚡🇲⚡🇪⚡🇭⚡🇭",
+        "⚡🇭⚡🇹 ⚡🇹⚡🇧⚡🇰⚡🇨 ⚡🇩⚡🇦⚡🇱⚡🇦⚡🇱 ⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇪.",
+        "⚡🇷⚡🇳⚡🇩⚡🇾 ⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇨⚡🇺⚡🇩⚡🇶 ⚡🇹⚡🇷⚡🇾⚡🇲⚡🇦",
+        "⚡🇵⚡🇦⚡🇷⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭⚡🇪⚡🇬⚡🇦..",
+        "⚡🇹⚡🇷⚡🇦 ⚡🇷⚡🇳⚡🇩⚡🇭⚡🇧⚡🇭⚡🇦⚡🇰",
+        "⚡🇱⚡🇦⚡🇬⚡🇩⚡🇮 ⚡🇰⚡🇪 ⚡🇱⚡🇦⚡🇩⚡🇨⚡🇪 ⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱",
+        "⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱 ⚡🇱⚡🇦⚡🇬⚡🇩⚡🇮 ⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇪..",
+        "⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱",
+        "⚡🇧⚡🇭⚡🇮⚡🇰⚡🇦⚡🇷⚡🇮 ⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇨⚡🇭⚡🇺⚡🇸 ⚡🇲⚡🇪⚡🇷⚡??.",
+        "⚡🇱⚡🇴⚡🇼 ⚡🇱⚡🇪⚡🇻⚡🇪⚡🇱 ⚡🇨⚡🇵 ⚡🇨⚡🇷",
+        "⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱 ⚡🇱⚡🇴⚡🇼 ⚡🇱⚡🇪⚡🇻⚡🇪⚡🇱 ⚡🇼⚡🇪⚡🇦⚡🇰",
+        "⚡🇲⚡🇪⚡🇷⚡🇪 ⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇵⚡🇪 ⚡🇪⚡🇾 ⚡🇹⚡🇺 ⚡🇭⚡🇮⚡🇯⚡🇩⚡🇪",
+        "⚡🇫⚡🇷⚡🇪⚡🇪 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴",
+        "⚡🇫⚡🇷⚡🇪⚡🇪 ⚡🇲⚡🇪⚡🇾 ⚡🇨⚡🇺⚡🇩 ⚡🇹⚡🇺 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪"
+        "⚡🇸⚡🇵⚡🇪⚡🇪⚡🇩 ⚡🇳⚡🇾 ⚡🇼⚡🇪⚡🇦⚡🇰 ⚡🇹⚡🇦⚡🇹⚡🇹⚡🇪 ⚡🇹⚡🇪⚡🇷⚡🇲⚡🇪",
+        "⚡??⚡🇮⚡🇹⚡🇳⚡🇮 ⚡🇧⚡🇷 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦⚡🇾⚡🇪⚡🇬⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾⚡🇲⚡🇦⚡🇰⚡🇴",
+        "⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇱⚡🇪 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇧⚡🇦⚡🇵⚡🇰⚡🇦",
+        "⚡🇱⚡🇺⚡🇳 ⚡🇨⚡🇺⚡🇸 ⚡🇯⚡🇦⚡🇱⚡🇩⚡🇮 ⚡🇸⚡🇪 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇧⚡🇦⚡🇵⚡🇰⚡🇦",
+        "⚡🇰⚡🇴⚡🇮 ⚡🇳⚡🇾 ⚡🇩⚡🇪⚡🇰⚡🇭 ⚡🇷⚡🇭⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇹⚡🇺",
+        "⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇮⚡🇨⚡🇭⚡🇴⚡🇩 ⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪",
+        "⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇧⚡🇸 ⚡🇾⚡🇪⚡🇭⚡🇮 ⚡🇯⚡🇦⚡🇳⚡🇹⚡🇦 ⚡🇲⚡🇪⚡🇾",
+        "⚡🇨⚡🇵 ⚡🇧⚡🇴⚡🇱⚡🇪⚡🇬⚡🇦 ⚡🇹⚡🇴 ⚡🇹⚡🇲⚡🇰⚡🇨",
+        "⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇯⚡🇦⚡🇾⚡🇪⚡🇬⚡🇮",
+        "⚡🇸⚡🇱⚡🇴⚡🇼 ⚡🇪⚡🇾 ⚡🇹⚡🇺 ⚡🇰⚡🇮⚡🇩",
+        "⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇱⚡🇮⚡🇰⚡🇭..",
+        "⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇱⚡🇮⚡🇰⚡🇭..",
+        "⚡🇹⚡🇾⚡🇲 ⚡🇸⚡🇪 ⚡🇵⚡🇭⚡🇱⚡🇪 ⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦",
+        "⚡🇹⚡🇾⚡🇲 ⚡🇭⚡🇴⚡🇬⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦",
+        "⚡🇲⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇹⚡🇾⚡🇲 ⚡🇸⚡🇪 ⚡🇵⚡🇭⚡🇱⚡🇪",
+        "⚡🇺⚡🇹⚡🇭 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇨⚡🇪 ⚡🇰⚡🇪 ⚡🇱⚡🇩⚡🇰⚡🇪",
+        "⚡🇲⚡🇦⚡🇨⚡🇦⚡🇧⚡🇴⚡🇸⚡🇩⚡🇦⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇨⚡🇴⚡🇳 ⚡🇰⚡🇧 ⚡🇨⚡🇴⚡🇩 ⚡🇩⚡🇮⚡🇦 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇹⚡🇪⚡🇷⚡🇾",
+        "⚡🇰⚡🇴⚡🇮 ⚡🇭⚡🇴⚡🇬⚡🇦 ⚡🇹⚡🇲⚡🇱",
+        "⚡🇲⚡🇦⚡🇨⚡🇭⚡🇦⚡🇷 ⚡🇨⚡🇺⚡🇩⚡🇱⚡🇪 ⚡🇹⚡🇺",
+        "⚡🇲⚡🇪⚡🇳⚡🇺 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇨⚡🇴⚡🇩⚡🇳⚡🇦 ⚡🇸⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇧⚡🇴⚡🇱 ⚡🇲⚡🇺⚡🇯⚡🇭⚡🇪 ⚡🇨⚡🇴⚡🇩 ⚡🇩⚡🇪",
+        "⚡🇧⚡🇸 ⚡🇲⚡🇪⚡🇾 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩⚡🇳⚡🇦 ⚡🇨⚡🇭⚡🇹⚡🇦 ⚡🇭⚡🇺",
+        "⚡🇪⚡🇼⚡🇼 ⚡🇲⚡🇦⚡🇰⚡🇦 ⚡🇱⚡🇴⚡🇩⚡🇪 ⚡🇺⚡🇹⚡🇭",
+        "⚡🇲⚡🇪⚡🇴⚡🇼 ⚡🇨⚡🇷 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇨⚡🇴⚡🇩⚡🇺",
+        "⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇷⚡🇰⚡🇭 ⚡🇩⚡🇮⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇪 ⚡🇫⚡🇺⚡🇩⚡🇪 ⚡🇵⚡🇪",
+        "⚡🇲⚡🇪⚡🇷⚡🇦 ⚡🇱⚡🇺⚡🇳⚡🇩 ⚡🇰⚡🇪 ⚡🇧⚡🇦⚡🇱 ⚡🇺⚡🇹⚡🇭",
+        "⚡🇰⚡🇮⚡🇩⚡🇪⚡🇪 ⚡🇿⚡🇮⚡🇳⚡🇩⚡🇦 ⚡🇭⚡🇴",
+        "⚡🇲⚡🇦⚡🇷 ⚡🇳⚡🇾 ⚡🇰⚡🇮⚡🇩⚡🇩⚡🇪 ⚡🇹⚡🇾⚡🇵⚡🇪 ⚡🇰⚡🇷",
+        "⚡🇨⚡🇭⚡🇺⚡🇵 ⚡🇧⚡🇰⚡🇱",
+        "⚡🇧⚡🇨 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹",
+        "⚡🇲⚡🇨 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇫⚡🇦⚡🇸⚡🇹",
+        "⚡🇫⚡🇦⚡🇸⚡🇹 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪",
+        "⚡🇫⚡🇦⚡🇸⚡🇹 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇰⚡🇦⚡🇲⚡🇿⚡🇴⚡🇷"
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇨⚡🇱⚡🇦⚡🇮⚡🇲 ⚡🇨⚡🇷⚡🇼⚡🇦",
+        "⚡🇦⚡🇼⚡🇿 ⚡🇳⚡🇮⚡🇨⚡🇭⚡🇪 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇨⚡🇪 ⚡🇰⚡🇪 ⚡🇧⚡🇨⚡🇭⚡🇪",
+        "⚡🇸⚡🇦⚡🇼⚡🇦⚡🇱 ⚡🇳⚡🇾 ⚡🇵⚡🇺⚡🇨⚡🇭 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇦⚡🇧⚡🇴⚡🇸⚡🇩⚡🇦",
+        "⚡🇫⚡🇾⚡🇹⚡🇪⚡🇷 ⚡🇧⚡🇳⚡🇪⚡🇬⚡🇦 ⚡🇱⚡🇦⚡🇬⚡🇩⚡🇪 ⚡🇲⚡🇦⚡🇩⚡🇷⚡🇨⚡🇭⚡🇴⚡🇩",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇰⚡🇦⚡🇦⚡🇱⚡🇪 ⚡🇷⚡🇴 ⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇰⚡🇦⚡🇦⚡🇱⚡🇪 ⚡🇷⚡🇴⚡🇴 ⚡🇳⚡🇾",
+        "⚡🇸⚡🇭⚡🇴⚡🇷⚡🇹 ⚡🇳⚡🇾 ⚡🇨⚡🇺⚡🇩 ⚡🇹⚡🇺 ⚡🇧⚡🇮⚡🇳⚡🇦 ⚡🇷⚡🇺⚡🇰⚡🇪",
+        "⚡🇸⚡🇭⚡🇴⚡🇷⚡🇹 ⚡🇳⚡🇾 ⚡🇨⚡🇺⚡🇩 ⚡🇹⚡🇺 ⚡🇦⚡🇵⚡🇳⚡🇮 ⚡🇲⚡🇦⚡🇰⚡🇴 ⚡🇱⚡🇪⚡🇰⚡🇷",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇪 ⚡🇸⚡🇹⚡🇭 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇧⚡🇭⚡🇪⚡🇳 ⚡🇻⚡🇮 ⚡🇨⚡🇺⚡🇩⚡🇼⚡🇦 ⚡🇱⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇪 ⚡🇸⚡🇹⚡🇭 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇩⚡🇮⚡🇩⚡🇮 ⚡🇻⚡🇮 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮",
+        "⚡🇨⚡🇭⚡🇦⚡🇹 ⚡🇫⚡🇾⚡🇹⚡🇪⚡🇷 ⚡🇧⚡🇳⚡🇪⚡🇬⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇨⚡🇪 ⚡🇨⚡🇴⚡🇩⚡🇺 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇰⚡🇴",
+        "⚡🇧⚡🇴⚡🇱 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮⚡🇧⚡🇦⚡🇦⚡🇿 ⚡🇩⚡🇦⚡🇩⚡🇩⚡🇾 ⚡🇪⚡🇾",
+        "⚡🇧⚡🇺⚡🇱⚡🇱⚡🇾🇽 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇺⚡🇹⚡🇭",
+        "⚡🇲⚡🇦⚡🇷 ⚡🇲⚡🇦⚡🇷⚡🇰⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇷⚡🇭⚡🇦 ⚡🇹⚡🇺",
+        "⚡🇴⚡🇷 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦 ⚡🇲⚡🇦⚡🇷⚡🇰⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇦⚡🇮"
+        "⚡🇯⚡🇦⚡🇱⚡🇩⚡🇮 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇷⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇯",
+        "⚡🇴⚡🇷 ⚡🇧⚡🇩⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇹⚡🇲⚡🇨",
+        "⚡🇴⚡🇷 ⚡🇧⚡🇩⚡🇦 2 ⚡🇱⚡🇮⚡🇳⚡🇪 ⚡🇼⚡🇱⚡🇦 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇹⚡🇲⚡🇰⚡🇨",
+        "⚡🇴⚡🇷 ⚡🇧⚡??⚡🇦 ⚡🇴⚡🇾⚡🇪 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇹⚡🇲⚡🇱",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇦 ⚡🇧⚡🇺⚡🇷",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇰⚡🇪⚡🇪⚡🇩⚡🇪",
+        "⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮 ⚡🇰⚡🇪 ⚡🇱⚡🇦⚡🇩⚡🇰⚡🇪",
+        "⚡🇯⚡🇦⚡🇱⚡🇩⚡🇮 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇧⚡🇪⚡🇭⚡🇪⚡🇳 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇺",
+        "⚡🇲⚡🇰⚡🇱 ⚡🇺⚡🇹⚡🇭 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮 ⚡🇰⚡🇪 ⚡🇧⚡🇦⚡🇨⚡🇨⚡🇭⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇳⚡🇦⚡🇳⚡🇮 ⚡🇲⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦⚡🇱",
+        "⚡🇹⚡🇪⚡🇯 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇨⚡🇪",
+        "⚡🇴⚡🇾⚡🇪 ⚡🇲⚡🇦⚡🇦⚡🇰⚡🇪 ⚡🇱⚡🇴⚡🇩⚡🇪 ⚡🇲⚡🇷⚡🇪⚡🇳⚡🇬⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇾",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇮⚡🇾⚡🇦 ⚡🇰⚡🇮 ⚡🇬⚡🇦⚡🇳⚡🇩",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇩⚡🇦⚡🇩⚡🇮 ⚡🇰⚡🇦 ⚡🇫⚡🇺⚡🇩⚡🇩⚡🇦",
+        "⚡🇲⚡🇰⚡🇱 ⚡🇺⚡🇹⚡🇭 ⚡🇧⚡🇪⚡🇭⚡🇪⚡🇳⚡🇨⚡🇴⚡🇩",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇮 ⚡🇧⚡🇺⚡🇷 ⚡🇩⚡🇪",
+        "⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇦 ⚡🇫⚡🇺⚡🇩⚡🇩⚡🇦 ⚡🇲⚡🇪 ⚡🇱⚡🇦⚡🇺⚡🇩⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇺⚡🇩⚡🇻⚡🇦",
+        "⚡🇷⚡🇦⚡🇳⚡🇩⚡🇮 ⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇪 ⚡🇲⚡🇦⚡🇷 ⚡🇬⚡🇦⚡🇾⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇲⚡🇷⚡🇺",
+        "⚡🇯⚡🇦⚡🇱⚡🇮⚡🇩 ⚡🇰⚡🇷 ⚡🇸⚡🇵⚡🇦⚡🇲",
+        "⚡🇲⚡🇨 ⚡🇸⚡🇵⚡🇦⚡🇲 ⚡🇷⚡🇴⚡🇰⚡🇪⚡🇳⚡🇬⚡🇦",
+        "⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦⚡🇰⚡🇮 ⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇸⚡🇵⚡🇦⚡🇲 ⚡🇰⚡🇷",
+        "⚡🇸⚡🇵⚡🇦⚡🇲 ⚡🇰⚡🇷.⚡🇲⚡🇦⚡🇦⚡🇰⚡🇪 ⚡🇱⚡🇴⚡🇩⚡🇪",
+        "⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇪 ⚡🇸⚡🇵⚡🇦⚡🇲 ⚡🇰⚡🇷 ⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇨⚡🇺⚡🇩 ⚡🇹⚡🇺",
+        "⚡🇸⚡🇵⚡🇦⚡🇲 ⚡🇰⚡🇷 ⚡🇰⚡🇮⚡🇩",
+        "⚡🇳⚡🇴⚡🇴⚡🇧 ⚡🇹⚡🇪⚡🇷⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇨⚡🇭⚡🇴⚡🇩⚡🇺",
+        "⚡🇷⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇧⚡🇪⚡🇹⚡🇪 ⚡🇲⚡🇦⚡🇷 ⚡🇲⚡🇦⚡🇹 ⚡🇹⚡🇺",
+        "⚡🇳⚡🇴⚡🇴⚡🇧 ⚡🇯⚡🇦⚡🇱⚡🇩⚡🇮 ⚡🇱⚡🇮⚡🇰⚡🇭 ⚡🇼⚡🇷⚡🇳⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇲⚡🇦⚡🇦 ⚡🇷⚡🇦⚡🇳⚡🇩",
+        "⚡🇨⚡🇺⚡?? ⚡🇬⚡🇦⚡🇮 ⚡🇲⚡🇦⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇳⚡🇴⚡🇴⚡🇧",
+        "⚡🇺⚡🇹⚡🇭 ⚡🇷⚡🇦⚡🇳⚡🇩⚡🇾⚡🇰⚡🇪 ⚡🇳⚡🇴⚡🇴⚡🇧",
+        "⚡🇨⚡🇭⚡🇱 ⚡🇨⚡🇺⚡🇩⚡🇰⚡🇪 ⚡🇩⚡🇮⚡🇰⚡🇭⚡🇦 ⚡🇳⚡🇴⚡🇴⚡🇧",
+        "⚡🇯⚡🇱⚡🇩⚡🇮 ⚡🇹⚡🇾⚡🇵 ⚡🇨⚡🇷 ⚡🇳⚡🇴⚡🇴⚡🇧 ⚡🇭⚡🇦⚡🇱⚡🇰⚡🇪",
+        "⚡🇨⚡🇺⚡🇩 ⚡🇰⚡🇪 ⚡🇵⚡🇬⚡🇱 ⚡🇳⚡🇾 ⚡🇭⚡🇴 ⚡🇳⚡🇴⚡🇴⚡🇧",
+        "⚡🇨⚡🇺⚡🇩 ⚡🇨⚡🇺⚡🇩 ⚡🇰⚡🇪 ⚡🇷⚡🇦⚡🇳⚡🇩 ⚡🇧⚡🇳⚡🇯⚡🇦 ⚡🇹⚡🇺 ⚡🇳⚡🇴⚡🇴⚡🇧",
+        "⚡🇲⚡🇦⚡🇰⚡🇮⚡🇨⚡🇭⚡🇺⚡🇹 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇳⚡🇴⚡🇴⚡🇧",
+        "⚡🇬⚡🇦⚡🇳⚡🇩⚡🇦 ⚡🇨⚡🇾⚡🇺 ⚡🇨⚡🇺⚡🇩 ⚡🇷⚡🇭⚡🇦 ⚡🇹⚡🇺 ?",    "⚡🇮⚡🇹⚡🇳⚡🇦 ⚡🇬⚡🇳⚡🇩⚡🇦 ⚡🇳⚡🇾 ⚡🇨⚡🇺⚡🇩 ⚡🇦⚡🇨⚡🇭⚡🇪 ⚡🇸⚡🇪 ⚡🇨⚡🇺⚡🇩",
+        "⚡🇲⚡🇦⚡🇦⚡🇳 ⚡🇱⚡🇪 ⚡🇨⚡🇺⚡🇩 ⚡🇬⚡🇾⚡🇦 ⚡🇹⚡🇺 ⚡🇸⚡🇺⚡🇳 ⚡🇧⚡🇦⚡🇹 ⚡🇦⚡🇧",
+        "⚡🇲⚡🇦⚡🇰⚡🇦⚡🇫⚡🇺⚡🇩⚡🇩⚡🇦 ⚡🇫⚡🇦⚡🇹 ⚡🇬⚡🇾⚡🇦 ⚡🇹⚡🇪⚡🇷⚡🇾 ⚡🇷⚡🇺⚡🇰",
+    ]
+            ]
+            bas_texts = [
+                "★🆂★🅷★🅰★🅽★🆃 ★🅱★🅴★🆃★🅷 ★🅼★🅰★🅳★🆁★🅲★🅷★🅾★🅳 ★🆆★🆁★🅽★🅰 ★🅼★🅰★🅺★🅰★🅱★🅾★🆂★🅳★🅰 ★🆃★🅴★🅴★🆈.",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃..",
+        "★🅻★🆆★🅳★🅴 ★🅺★🅴 ★🅱★🅰★🅰★🅰★🅻★🅻★🅻 ★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🅲★🆄★🅳★🅺★🅴 ★🅿★🅶★🅻 ★🅳★🅴★🅺★🅷.",
+        "★🅼★🅰★🅲★🅷★🅰★🆁 ★🅺★🅸 ★🅹★🅷★🅰★🅰★🆃 ★🅺★🅴 ★🅱★🅰★🅰★🅰★🅻★🅻★🅻★🅻 ★🅲★🆄★🅳 ★🅰★🅲★🅷★🅴 ★🆂★🅴 ★🆈★🅷★🅰★🅿★🅴 ★🆃★🅤",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼 ★🅳★🆄 ★🆃★🅰★🅿★🅰 ★🆃★🅰★🅿?",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅷★🅽 ★🅰★🅱★🅰★🅱★🅴 ★🅱★🅳★🅸 ★🆁★🅰★🅽★🅳★🅸.",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅾★🅰★🅰★🅴 ★🅱★🅰★🅳★🅸 ★🆁★🅰★🅽★🅳★🅳★🅳★🅳★🅳",
+        "★🆃★🅴★🆁★🅰 ★🅱★🅰★🅰★🅿 ★🆁★🅰★🅽★🅳★🅸★🅱★🅰★🅰★🅾 ★🅴★🅈 ★🅳★🅴★🅺★🅷",
+        "★🅺★🅸★🆃★🅽★🅸 ★🅲★🅷★🅾★🅳★🆄 ★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅰★🅱 ★🅾★🆁..",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅲★🅷★🅾★🅳 ★🅳★🅸 ★🅷★🅼 ★🅽★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅴 ★🅱★🅴★🅴★🅻★🅰 ★🅱★🅽★🅴★🅶★🅰 ★🆁★🅾★🅰★🅳 ★🅿★🅴★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅴★🅺 ★🅳★🅰★🅼 ★🆃★🅾★🅿 ★🅱★🅴★🆇★🆈",
+        "★🅼★🅰★🅻★🆄★🅼 ★🅽★🅰 ★🅿★🅷★🆁 ★🅺★🅴★🅰★🅴 ★🅻★🅴★🆃★🅰 ★🅷★🆄 ★🅼 ★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🆃★🅰★🅿★🅰 ★🆃★🅰★🅿★🅿★🅿★🅿★🅿",
+        "★🅻★🆄★🅽★🅳 ★🅺★🅴 ★🅲★🅷★🅾★🅳★🅴 ★🆃★🅤 ★??★🅴★🆁★🅴★🅶★🅰 ★🆃★🆈★🅿★🅸★🅽★🅶 ★🅺★🆁★🅴★🅶★🅰 ★🆃★🅼★🅺★🅲",
+        "★🅱★🅴★🅱★🅳 ★🅿★🅺★🅳 ★🅻★🆆★🅳★🅴★🅴★🅴★🅴 ★🆆★🆁★🅽★🅰 ★🅼★🅴★🆁★🅰 ★🅻★🆄★🅽★🅳 ★🅿★🅺★🅳",
+        "★🅱★🅰★🅰★🅿 ★🅺★🅸 ★🅱★🅴★🅱★🅳 ★🅼★🆃★🅲★🅷 ★🅺★🆁★🆁★🆁",
+        "★🅻★🆆★🅳★🅰 ★🅻★🅴 ★🅼★🅴★🆁★🅰 ★🅹★🅰★🅻★🅳★🅸 ★🆂★🅴 ★🆃★🅤",
+        "★🅿★🅰★🅿★🅰 ★🅺★🅸 ★🅱★🅴★🅱★🅳 ★🅼★🆃★🅲★🅷 ★🅽★🅷★🅸 ★🅷★🅾 ★🆁★🅷★🅸 ★🅺★🆈★🅰 ★🆃★??★🆁★🅴★🆂★🅴",
+        "★🅰★🅻★🅴 ★🅰★🅻★🅴 ★🅼★🅴★🅻★🅰 ★🅱★🅲★🅷★🅰★🅰★🅰 ★🆃★🅴★🆁★🆈 ★🅼★🅰★🅺★🅰 ★🅱★🅾★🅂★🅳★🅰 ★🆂★🆄★🅽",
+        "★🅲★🅷★🆄★🅳 ★🅶★🆈★🅰 ★🆁★🅰★🅽★🅳★🅸★🅱★🅰★🅰★🅾 ★🅿★🅰★🅿★🅰 ★🅱★🅴★🅴★🅴 ★🆃★🅤",
+        "★🅼★🅴★🅽★🆄 ★🅺★🅸 ★🅿★🆃★🅰 ★🆃★🅴★🆁★🆈 ★🅼★🅰 ★🅲★🆄★🅳 ★🅶★🅰★🅸",
+        "★🅺★🅾★🅸 ★🅱★🅰★🅰★🆃 ★🅽★🅈 ★🅼★🅰★🅰 ★🆁★🅰★🅽★🅳★🆈 ★🆃★🅴★🆁★🆈",
+        "★🅷★🅰★🅷★🅰★🅷★🅰★🅰★🅰★🅰★🅰 ★🅼★🅰★🅺★🅰★🅱★🅾★🅂★🅳★🅰 ★🆃★🅴★🆁★🆈",
+        "★🆇★🅷★🆄★🅳 ★🅶★🅰★🅸 ★🅼★🅰★🅰 ★🆃★🅴★🆁★🆈 ★🅺★🅸★🅳★🅰★🅰★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅲★🅷★🆄★🅳 ★🅶★🆈★🅸 ★🅰★🅱 ★🅱★🅰★🆁 ★🅼★🆃 ★🅷★🅾★🅽★🅰",
+        "★🆈★🅴 ★🅻★🆄★🅽★🅳 ★🅻★🅴 ★🅼★🅴★🆁★🅰 ★🅲★🅷★🅻 ★🅹★🅰★🅻★🅳★🅸 ★🆂★🅴",
+        "★🅺★🅸★🅳★🅰★🅰★🅰 ★🅱★🅰★🆁 ★🅽★🅰 ★🅷★🅾 ★🆃★🅤 ★🅷★🅰★🅷★🅰★🅷★🅷",
+        "★🅱★🅷★🅴★🅽 ★🅺★🅴 ★🅻★🆆★🅳★🅴 ★🅱★🅷★🆁★🅼 ★🅺★🆁",
+        "★🅺★🅸★🆃★🅽★🅸 ★🅶★🅻★🅸★🅈★🅰 ★🅿★🅳★🆆★🅴★🅶★🅰 ★🅰★🅿★🅽★🅸 ★🅼★🅰 ★🅺★🅾",
+        "★🅲★🅷★🆄★🅿 ★🅽★🅰★🅻★🅻★🅸★🅸 ★🆁★🅰★🅽★🅳★🆈★🅺★🅴 ★🅻★🅰★🅳★🅺★🅴",
+        "★🅱★🅰★🅰★🆁 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅱★🅰★🅳★🅰★🅺 ★🅿★🅁 ★🅻★🅸★🆃★🅰★🅺★🅴 ★🅲★🅷★🅾★🅳 ★🅳★🆄★🅽★🅶★🅰 😂😆🤤",
+        "★🅰★🅱★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰 ★🅼★🅰★🅳★🅴★🆁★🅲★🅷★🅾★🅾★🅳 ★🅺★🆁 ★🅿★🅸★🅻★🅻★🅴 ★🅿★🅰★🅿★🅰 ★🅱★🅴★🅴 ★🅻★🅰★🅳★🅴★🅶★🅰 ★🆃★🅤 😼😂🤤",
+        "★🅶★🅰★🅻★🅸 ★🅶★🅰★🅻★🅸 ★🅽★🅴 ★🅱★🅷★🅾★🆁 ★🅷★🅴 ★🆃★🅴★??★🅸 ★🅼★🅰★🅰 ★🆁★🅰★🅽★🅳★🅸 ★🅲★🅷★🅾★🆁 ★🅷★🅴 💋💋💦",
+        "★🅰★🅱★🅴 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅾 ★🅲★🅷★🅾★🅳★🆄 ★🆁★🅰★🅽★🅳★🅸★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 ★🅺★🆄★🆃★🆃★🅴 ★🅺★🅴 ★🅲★🅷★🅾★🅳★🅴 😂👻🔥",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅰★🅸★🅱★🅴 ★🅲★🅷★🅾★🅳★🅰 ★🅰★🅸★🅱★🅴 ★🅲★🅷★🅾★🅳★🅰 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅰 ★🅱★🅴★🅳 ★🅿★🅴★🅷★🅸 ★🅼★🆄★🆃★🅷 ★🅳★🅸★🅰 💦💦💦💦",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅴 ★🅱★🅷★🅾★🅱★🅴★🅳★🅴 ★🅼★🅴 ★🅰★??★🅰★🅶 ★🅻★🅰★🅶★🅰★🅳★🅸★🅰 ★🅼★🅴★🆁★🅰 ★🅼★🅾★🆃★🅰 ★🅻★🆄★🅽★🅳 ★🅳★🅰★🅻★🅺★🅴 🔥🔥💦😆😆",
+        "★🆁★🅰★🅽★🅳★🅸★🅺★🅴 ★🅱★🅰★🅲★🅷★🅷★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅲★🅷★🅾★🅳★🆄 ★🅲★🅷★🅰★🅻 ★🅽★🅸★🅺★🅰★🅻",
+        "★🅺★🅸★🆃★🅽★🅰 ★🅲★🅷★🅾★🅳★🆄 ★🆃★🅴★🆁★🅸 ★🆁★🅰★🅽★🅳★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅰★🅱★🅱 ★🅰★🅿★🅽★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅾 ★🅱★🅷★🅴★🅹 😆👻🤤",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅾★🆃★🅾 ★🅲★🅷★🅾★🅳 ★🅲★🅷★🅾★🅳★🅺★🅴 ★🅿★🆄★🆁★🅰 ★🅱★🅰★🅰★🅳 ★🅳★🅸★🅰 ★🅲★🅷★🆄★🆃★🅷 ★🅰★🅱★🅱 ★??★🅴★🆁★🅸 ★🅶★🅱 ★🅺★🅾 ★🅱★🅷★🅴★🅹 😆💦🤤",
+        "★🆃★🅴★🆁★🅸 ★🅶★🅱 ★🅺★🅾 ★🅴★🆃★🅽★🅰 ★🅲★🅷★🅾★🅳★🅰 ★🅱★🅴★🅷★🅴★🅽 ★??★🅴 ★🅻★🅾★🅳★🅴 ★🆃★🅴★🆁★🅸 ★🅶★🅱 ★🆃★🅾 ★🅼★🅴★🆁★🅸 ★🆁★🅰★🅽★🅳★🅸 ★🅱★🅰★🅽★🅶★🅰★🆈★🅸 ★🅰★🅱★🅱 ★🅲★🅷★🅰★🅻 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅲★🅷★🅾★🅳★🆃★🅰 ★🅱★🅸★🆁★🅱★🅴 ♥️💦😆😆😆😆",
+        "★🅷★🅰★🆁★🅸 ★🅷★🅰★🆁★🅸 ★🅶★🅷★🅰★🅰★🅱 ★🅼★🅴 ★🅹★🅷★🅾★🅿★🅳★🅰 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰 🤣🤣💋💦",
+        "★🅲★🅷★🅰★🅻 ★🆃★🅴★🆁★🅴 ★🅱★🅰★🅰★🅿 ★🅺★🅾 ★🅱★🅷★🅴★🅹 ★🆃★🅴★🆁★🅰 ★🅱★🅰★🅱★🅺★🅰 ★🅽★🅷★🅸 ★🅷★🅴 ★🅿★🅰★🅿★🅰 ★🅱★🅴★🅴 ★🅻★🅰★🅳★🅴★🅶★🅰 ★🆃★🅤",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅼★🅴 ★🅱★🅾★🅼★🅱 ★🅳★🅰★🅻★🅺★🅴 ★🆄★🅳★🅰 ★🅳★🆄★🅽★🅶★🅰 ★🅼★🅰★🅰★🅺★🅴 ★🅻★🅰★🆆★🅳★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🆃★🆁★🅰★🅸★🅽 ★🅼★🅴 ★🅻★🅴★🅹★🅰★🅺★🅴 ★🆃★🅾★🅿 ★🅱★🅴★🅳 ★🅿★🅴 ★🅻★🅸★🆃★🅰★🅺★🅴 ★🅲★🅷★🅾★🅳 ★🅳★🆄★🅽★🅶★🅰 ★🅱★🅰★🅰★🆁 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 🤣🤣💋💋",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅴 ★🅽★🆄★🅳★🅴★🅰 ★🅶★🅾★🅾★🅶★🅻★🅴 ★🅿★🅴 ★🆄★🅿★🅻★🅾★🅰★🅳 ★🅺★🅰★🆁★🅳★🆄★🅽★🅶★🅰 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅴 ★🅻★🅰★🅴★🆆★🅳★🅴 👻🔥",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅴 ★🅽★🆄★🅳★🅴★🅰 ★🅶★🅾★🅾★🅶★🅻★🅴 ★🅿★🅴 ★🆄★🅿★🅻★🅾★🅰★🅳 ★🅺★🅰★🆁★🅳★🆄★🅽★🅶★🅰 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅴 ★🅻★🅰★🅴★🆆★🅳★🅴 👻🔥",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅾 ★🅲★🅷★🅾★🅳 ★??★🅷★🅾★🅳★🅺★🅴 ★🅱★🅰★🅽★🅰★🅺★🅴 ★🅱★🅸★🅳★🅴★🅾 ★🅱★🅰★🅽★🅰★🅺★🅴 ★🆇★🅽★🆇★🆇.★🅲★🅾★🅼 ★🅿★🅴 ★🅽★🅴★🅴★🅻★🅰★🅼 ★🅺★🅰★🆁★🅳★🆄★🅽★🅶★🅰 ★🅺★🆄★🆃★🆃★🅴 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 💦💋",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🅳★🅰★🅸 ★🅺★🅾 ★🅿★🅾★🆁★🅽★🅷★🆄★🅱.★🅲★🅾★🅼 ★🅿★🅴 ★🆄★🅿★🅻★🅾★🅰★🅳 ★🅺★🅰★🆁★🅳★🆄★🅽★🅶★🅰 ★🅱★🅰★🅰★🆁 ★🅺★🅴 ★🅲★🅷★🅾★🅳★🅴 🤣💋💦",
+        "★🅰★🅱★🅴 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅾 ★🅲★🅷★🅾★🅳★🆄 ★🆁★🅰★🅽★🅳★🅸★🅺★🅴 ★🅱★🅰★🅲★🅷★🅷★🅴 ★🆃★🅴★🆁★🅴★🅺★🅾 ★🅲★🅷★🅰★🅺★🅺★🅾 ★🅱★🅴★🅴 ★🅿★🅸★🅻★🆆★🅰★🆅★🆄★🅽★🅶★🅰 ★🆁★🅰★🅽★🅳★🅸★🅺★🅴 ★🅱★🅰★🅲★🅷★🅷★🅴 🤣🤣",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅱★🅰★🅰★🅳★🅺★🅴 ★🆁★🅰★🅺★🅳★🅸★🅰 ★🅼★🅰★🅰★🅺★🅴 ★🅻★🅾★🅳★🅴 ★🅹★🅰★🅰 ★🅰★🅱★🅱 ★🅱★🅸★🅻★🆆★🅰★🅻★🅴 👄👄",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅼★🅴 ★🅼★🅴★🆁★🅰 ★🅻★🆄★🅽★🅳 ★🅺★🅰★🅰★🅻★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅻★🅴★🆃★🅸 ★🅼★🅴★🆁★🅸 ★🅻★🆄★🅽★🅳 ★🅱★🅰★🅳★🅴 ★🅼★🅰★🅱★🅰★🅱★🅸 ★🅱★🅴★🅴 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅾 ★🅼★🅴★🅽★🅴 ★🅲★🅷★🅾★🅳 ★🅳★🅰★🅻★🅰 ★🅱★🅾★🅷★🅾★🆃 ★🅱★🅰★🅱★🆃★🅴 ★🅱★🅴★🅴",
+        "★🅱★🅴★🆃★🅴 ★🆃★🅤 ★🅱★🅰★🅰★🅿 ★🅱★🅴★🅴 ★🅻★🅴★🅶★🅰 ★🅿★🅰★🅽★🅶★🅰 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅰 ★🅺★🅾 ★🅲★🅷★🅾★🅳 ★🅳★🆄★🅽★🅶★🅰 ★🅺★🅰★🆁★🅺★🅴 ★🅽★🅰★🅽★🅶★🅰 💦💋",
+        "★🅷★🅰★🅷★🅰★🅷★🅰★🅷 ★🅼★🅴★🆁★🅴 ★🅱★🅴★🆃★🅴 ★🅰★🅶★🅻★🅸 ★🅱★🅰★🅰★🆁 ★🅰★🅿★🅽★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅻★🅴★🅺★🅴 ★🅰★🅰★🆈★🅰 ★🅼★🅰★🆃★🅷 ★🅺★🅰★🆃 ★🅾★🆁 ★🅼★🅴★🆁★🅴 ★🅼★🅾★🆃★🅴 ★🅻★🆄★🅽★🅳 ★🅱★🅴★🅴 ★🅲★🅷★🆄★🅳★🆆★🅰★🆈★🅰 ★🅼★🅰★🆃★🅷 ★🅺★🅰★🆁",
+        "★🅲★🅷★🅰★🅻 ★🅱★🅴★🆃★🅰 ★🆃★🆄★🅹★🅷★🅴 ★🅼★🅰★🅰★🅱 ★🅺★🅸★🅰 🤣★🆃★🅤 ★🅰★🅱★🅱 ★🅰★🅿★🅽★🅸 ★🅼★🅰★🅺★🅾 ★🅱★🅷★🅴★🅹",
+        "★🅱★🅷★🅰★🆁★🅰★🅼 ★🅺★🅰★🆁 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅳★🅰 ★🅺★🅸★🆃★🅽★🅰 ★🅶★🅰★🅰★??★🅸★🅰 ★🅱★🆄★🅽★🆆★🅰★🆈★🅴★🅶★🅰 ★🅰★🅿★🅽★🅸 ★🅼★🅰★🅰★🅰 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅴 ★🆄★🅿★🅴★🆁",
+        "★🅰★🅱★🅴 ★🆁★🅰★🅽★🅳★🅸★🅺★🅴 ★🅱★🅰★🅲★🅷★🅷★🅴 ★🅰★🆄★🅺★🅰★🆃 ★🅽★🅷★🅸 ★🅷★🅴★🆃★🅾 ★🅰★🅿★🅽★🅸 ★🆁★🅰★🅽★🅳★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅻★🅴★🅺★🅴 ★🅰★🅰★🆈★🅰 ★🅼★🅰★🆃★🅷 ★🅺★🅰★🆁 ★🅷★🅰★🅷★🅰★🅷★🅰★🅷★🅰",
+        "★🅺★🅸★🅳★🅾 ★🅼★🅰★🅳★🅰★🆁★🅲★🅷★🅾★🅳 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅲★🅷★🅾★?? ★🅲★🅷★🅾★🅳★🅺★🅴 ★🆃★🅴★🆁★🆁 ★🅻★🅸★🆈★🅴 ★🅱★🅷★🅰★🅸 ★🅳★🅴★🅳★🅸★🆈★🅰",
+        "★🅹★🆄★🅽★🅶★🅻★🅴 ★🅼★🅴 ★🅽★🅰★🅲★🅷★🆃★🅰 ★🅷★🅴 ★🅼★🅾★🆁★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🅳★🅰★🅸 ★🅳★🅴★🅺★🅺★🅴 ★🅱★🅰★🅱 ★🅱★🅾★🅻★🆃★🅴 ★🅾★🅽★🅲★🅴 ★🅼★🅾★🆁★🅴 ★🅾★🅽★🅲★🅴 ★🅼★🅾★🆁★🅴 🤣🤣💦💋",
+        "★🅶★🅰★??★🅸 ★🅶★🅰★🅻★🅸 ★🅼★🅴 ★🆁★🅴★🅷★🆃★🅰 ★🅷★🅴 ★🅱★🅰★🅽★🅳 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅲★🅷★🅾★🅳 ★🅳★🅰★🅻★🅰 ★🅾★🆁 ★🅱★🅰★🅽★🅰 ★🅳★🅸★🅰 ★🆁★🅰★🅽★🅳 🤤🤣",
+        "★🅱★🅰★🅱 ★🅱★🅾★🅻★🆃★🅴 ★🅼★🆄★🅹★🅷★🅺★🅾 ★🅿★🅰★🅿★🅰 ★🅲★🆈★🆄★🅺★🅸 ★🅼★🅴★🅽★🅴 ★🅺★🆁★🅳★🅸★🅰 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅿★🆁★🅴★🅶★🅽★🅴★🅽★🆃 🤣🤣",
+        "★🅱★🅰★🅰★🆁 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅼★🅴 ★🅱★🅰★🅰★🆁 ★🅺★🅰 ★🅻★🅾★🆄★🅳★🅰 ★🅾★🆁 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅼★🅴 ★🅼★🅴★🆁★🅰 ★🅻★🅾★🅳★🅰",
+        "★🅲★🅷★🅰★🅻 ★🅲★🅷★🅰★🅻 ★🆃★🅤 ★🅰★🅿★🅽★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🅲★🅷★🅸★🆈★🅰 ★🅳★🅸★🅺★🅰",
+        "★🅷★🅰★🅷★🅰★🅷★🅰★🅷★🅰 ★🅱★🅰★🅲★🅷★🅷★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅰★🅺★🅾 ★🅲★🅷★🅾★🅳 ★🅳★🅸★🅰 ★🅽★🅰★🅽★🅶★🅰 ★🅺★🅰★🆁★🅺★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅶★🅱 ★🅷★🅴 ★🅱★🅰★🅳★🅸 ★🅱★🅴★🆇★🆈 ★🆄★🅱★🅺★🅾 ★🅿★🅸★🅻★🅰★🅺★🅴 ★🅲★🅷★🅾★🅾★🅳★🅴★🅽★🅶★🅴 ★🅿★🅴★🅿★🅱★🅸",
+        "2 ★🆁★🆄★🅿★🅰★🆈 ★🅺★🅸 ★🅿★🅴★🅿★🅱★🅸 ★🆃★🅴★🆁★🅸 ★🅼★🆄★🅼★🅼★🆈 ★🅱★??★🅱★🅱★🅴 ★🅱★🅴★🆇★🆈 💋💦",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅲★🅷★🅴★🅴★🅼★🅱 ★🅱★🅴★🅴 ★🅲★🅷★🆄★🅳★🆆★🅰★🆅★🆄★🅽★🅶★🅰 ★🅼★🅰★🅳★🅴★🆁★🅲★🅷★🅾★🅾★🅳 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 💦🤣",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅸 ★🅲★🅷★🆄★🆃★🅷 ★🅼★🅴 ★🅼★🆄★🆃★🅷★🅺★🅴 ★🅱★🅰★🆁★🅰★🆁 ★🅷★🅾★🅹★🅰★🆅★🆄★🅽★🅶★🅰 ★🅷★🆄★🅸 ★🅷★🆄★🅸 ★🅷★🆄★🅸",
+        "★🅱★🅴★🅱★🅳 ★🅻★🅰★🅰★🅰 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅲★🅷★🅾★🅳★🆄 ★🆁★🅰★🅽★🅳★🅸★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 💋💦🤣",
+        "★🅰★🆁★🅴 ★🆁★🅴 ★🅼★🅴★🆁★🅴 ★🅱★🅴★🆃★🅴 ★🅲★🆈★🆄 ★🅱★🅴★🅱★🅳 ★🅿★🅰★🅺★🅰★🅳 ★🅽★🅰 ★🅿★🅰★🅰★🅰 ★🆁★🅰★🅷★🅰 ★🅰★🅿★🅽★🅴 ★🅱★🅰★🅰★🅿 ★🅺★🅰 ★🅷★🅰★🅷★🅰★🅷★🅰 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅲★🆄★🅳 ★🅶★🅰★🅸🤣🤣",
+        "★🅱★🆄★🅽 ★🅱★🆄★🅽 ★🅱★🅰★🅰★🆁 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅴 ★🅹★🅷★🅰★🅽★🆃★🅾 ★🅺★🅴 ★🅱★🅾★🆄★🅳★🅰★🅶★🅰★🆁 ★🅰★🅿★🅽★🅸 ★🅼★🆄★🅼★🅼★🆈 ★🅺★🅸 ★🅽★🆄★🅳★🅴★🅱 ★🅱★🅷★🅴★🅹",
+        "★🅰★🅱★🅴 ★🅱★🆄★🅽 ★🅻★🅾★🅳★🅴 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅳★🅰 ★🅱★🅰★🅰★🅳 ★🅳★🆄★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅾 ★🅺★🅷★🆄★🅻★🅴 ★🅱★🅰★🅹★🅰★🆁 ★🅼★🅴 ★🅲★🅷★🅾★🅳 ★🅳★🅰★🅻★🅰 🤣🤣💋",
+        "★🅱★🅷★🆁★🅼 ★🅺★🆁 ★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🅲★🆄★🅳 ★🅶★🅰★🅸 ★🆈★🅷★🅰",
+        "★🅼★🅴★🆁★🅴 ★🅻★🆄★🅽★🅳 ★🅺★🅴 ★🅱★🅰★🅰★🅰★🅰★🅻★🅻★🅻★🅻★🅻 ★🅿★🅺★🅳 ★🅹★🅰★🅻★🅳★🅸 ★🅱★🅴★🅴",
+        "★🆃★🅤 ★🅴★🅺 ★🅺★🅰★🅰★🅼 ★🅺★🆁 ★🅰★🅿★🅽★🅸 ★🅼★🅰 ★🅱★🅷★🅴★🅽 ★🅺★🅾 ★🅲★🆄★🅳★🆆★🅰 ★🅻★🅴 ★🅼★🅴★🆁★🅴 ★🅱★🆃★🅷",
+        "★🆁★🅽★🅳★🅸 ★🅺★🅴 ★🅻★🅳★🅺★🅴★🅴★🅴★🅴★🅴★🅴★🅴★🅴 ★🅲★🅷★🆄★🅿 ★🅾★🆁 ★🅲★🆄★🅳 ★🆈★🅷★🅰",
+        "★🅲★🅷★🆄★🅿 ★🆃★🅼★🅺★🅲 ★🅺★🅸★🅳★🅰★🅰★🅰★🅰★🅰★🅰★🅰★🅰★🅰★🅰★🅰★🅰★🅰",
+        "★🅰★🅿★🅽★🅸 ★🅶★🅰★🅰★🅽★🅳 ★🅼★🅴★🅸★🅽 ★🅼★🆄★🆃★🅷★🅸 ★🅳★🅰★🅰★🅻",
+        "★🅼★🅴★🆁★🅰 ★🅻★🆄★🅽★🅳 ★🅲★🅷★🅾★🅾★🅱 ★🅹★🅰★🅻★🅳★🅸 ★🅱★🅴★🅴",
+        "★🅰★🅿★🅽★🅸 ★🅼★🅰 ★🅺★🅾 ★🅲★🆄★🅱★🆆★🅰 ★🅼★🅴★🆁★🅰 ★🅻★🆄★🅽★🅳",
+        "★🅱★🅷★🅴★🅽 ★🅺★🅴 ★🅻★🅰★🆄★🅳★🅴 ★🆃★🅼★🅲",
+        "★🅱★🅷★🅴★🅽 ★🅺★🅴 ★🆃★🅰★🅺★🅺★🅴 ★🆃★🅼★🅻",
+        "★🅰★🅱★🅻★🅰 ★🆃★🅴★🆁★🅰 ★🅺★🅷★🅰★🅽 ★🅳★🅰★🅽 ★🅲★🅷★🅾★🅳★🅽★🅴 ★🅺★🅸 ★🅱★🅰★🆁★🅸★🅸",
+        "★🅱★🅴★🆃★🅴 ★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅱★🅰★🅱★🅱★🅴 ★🅱★🅳★🅸 ★🆁★🅰★🅽★🅳",
+        "★🅻★🆄★🅽★🅳 ★🅺★🅴 ★🅱★🅰★🅰★🅰★🅻 ★🅹★🅷★🅰★🆃 ★🅺★🅴 ★🅿★🅸★🅱★🅱★🅱★🆄★🆄★🆄★🆄★🆄★🆄 ★🆃★🅼★🅺★🅲",
+        "★🅻★🆄★🅽★🅳 ★🅿★🅴 ★🅻★🆃★🅺★🅸★🆃 ★🅼★🅰★🅰★🅻★🅻★🅻★🅻 ★🅺★🅸 ★🅱★🅾★🅽★🅳 ★🅷 ★🆃★🆄★??★🆄",
+        "★🅺★🅰★🅱★🅷 ★🅾★🅱 ★🅳★🅸★🅽 ★🅼★🆄★🆃★🅷 ★🅼★🆁★🅺★🅴 ★🅱★🅾★🅹★🆃★🅰 ★🅼 ★🆃★🅤 ★🅿★🅰★🅸★🅳★🅰 ★🅽★🅰 ★🅷★🅾★🆃★🅰★🅰",
+        "★🅶★🅻★🆃★🅸 ★🅺★🆁★🅳★🅸 ★🆃★🆄★🅹★🆆 ★🅿★🅰★🅸★🅳★🅰 ★🅺★🆁★🅺★🅴 ★🆃★🅴★🆁★🆈 ★🅼★🅰 ★🅽★🅴 ★🅰★🅱 ★🅲★🆄★🅳 ★🆃★🅤 ★🆈★🅷★🅰",
+        "★🅱★🅴★🅱★🅳 ★🅿★🅺★🅳★🅳★🅳",
+        "★🅶★🅰★🅰★🅽★🅳 ★🅼★🅰★🅸★🅽 ★🅻★🆆★🅳★🅰 ★🅳★🅰★🅻 ★🅻★🅴 ★🅰★🅿★🅽★🅸 ★🅼★🅴★🆁★🅰★🅰★🅰",
+        "★🅶★🅰★🅰★🅽★🅳 ★🅼★🅴★🅸★🅽 ★🅱★🅰★🅼★🅱★🆄 ★🅳★🅴★🅳★🆄★🅽★🅶★🅰★🅰★🅰★🅰★🅰",
+        "★🅶★🅰★🅽★🅳 ★🅱★🆃★🅸 ★🅺★🅴 ★🅱★🅰★🅻★🅺★🅺★🅺 ★🆃★🅤 ★🅲★🆄★🅳 ★🆈★🅷★🅰",
+        "★🅶★🅾★🆃★🅴 ★🅺★🅸★🆃★🅽★🅴 ★🅱★🅷★🅸 ★🅱★🅰★🅳★🅴 ★🅷★🅾, ★🅻★🆄★🅽★🅳 ★🅺★🅴 ★🅽★🅸★🅲★🅷★🅴 ★🅷★🅸 ★🆁★🅴★🅷★🆃★🅴 ★🅷★🅰",
+        "★🅷★🅰★🅾★??★🅰★🆁 ★🅻★🆄★🅽★🅳 ★🆃★🅴★🆁★🅸 ★🅶★🅰★🅰★🅽★🅳 ★🅼★🅰★🅸★🅽",
+        "★🅹★🅷★🅰★🅰★🅽★🆃 ★🅺★🅴 ★🅿★🅸★🅱★🅱★🆄 ★🆃★🅼★🅺★🅲 ★🅱★🆄★🅽",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🅺★🅸 ★🅺★🅰★🅻★🅸 ★🅲★🅷★🆄★🆃",
+        "★🅺★🅷★🅾★🆃★🅴★🆈 ★🅺★🅸 ★🅰★🆄★??★🅳★🅰 ★🅴★🆈 ★🆃★🅤 ★🆁★🅰★🅽★🅳★🆈★🅺★🅴",
+        "★🅺★🆄★🆃★🆃★🅴 ★🅺★🅰 ★🅰★🆆★🅻★🅰★🆃 ★🅹★🅰★🅸★🅱★🅰 ★🅻★🅶 ★🆁★🅷★🅰 ★🆃★🅤",
+        "★🅺★🆄★🆃★🆃★🅴 ★🅺★🅸 ★🅹★🅰★🆃 ★🅹★🅰★🅸★🅱★🅰 ★🅴★🆈 ★🆃★🅤 ",
+        "★🅺★🆄★🆃★🆃★🅴 ★🅺★🅴 ★🆃★🅰★🆃★🆃★🅰 ★🅴★🆈 ★🆃★🅤",
+        "★🆃★🅴★🆃★🅸 ★🅼★🅰 ★🅺★🅸.★🅲★🅷★🆄★🆃 , ★🆃★🅴★🆁★🅸 ★🅼★🅰 ★🆁★🅽★🅳★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸★🅸",
+        "★🅻★🅰★🆅★🅳★🅴 ★🅺★🅴 ★🅱★🅰★🅻 ★🅿★🅺★🅳 ★🅻★🅴 ★🅼★🅴★🆁★🅴",
+        "★🅼★🆄★🅷 ★🅼★🅴★🅸 ★🅻★🅴★🅻★🅴 ★🅼★🅴★🆁★🅰 ★🅻★🆄★🅽★🅳",
+        "★🅻★🆄★🅽★🅳 ★🅺★🅴 ★🅿★🅰★🅱★🅸★🅽★🅴 ★🅲★🅷★🆄★🅿 ★🅱★🅴★🆃★🅷 ★🅾★🆁 ★🅲★🆄★🅳",
+        "★🅼★🅴★🆁★🅴 ★🅻★🆆★🅳★🅴 ★🅺★🅴 ★🅱★🅰★🅰★🅰★🅰★🅻★🅻★🅻",
+        "★🅷★🅰★🅷★🅰★🅷★🅰★🅰★🅰★🅰★🅰★🅰 ★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🅲★🆄★🅳 ★🅶★🅰★🅸",
+        "★🆃★🅤 ★🅲★🅷★🆄★🅳 ★🅶★🆈★🅰★🅰★🅰★🅰",
+        "★🆁★🅰★🅽★🅳★🅸 ★🅺★🅷★🅰★🅽★🅴 ★🅺★🅸 ★🆄★🅻★🅰★🅳★🅳★🅳",
+        "★🅱★🅰★🅳★🅸 ★🅷★🆄★🅸 ★🅶★🅰★🅰★🅽★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅶★🅰★🅰★🅽★🅳 ★🅼★🅰★🅸★🅽 ★🅺★🆄★🆃★🅴 ★🅺★🅰 ★🅻★🆄★🅽★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃",
+        "★🆃★🅴★🆁★🅴 ★🅶★🅰★🅰★🅽★🅳 ★🅼★🅴★🅸★🅽 ★🅺★🅴★🅴★🅳★🅴 ★🅿★🅰★🅳★🅰★🆈",
+        "★🅽★🆈 ★🅽★🆈 ★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🆁★🅰★🅽★🅳★🅸",
+        "★🅱★🆄★🅽★🅽 ★🅼★🅰★🅳★🅴★🆁★🅲★🅷★🅾★🅳 ★🆃★🅼★🅻",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰",
+        "★🅱★🅴★🅷★🅴★🅽 ★🅺 ★🅻★🆄★🅽★🅳 ★🅲★🅷★🆄★🅿★🅲★🅷★🅰★🅿 ★🅲★🆄★🅳 ★🆈★🅷★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅰 ★🅲★🅷★🆄★🆃 ★🅺★🅸 ★🅲★🅷★🆃★🅽★🅸★🅸★🅸",
+        "★🅼★🅴★🆁★🅰 ★🅻★🅰★🆆★🅳★🅰 ★🅻★🅴★🅻★🅴 ★🆃★🅤 ★🅰★🅶★🅰★🆁 ★🅲★🅷★🅰★🅸★🆈★🅴 ★🆃★🅾★🅷",
+        "★🅲★🅷★🆄★🅿 ★🅶★🅰★🅰★🅽★🅳★🆄",
+        "★🅲★🅷★🆄★🅿 ★🅲★🅷★🆄★🆃★🅸★🆈★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅿★🅴 ★🅹★🅲★🅱 ★🅲★🅷★🅰★🅳★🅷★🅰★🅰 ★🅳★🆄★🅽★🅶★🅰",
+        "★🅱★🅰★🅼★🅹★🅷★🅰★🅰 ★🅻★🅰★🆆★🅳★🅴",
+        "★🆈★🅰 ★🅳★🆄 ★🆃★🅴★🆁★🅸 ★🅶★🅰★🅰★🅽★🅳 ★🅼★🅴 ★🆃★🅰★🅿★🅰★🅰 ★🆃★🅰★🅿",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅼★🅴★🆁★🅰 ★🆁★🅾★🅾 ★🅻★🅴★🆃★🅸 ★🅷★🅰★🅸",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅴 ★🅱★🅰★🅰★🆃★🅷 ★🅼★🅼★🅱 ★🅱★🅰★🅽★🅰★🅰 ★🅲★🅷★🆄★🅺★🅰 ★🅷★🆄",
+        "★🆃★🅤 ★🅲★🅷★🆄★🆃★🅸★🆈★🅰 ★🆃★🅴★🆁★🅰 ★🅺★🅷★🅰★🅽★🅳★🅰★🅰★🅽 ★🅲★🅷★🆄★🆃★🅸★🆈★🅰",
+        "★🅰★🆄★🆁 ★🅺★🅸★🆃★🅽★🅰 ★🅱★🅾★🅻★🆄 ★🅱★🅴★🆈 ★🅼★🅰★🅽★🅽 ★🅱★🅷★🅰★🆁 ★🅶★🅰★🆈★🅰 ★🅼★🅴★🆁★🅰",
+        "★🆃★🅴★🆁★🅸★🅸★🅸★🅸★🅸 ★🅼★🅰★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃★🆃★🆃 ★🅼★🅴 ★🅰★🅱★🅲★🅳 ★🅻★🅸★🅺★🅷 ★🅳★🆄★🅽★🅶★🅰 ★🅼★🅰★🅰 ★🅺★🅴 ★🅻★🅾★🅳★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅾 ★🅻★🅴★🅺★🅰★🆁 ★🅼★🅰★🅸 ★🅱★🅰★🆁★🅰★🆁",
+        "★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🆁★🅰★🅽★🅸★🅳★🅸★🅸",
+        "★🅲★🅷★🆄★🅿 ★🅱★🅰★🅲★🅷★🅴★🅴 ★🆃★🅼★🅺★🅲",
+        "★🆃★🅴★🆁★🆈 ★🅼★🅰★🅺★🅾★🅲★🅷★🅾★🅳★🆄",
+        "★🆁★🅰★🅽★🅳★🅸 ★🅼★🅰★🅰 ★🆃★🅴★🆁★🆈",
+        "★🆃★🅤 ★🆁★🅰★🅽★🅳★🅸 ★🅺★🅴 ★🅿★🅸★🅻★🅻★🅰 ★🅴★🆈",
+        "★🆃★🅴★🆁★🅸★🅸★🅸★🅸 ★🅼★🅰★🅰★🅰 ★🅺★🅾 ★🅱★🅷★🅴★🅹★🅹★🅹",
+        "★🆃★🅴★🆁★🅰★🅰 ★🅱★🅰★🅰★🅰★🅿 ★🅷★🆄",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🅴 ★🅷★🅰★🅰★🆃 ★🅳★🅰★🅰★🅻★🅻★🅺★🅴 ★🅱★🅷★🅰★🅰★🅶 ★🅹★🅰★🅰★🅽★🆄★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅾 ★🅱★🅰★🆁★🅰★🅺 ★🅿★🅴 ★🅻★🅴★??★🅰★🅰 ★🅳★🆄★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅾 ★🅶★🅱 ★🆁★🅾★🅰★🅳 ★🅿★🅴 ★🅻★🅴★🅹★🅰★🅺★🅴 ★🅱★🅴★🅲★🅷 ★🅳★🆄★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🅴★🅰 ★🅺★🅰★🅰★🅻★🅸 ★🅼★🅸★🆃★🅲★🅷",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅱★🅰★🅱★🆃★🅸 ★🆁★🅰★🅽★🅳★🅸 ★🅷★🅰★🅸",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🅴 ★🅺★🅰★🅱★🆄★🆃★🅰★🆁 ★🅳★🅰★🅰★🅻 ★🅺★🅴 ★🅱★🅾★🆄★🅿 ★🅱★🅰★🅽★🅰★🆄★🅽★🅶★🅰 ★🅼★🅰★??★🅰★🆁★🅲★🅷★🅾★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅰 ★🆁★🅰★🅽★🅳★🅸 ★🅷★🅰★🅸",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🅴 ★🅳★🅴★🆃★🅾★🅻 ★🅳★🅰★🅰★🅻 ★🅳★🆄★🅽★🅶★🅰 ★🅼★🅰★🅳★🅰★🆁★🅲★🅷★🅾★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅰★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🅴 ★🅻★🅰★🅿★🆃★🅾★🅿",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🆁★🅰★🅽★🅳★🅸 ★🅷★🅰★🅸",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅾 ★🅱★🅸★🅱★🆃★🅰★🆁 ★🅿★🅴 ★🅻★🅴★🆃★🅰★🅰★🅺★🅴 ★🅲★🅷★🅾★🅳★🆄★🅽★🅶★??",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅾 ★🅰★🅼★🅴★🆁★🅸★🅲★🅰 ★🅶★🅷★🆄★🅼★🅰★🆄★🅽★🅶★🅰 ★🅼★🅰★🅳★🅰★🆁★🅲★🅷★🅾★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🅴 ★🅽★🅰★🅰★🆁★🅸★🆈★🅰★🅻 ★🅿★🅷★🅾★🆁 ★🅳★🆄★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅴 ★🅶★🅰★🅽★🅳 ★🅼★🅴 ★🅳★🅴★🆃★🅾★🅻 ★🅳★🅰★🅰★🅻 ★🅳★🆄★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅰 ★🅺★🅾 ★🅷★🅾★🆁★🅻★🅸★🅲★🅺★🅱 ★🅿★🅸★🅻★🅰★🆄★🅽★🅶★🅰 ★🅼★🅰★🅳★🅰★🆁★🅲★🅷★🅾★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅾 ★🅱★🅰★🆁★🅰★🅺 ★🅿★🅴 ★🅻★🅴★🆃★🅰★🅰★🅰 ★🅳★🆄★🅽★🅶★🅰★🅰★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅰★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰",
+        "★🅼★🅴★🆁★🅰★🅰 ★🅻★🆄★🅽★🅳 ★🅿★🅰★🅺★🅰★🅳 ★🅻★🅴 ★🅼★🅰★🅳★🅰★🆁★🅲★🅷★🅾★🅳",
+        "★🅲★🅷★🆄★🅿 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅰★🅺★🅰★🅰 ★🅱★🅷★🅾★🅱★🅴★🅰★🅰",
+        "★🆃★🅴★🆁★🅸★🅸 ★🅼★🅰★🅰 ★🅲★🅷★🆄★🅱 ★🅶★🅴★🆈★🅸 ★🅺★🆈★🅰★🅰 ★🅻★🅰★🆆★🅳★🅴★🅴★🅴",
+        "★🆃★🅴★🆁★🅸★🅸 ★🅼★🅰★🅰 ★🅺★🅰★🅰 ★🅱★🅹★🅱★🅾★🅳★🅰★🅰",
+        "★🅼★🅰★🅳★🅰★🆁★🅇★🅷★🅾★🅳★🅳★🅳",
+        "★🆃★🅴★🆁★🅸★🆄★🆄★🅸 ★🅼★🅰★🅰★🅰 ★🅺★🅰★🅰 ★🅱★🅷★🅱★🅾★🅳★🅰★🅰",
+        "★🆃★🅴★🆁★🅸★🅸★🅸★🅸★🅸 ★🅱★🅴★🅷★🅴★🅽★🅽★🅽 ★🅺★🅾 ★🅲★🅷★🅾★🅳★🅳★🅳★🆄★🆄★🆄★🆄 ★🅼★🅰★🅳★🅰★🆁★🅇★🅷★🅾★🅳★🅳★🅳★🅳",
+        "★🆃★🅤 ★🅽★🅸★🅺★🅰★🅻 ★🅼★🅰★🅳★🅰★🆁★🅲★🅷★🅾★🅳",
+        "★🅲★🅷★🆄★🅿 ★🆁★🅰★🅽★🅳★🅸 ★🅺★🅴 ★🅱★🅰★🅲★🅷★🅴",
+        "★🆃★🅴★🆁★🅰 ★🅼★🅰★🅰 ★🅼★🅴★🆁★🅸 ★🅹★🅰★🅰★🅽 ★🅴★🆈",
+        "★🆃★🅴★🆁★🅸 ★🅱★🅰★🅱★🅴★🅽 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅾★🅿",
+        "★🅹★🅰★🅻★🅳★🅸 ★🅻★🅸★🅺★🅷 ★🆁★🅽★🅳★🆈★🅺★🅴 ★🅱★🅴★🅹",
+        "★🅾★🆁 ★🅱★🅳★🅰 ★🅻★🅸★🅺★🅷",
+        "★🅾★🆁 ★🅱★🅳★🅰",
+        "★🅾★🆁 ★🅱★🅳★🅰 ★🅾★🆈★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅰 ★🅱★🆄★🆁",
+        "★🅾★🆈★🅴 ★🅺★🅴★🅴★🅳★🅴",
+        "★🆁★🅰★🅽★🅳★🅸 ★🅺★🅴 ★🅻★🅰★🅳★🅺★🅴",
+        "★🅹★🅰★🅻★🅳★🅸 ★🅻★🅸★🅺★🅷 ★🆃★🅴★🆁★🅸 ★🅱★🅴★🅷★🅴★🅽 ★🅲★🅷★🅾★🅳★🆄",
+        "★🅼★🅺★🅻 ★🆄★🆃★🅷 ★🆁★🅰★🅽★🅳★🅸 ★🅺★🅴 ★🅱★🅰★🅲★🅲★🅷★🅴",
+        "★🆃★🅴★🆁★🅸 ★🅽★🅰★🅽★🅸 ★🅼★🅴★🆁★🅸 ★🅼★🅰★🅰★🅻",
+        "★🆃★🅴★🅹 ★🅻★🅸★🅺★🅷 ★🆁★🅰★🅽★🅳★🅲★🅴",
+        "★🅾★🆈★🅴 ★🅼★🅰★🅰★🅺★🅴 ★🅻★🅾★🅳★🅴 ★🅼★🆁★🅴★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅲★🅷★🅾★🅳★🆈",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅸★🆈★🅰 ★🅺★🅸 ★🅶★🅰★🅽★🅳",
+        "★🆃★🅴★🆁★🆈 ★🅳★🅰★🅳★🅸 ★🅺★🅰 ★🅵★🆄★🅳★🅳★🅰",
+        "★🅼★🅺★🅻 ★🆄★🆃★🅷 ★🅱★🅴★🅷★🅴★🅽★🅲★🅾★🅳",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅱★🆄★🆁 ★🅳★🅴",
+        "★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🅺★🅰 ★🅵★🆄★🅳★🅳★🅰 ★🅼★🅴 ★🅻★🅰★🆄★🅳★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅲★🅷★🆄★🅳★🆅★🅰",
+        "★🆁★🅰★🅽★🅳★🅸 ★🅺★🅴 ★🅱★🅴★🆃★🅴 ★🅼★🅰★🆁 ★🅶★🅰★🆈★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🅼★🆁★🆄",
+        "★🅹★🅰★🅻★🅸★🅳 ★🅺★🆁 ★🆂★🅿★🅰★🅼",
+        "★🅼★🅲 ★🆂★🅿★🅰★🅼 ★🆁★🅾★🅺★🅴★🅽★🅶★🅰",
+        "★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰★🅺★🅸 ★🅲★🅷★🆄★🆃 ★🆂★🅿★🅰★🅼 ★🅺★🆁",
+        "★🆂★🅿★🅰★🅼 ★🅺★🆁.★🅼★🅰★🅰★🅺★🅴 ★🅻★🅾★🅳★🅴",
+        "★🆁★🅽★🅸★🅳 ★🅺★🅴 ★🅲★🅷★🅾★🅳★🅴 ★🆂★🅿★🅰★🅼 ★🅺★🆁",
+        "★🆂★🅿★🅰★🅼 ★🅺★🆁 ★🅺★🅸★🅳",
+        "★🅽★🅾★🅾★🅱 ★🆃★🅴★🆁★🅸 ★🅼★🅰★🅰 ★🅲★🅷★🅾★🅳★🆄",
+        "★🆁★🅽★🅳★🅸 ★🅺★🅴 ★🅱★🅴★🆃★🅴",
+        "★🅽★🅾★🅾★🅱 ★🅹★🅰★🅻★🅳★🅸 ★🅻★🅸★🅺★🅷 ★🆆★🆁★🅽★🅰 ★🆃★🅴★🆁★🆈 ★🅼★🅰★🅰 ★🆁★🅰★🅽★🅳",
+        "★🅲★🆄★🅳 ★🅶★🅰★🅸 ★🅼★🅰★🅰 ★🆃★🅴★🆁★🆈 ★🅽★🅾★🅾★🅱",
+        "★🆄★🆃★🅷 ★🆁★??★🅽★🅳★🆈★🅺★🅴 ★🅽★🅾★🅾★🅱",
+        "★🅲★🅷★🅻 ★🅲★🆄★🅳★🅺★🅴 ★🅳★🅸★🅺★🅷★🅰 ★🅽★🅾★🅾★🅱",
+        "★🅹★🅻★🅳★🅸 ★🆃★🆈★🅿 ★🅲★🆁 ★🅽★🅾★🅾★🅱 ★🅷★🅰★🅻★🅺★🅴",
+        "★🅲★🆄★🅳 ★🅺★🅴 ★🅿★🅶★🅻 ★🅽★🆈 ★🅷★🅾 ★🅽★🅾★🅾★🅱",
+        "★🅲★🆄★🅳 ★🅲★🆄★🅳 ★🅺★🅴 ★🆁★🅰★🅽★🅳 ★🅱★🅽★🅹★🅰 ★🆃★🅤 ★🅽★🅾★🅾★🅱",
+        "★🅼★🅰★🅺★🅸★🅲★🅷★🆄★🆃 ★🆃★🅴★🆁★🆈 ★🅽★🅾★🅾★🅱",
+        "★🅶★🅰★🅽★🅳★🅰 ★🅲★🆈★🆄 ★🅲★🆄★🅳 ★🆁★🅷★🅰 ★🆃★🆄 ?",
+        "★🅸★??★🅽★🅰 ★🅶★🅽★🅳★🅰 ★🅽★🆈 ★🅲★🆄★🅳 ★🅰★🅲★🅷★🅴 ★🆂★🅴 ★🅲★🆄★🅳",
+        "★🅼★🅰★🅰★🅽 ★🅻★🅴 ★🅲★🆄★🅳 ★🅶★🆈★🅰 ★🆃★🅤 ★🆂★🆄★🅽 ★🅱★🅰★🆃 ★🅰★🅱",
+        "★🅼★🅰★🅺★🅰★🅵★🆄★🅳★🅳★🅰 ★🅵★🅰★🆃 ★🅶★🆈★🅰 ★🆃★🅴★🆁★🆈 ★🆁★🆄★🅺",
+        
+    ]
+            
+            gs_texts = [
+                    """~~~~~ ~~~~~ ~~~~~ ~~~~~
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Pᴀɴɪ Kɪ Tᴀʀᴀʜ Cʜᴏᴅᴀ
+    ~~~~~ ~~~~~ ~~~~~ ~~~~~""",
+        """████████████████████████████
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴅᴀɪ Kɪ
+    ████████████████████████████
+        ✦ (🩷) ✦ (❤️) ✦ (🧡) ✦""",
+        """☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Zʜᴇʀ Dᴀʟᴀ
+    ☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️☠️""",
+        """✦━━━━━━━━━━━━━━━━━━━━━━━✦
+        🥇 ZA Nᴇ 🥇
+        Tᴇʀɪ Mᴀᴀ Kᴏ Gᴏʟᴅ Cʜᴜᴅᴀɪ Dɪ
+    ✦━━━━━━━━━━━━━━━━━━━━━━━✦""",
+        """🗑️━━━━━━━━━━━━━━━━━🗑️
+        ║  ZA Nᴇ  ║
+        ║  Tᴇʀɪ Mᴀᴀ Kᴏ Kᴀᴄʀᴀ Bɴᴀʏᴀ ║
+    🗑️━━━━━━━━━━━━━━━━━🗑️""",
+        """☢️☢️☢️☢️☢️☢️☢️☢️☢️☢️
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴀ Bᴏsᴅᴀ Kʜᴏʟ Dɪʏᴀ
+    ☢️☢️☢️☢️☢️☢️☢️☢️☢️☢️""",
+        """🚀 Sᴘᴀᴄᴇ Mɪssɪᴏɴ: ZA
+    👨‍🚀 Cᴏᴍᴍᴀɴᴅᴇʀ: ZA
+    🌍 Tᴀʀɢᴇᴛ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    🌟 Mɪssɪᴏɴ: Cʜᴏᴅ ᴀɴᴅ Dᴇsᴛʀᴏʏ""",
+        """⏰ Tɪᴍᴇ: 3:00 AM
+    📍 Lᴏᴄᴀᴛɪᴏɴ: Tᴇʀɪ Mᴀᴀ Kᴇ Bʜᴏsᴅᴇ Mᴇ
+    👨 ZA Iɴ Aᴄᴛɪᴏɴ
+    🎬 Lɪᴠᴇ Sᴛʀᴇᴀᴍɪɴɢ...""",
+        """🌧️ Mᴀᴜsᴀᴍ: Bᴀʀɪsʜ
+    🌊 Lᴇᴠᴇʟ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bᴀᴅʜ
+    ⚡ ZA Nᴇ Bᴀɴᴅʜ Tᴏᴅᴀ""",
+        """📰 Bʀᴇᴀᴋɪɴɢ Nᴇᴡs!
+    🗞️ ZA Nᴇ Cʜᴏᴅᴀ
+    👑 Tʀᴇɴᴅɪɴɢ #1 Oɴ Tᴇʟᴇɢʀᴀᴍ
+    ⭐ ZA""",
+        """🎬 Mᴏᴠɪᴇ: ZA
+    🎭 Sᴛᴀʀʀɪɴɢ: ZA
+    🎟️ Rᴀᴛɪɴɢ: ⭐⭐⭐⭐⭐
+    🍿 Bᴏx Oғғɪᴄᴇ: Tᴇʀɪ Mᴀᴀ""",
+        """🎮 Gᴀᴍᴇ: ZA
+    👾 Pʟᴀʏᴇʀ: ZA
+    🏆 Lᴇᴠᴇʟ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    💀 Sᴄᴏʀᴇ: Iɴғɪɴɪᴛʏ""",
+        """📋 Mᴇɴᴜ Cᴀʀᴅ:
+    🍽️ Mᴀɪɴ Cᴏᴜʀsᴇ: Tᴇʀɪ Mᴀᴀ
+    🍜 Sɪᴅᴇ Dɪsʜ: Tᴇʀɪ Bʜᴇɴ
+    🍰 Dᴇssᴇʀᴛ: ZA Kᴀ Lᴜɴᴅ
+    💵 Pʀɪᴄᴇ: Fʀᴇᴇ Cʜᴜᴅᴀɪ""",
+        """🗺️ Nᴀᴠɪɢᴀᴛɪᴏɴ:
+    Sᴛᴀʀᴛ: ZA
+    Dᴇsᴛɪɴᴀᴛɪᴏɴ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    Dɪsᴛᴀɴᴄᴇ: 0 Mᴇᴛᴇʀs
+    ETA: Aʙʜɪ Cʜᴏᴅ Rʜᴀ Hᴜ""",
+        """🎵 Nᴏᴡ Pʟᴀʏɪɴɢ:
+    🎶 Tʀᴀᴄᴋ: ZA
+    🎤 Aʀᴛɪsᴛ: ZA
+    💿 Aʟʙᴜᴍ: ZA Sᴇʀɪᴇs
+    🔥 Vɪᴇᴡs: 69M""",
+        """🏏 Mᴀᴛᴄʜ: ZA Vs Tᴇʀɪ Mᴀᴀ
+    🏆 Wɪɴɴᴇʀ: ZA
+    📊 Sᴄᴏʀᴇ: Cʜᴏᴅ ᴏᴜᴛ
+    🔥 Mᴀɴ ᴏғ ᴛʜᴇ Mᴀᴛᴄʜ: Lᴜɴᴅ""",
+        """🏥 Rᴇᴘᴏʀᴛ:
+    Dᴏᴄᴛᴏʀ: ZA
+    Pᴀᴛɪᴇɴᴛ: Tᴇʀɪ Mᴀᴀ
+    Dɪᴀɢɴᴏsɪs: Cʜᴜᴛ Mᴇ Lᴜɴᴅ
+    Tʀᴇᴀᴛᴍᴇɴᴛ: Cʜᴏᴅɴᴀ""",
+        """🏫 Sᴄʜᴏᴏʟ: ZA Aᴄᴀᴅᴇᴍʏ
+    📚 Sᴜʙᴊᴇᴄᴛ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴅᴀɪ 101
+    👨‍🏫 Tᴇᴀᴄʜᴇʀ: ZA
+    ✅ Cʟᴀss: Iɴ Sᴇssɪᴏɴ""",
+        """🛒 Sʜᴏᴘᴘɪɴɢ Cᴀʀᴛ:
+    🛍️ Iᴛᴇᴍ: Tᴇʀɪ Mᴀᴀ
+    💰 Pʀɪᴄᴇ: Fʀᴇᴇ
+    🛒 Bᴏᴜɢʜᴛ Bʏ: ZA
+    📦 Sᴛᴀᴛᴜs: Cʜᴏᴅ Dɪʏᴀ""",
+        """🏨 Hᴏᴛᴇʟ: ZA Pᴀʟᴀᴄᴇ
+    🛏️ Rᴏᴏᴍ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    👤 Gᴜᴇsᴛ: ZA
+    ⭐ Rᴀᴛɪɴɢ: 5 Sᴛᴀʀs""",
+        """✈️ Fʟɪɢʜᴛ: ZA 101
+    🛫 Dᴇᴘᴀʀᴛᴜʀᴇ: ZA
+    🛬 Aʀʀɪᴠᴀʟ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    ⏰ Tɪᴍᴇ: Nᴏᴡ""",
+        """🚂 Tʀᴀɪɴ: ZA Exᴘʀᴇss
+    🚉 Sᴛᴀᴛɪᴏɴ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    👨‍✈️ Dʀɪᴠᴇʀ: ZA
+    🕒 Tɪᴍɪɴɢ: 24x7""",
+        """🍕 Rᴇsᴛᴀᴜʀᴀɴᴛ: ZA Bᴀᴢᴀᴀʀ
+    🍽️ Sᴘᴇᴄɪᴀʟ: Tᴇʀɪ Mᴀᴀ
+    👨‍🍳 Cʜᴇғ: ZA
+    🍴 Oʀᴅᴇʀ: Cʜᴏᴅ ᴀɴᴅ Gᴏ""",
+        """💪 Gʏᴍ: ZA Fɪᴛɴᴇss
+    🏋️ Tʀᴀɪɴᴇʀ: ZA
+    🎯 Tᴀʀɢᴇᴛ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    ✅ Rᴇsᴜʟᴛ: Pʜᴏᴏʟ Cʜᴏᴅ""",
+        """🎉 Pᴀʀᴛʏ: ZA Nɪɢʜᴛ
+    🕺 Hᴏsᴛ: ZA
+    💃 Gᴜᴇsᴛ: Tᴇʀɪ Mᴀᴀ
+    🎵 Sᴏɴɢ: Cʜᴏᴅ Tʜᴇ Fʟᴏᴏʀ""",
+        """🏛️ Mᴜsᴇᴜᴍ: ZA Hɪsᴛᴏʀʏ
+    🖼️ Exʜɪʙɪᴛ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    🎨 Aʀᴛɪsᴛ: ZA
+    📅 Dᴀᴛᴇ: Hᴀʀ Rᴏᴢ""",
+        """🦁 Zᴏᴏ: ZA Wᴏʀʟᴅ
+    🐯 Mᴀɪɴ Aᴛᴛʀᴀᴄᴛɪᴏɴ: Tᴇʀɪ Mᴀᴀ
+    🐺 Kᴇᴇᴘᴇʀ: ZA
+    🔥 Sʜᴏᴡ: Cʜᴏᴅᴜɴɢᴀ""",
+        """🎪 Cɪʀᴄᴜs: ZA Mᴀsᴛɪ
+    🤡 Cʟᴏᴡɴ: ZA
+    🎪 Sʜᴏᴡ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴅᴀɪ
+    🎟️ Tɪᴄᴋᴇᴛ: Fʀᴇᴇ""",
+        """📚 Lɪʙʀᴀʀʏ: ZA Bᴏᴏᴋs
+    📖 Bᴏᴏᴋ: ZA
+    ✍️ Aᴜᴛʜᴏʀ: ZA
+    📕 Cʜᴀᴘᴛᴇʀ: Cʜᴏᴅɴᴀ""",
+        """🌸 Gᴀʀᴅᴇɴ: ZA Fʟᴏᴡᴇʀs
+    🌹 Mᴀɪɴ Fʟᴏᴡᴇʀ: Tᴇʀɪ Mᴀᴀ
+    🌻 Gᴀʀᴅᴇɴᴇʀ: ZA
+    💧 Wᴀᴛᴇʀ: Lᴜɴᴅ Kᴀ Pᴀɴɪ""",
+        """🏖️ Bᴇᴀᴄʜ: ZA Sʜᴏʀᴇ
+    🌊 Wᴀᴠᴇs: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    🏄 Sᴜʀғᴇʀ: ZA
+    🌅 Tɪᴍᴇ: Sᴜɴsᴇᴛ Cʜᴏᴅ""",
+        """☕ Cᴏғғᴇᴇ Sʜᴏᴘ: ZA Cᴀғᴇ
+    🍵 Sᴘᴇᴄɪᴀʟ: Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ
+    👨‍🍳 Bᴀʀɪsᴛᴀ: ZA
+    💦 Aᴅᴅɪᴛɪᴏɴ: Lᴜɴᴅ Kᴀ Cʀᴇᴀᴍ""",
+        """🎰 Cᴀsɪɴᴏ: ZA Pᴀʟᴀᴄᴇ
+    🃏 Gᴀᴍᴇ: Cʜᴏᴅ Tʜᴇ ZA
+    🎲 Bᴇᴛ: Tᴇʀɪ Mᴀᴀ
+    💰 Wɪɴɴᴇʀ: ZA""",
+        """🌙 Nɪɢʜᴛ Sʜᴏᴡ:
+    🌚 Mᴀɪɴ Aᴛᴛʀᴀᴄᴛɪᴏɴ: Tᴇʀɪ Mᴀᴀ
+    🌟 Hᴏsᴛ: ZA
+    💫 Pᴇʀғᴏʀᴍᴀɴᴄᴇ: Cʜᴏᴅɴᴀ""",
+        """🌋🌋🌋🌋🌋🌋🌋🌋
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Jᴡᴀʟᴀ Pʜᴏᴅɪ
+    🌋🌋🌋🌋🌋🌋🌋🌋""",
+        """🌊🌊🌊🌊🌊🌊🌊🌊
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Tᴏᴏғᴀɴ Lᴀʏᴀ
+    🌊🌊🌊🌊🌊🌊🌊🌊""",
+        """🌀🌀🌀🌀🌀🌀🌀🌀
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bʜᴜᴄʜᴀʟ Lᴀʏɪ
+    🌀🌀🌀🌀🌀🌀🌀🌀""",
+        """💻💻💻💻💻💻💻💻
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Cʏʙᴇʀ Cʜᴏᴅᴀ
+    💻💻💻💻💻💻💻💻""",
+        """🤖🤖🤖🤖🤖🤖🤖🤖
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Rᴏʙᴏᴛ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ
+    🤖🤖🤖🤖🤖🤖🤖🤖""",
+        """👽👽👽👽👽👽👽👽
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Aʟɪᴇɴ Gʜᴜsᴀʏᴀ
+    👽👽👽👽👽👽👽👽""",
+        """🐉🔥🐉🔥🐉🔥🐉🔥
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Dʀᴀɢᴏɴ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ
+    🐉🔥🐉🔥🐉🔥🐉🔥""",
+        """⚡🔨⚡🔨⚡🔨⚡🔨
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Tʜᴏʀ Kᴀ Hᴀᴍᴍᴇʀ Mᴀʀᴀ
+    ⚡🔨⚡🔨⚡🔨⚡🔨""",
+        """🦾💥🦾💥🦾💥🦾💥
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Iʀᴏɴ Mᴀɴ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ
+    🦾💥🦾💥🦾💥🦾💥""",
+        """💚💢💚💢💚💢💚💢
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Hᴜʟᴋ Sᴛʏʟᴇ Mᴇ Sᴍᴀsʜ Kɪʏᴀ
+    💚💢💚💢💚💢💚💢""",
+        """🕷️🕸️🕷️🕸️🕷️🕸️🕷️🕸️
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sᴘɪᴅᴇʀ Wᴇʙ Bɴᴀʏᴀ
+    🕷️🕸️🕷️🕸️🕷️🕸️🕷️🕸️""",
+        """🦇🌙🦇🌙🦇🌙🦇🌙
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Bᴀᴛᴍᴀɴ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ
+    🦇🌙🦇🌙🦇🌙🦇🌙""",
+        """🦸💫🦸💫🦸💫🦸💫
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Sᴜᴘᴇʀᴍᴀɴ Sᴛʏʟᴇ Mᴇ Uᴅᴀʏᴀ
+    🦸💫🦸💫🦸💫🦸💫""",
+        """🗡️💢🗡️💢🗡️💢🗡️💢
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Wᴏʟᴠᴇʀɪɴᴇ Cʟᴀᴡs Mᴀʀᴇ
+    🗡️💢🗡️💢🗡️💢🗡️💢""",
+        """🔥💀🔥💀🔥💀🔥💀
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Gʜᴏsᴛ Rɪᴅᴇʀ Gʜᴜsᴀʏᴀ
+    🔥💀🔥💀🔥💀🔥💀""",
+        """💀🔫💀🔫💀🔫💀🔫
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Pᴜɴɪsʜᴇʀ Dᴀʟᴀ
+    💀🔫💀🔫💀🔫💀🔫""",
+        """🦸🔫🦸🔫🦸🔫🦸🔫
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Dᴇᴀᴅᴘᴏᴏʟ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ
+    🦸🔫🦸🔫🦸🔫🦸🔫""",
+        """🖤👅🖤👅🖤👅🖤👅
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Vᴇɴᴏᴍ Gʜᴜsᴀʏᴀ
+    🖤👅🖤👅🖤👅🖤👅""",
+        """🃏💚🃏💚🃏💚🃏💚
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Jᴏᴋᴇʀ Kʜᴇʟᴀ
+    🃏💚🃏💚🃏💚🃏💚""",
+        """💕🔨💕🔨💕🔨💕🔨
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kᴏ Hᴀʀʟᴇʏ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ
+    💕🔨💕🔨💕🔨💕🔨""",
+        """⚡💨⚡💨⚡💨⚡💨
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Fʟᴀsʜ Sᴘᴇᴇᴅ Dɪ
+    ⚡💨⚡💨⚡💨⚡💨""",
+        """🌊🔱🌊🔱🌊🔱🌊🔱
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Aǫᴜᴀᴍᴀɴ Gʜᴜsᴀʏᴀ
+    🌊🔱🌊🔱🌊🔱🌊🔱""",
+        """👁️💥👁️💥👁️💥👁️💥
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Cʏᴄʟᴏᴘs Bᴇᴀᴍ Mᴀʀᴀ
+    👁️💥👁️💥👁️💥👁️💥""",
+        """🧲💢🧲💢🧲💢🧲💢
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Mᴀɢɴᴇᴛᴏ Gʜᴜsᴀʏᴀ
+    🧲💢🧲💢🧲💢🧲💢""",
+        """🌩️⚡🌩️⚡🌩️⚡🌩️⚡
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sᴛᴏʀᴍ Lᴀʏᴀ
+    🌩️⚡🌩️⚡🌩️⚡🌩️⚡""",
+        """💋💢💋💢💋💢💋💢
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Rᴏɢᴜᴇ Kɪss Dɪ
+    💋💢💋💢💋💢💋💢""",
+        """🃏🔥🃏🔥🃏🔥🃏🔥
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Gᴀᴍʙɪᴛ Cᴀʀᴅs Dᴀʟᴇ
+    🃏🔥🃏🔥🃏🔥🃏🔥""",
+        """💨🌀💨🌀💨🌀💨🌀
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Nɪɢʜᴛᴄʀᴀᴡʟᴇʀ Gʜᴜsᴀʏᴀ
+    💨🌀💨🌀💨🌀💨🌀""",
+        """💙🌀💙🌀💙🌀💙🌀
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Mʏsᴛɪǫᴜᴇ Gʜᴜsᴀʏᴀ
+    💙🌀💙🌀💙🌀💙🌀""",
+        """🐾💢🐾💢🐾💢🐾💢
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bᴇᴀsᴛ Gʜᴜsᴀʏᴀ
+    🐾💢🐾💢🐾💢🐾💢""",
+        """❄️🧊❄️🧊❄️🧊❄️🧊
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Iᴄᴇᴍᴀɴ Gʜᴜsᴀʏᴀ
+    ❄️🧊❄️🧊❄️🧊❄️🧊""",
+        """🔥💥🔥💥🔥💥🔥💥
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Pʏʀᴏ Gʜᴜsᴀʏᴀ
+    🔥💥🔥💥🔥💥🔥💥""",
+        """🌑🌀🌑🌀🌑🌀🌑🌀
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sʜᴀᴅᴏᴡ Gʜᴜsᴀʏᴀ
+    🌑🌀🌑🌀🌑🌀🌑🌀""",
+        """🔥🦅🔥🦅🔥🦅🔥🦅
+        ZA Nᴇ
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Pʜᴏᴇɴɪx Fɪʀᴇ Dᴀʟɪ
+    🔥🦅🔥🦅🔥🦅🔥🦅""",
+        """🍔🍔🍔🍔🍔🍔🍔🍔🍔
+        ??   😋   🍔
+        🍔  🧀   🍔
+        🍔  🥩   🍔
+        🍔🍔🍔🍔🍔🍔🍔🍔🍔
+        
+        Tᴇʀɪ Mᴀᴀ Kᴏ Bᴜʀɢᴇʀ Bɴᴀᴋᴇ Kʜᴀʏᴀ""",
+        """🍕🍕🍕🍕🍕🍕🍕🍕
+        🍕  🍅  🍕
+        🍕  🧀  🍕
+        🍕  🍕  🍕
+        🍕🍕🍕🍕🍕🍕🍕🍕
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Pɪᴢᴢᴀ Dᴀʟᴀ""",
+        """🌮🌮🌮🌮🌮🌮🌮🌮
+        🌮  😋  🌮
+        🌮  🥩  🌮
+        🌮  🌮  🌮
+        🌮🌮🌮🌮🌮🌮🌮🌮
+        
+        Tᴇʀɪ Mᴀᴀ Kᴏ Tᴀᴄᴏ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ""",
+        """🍩🍩🍩🍩🍩🍩🍩🍩
+        🍩  😋  🍩
+        🍩  🍩  🍩
+        🍩  🍩  🍩
+        🍩🍩🍩🍩🍩🍩🍩🍩
+        
+        Tᴇʀɪ Mᴀᴀ Kᴏ Dᴏɴᴜᴛ Bɴᴀᴋᴇ Cʜᴏᴅᴀ""",
+        """☕☕☕☕☕☕☕☕
+        ☕  😋  ☕
+        ☕  ☕  ☕
+        ☕  ☕  ☕
+        ☕☕☕☕☕☕☕☕
+        
+        Tᴇʀɪ Mᴀᴀ Kᴏ Cᴏғғᴇᴇ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ""",
+        """👑👑👑👑👑👑👑👑
+        👑  😎  👑
+        👑  👑  👑
+        👑  👑  👑
+        👑👑👑👑👑👑👑👑
+        
+        ZA Nᴇ Tᴇʀɪ Mᴀᴀ Kᴏ Cʜᴏᴅᴀ""",
+        """💖💖💖💖💖💖💖💖
+        💖  😍  💖
+        💖  💖  💖
+        💖  💖  💖
+        💖💖💖💖💖💖💖💖
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Pʏᴀʀ""",
+        """💀💀💀💀💀💀💀💀
+        💀  😈  💀
+        💀  💀  💀
+        💀  💀  💀
+        💀💀💀💀💀💀💀💀
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴀʀ Gᴀʏɪ""",
+        """🔥🔥🔥🔥🔥🔥🔥🔥
+        🔥  😈  🔥
+        🔥  🔥  🔥
+        🔥  🔥  🔥
+        🔥🔥🔥🔥🔥🔥🔥🔥
+        
+        ZA Nᴇ Aᴀɢ Lɢᴀʏɪ""",
+        """👻👻👻👻👻👻👻👻
+        👻  😱  👻
+        👻  👻  👻
+        👻  👻  👻
+        👻👻👻👻👻👻👻👻
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Gʜᴏsᴛ""",
+        """🌈🌈🌈🌈🌈🌈🌈🌈
+        🌈  😋  🌈
+        🌈  🌈  🌈
+        🌈  🌈  🌈
+        🌈🌈🌈🌈🌈🌈🌈🌈
+        
+        Tᴇʀɪ Mᴀᴀ Kᴏ Rᴀɪɴʙᴏᴡ Sᴛʏʟᴇ Mᴇ Cʜᴏᴅᴀ""",
+        """💣➖💣➖➖💣➖💣
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🔥             ✨
+                /    \\
+                💥    💥 
 
-        # ─── RIDDLE TEXTS ──────────────────────────────────────────────────────
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bᴏᴍʙ Pʜᴏᴅᴜɴɢᴀ""",
+        """☢️➖☢️➖➖☢️➖☢️
+    🌟        \\         /          🌟
+    ⭐️          \\☠️/            ⭐️
+    ✨           💀             ✨
+                /    \\
+                🦴    🦴 
 
-        riddle_texts = [
-            {"q": "Main hoon jo andar aata hai par bahar nahi jaata. Main hoon jo har insaan ke paas hai. Main kya hoon?", "a": "Sans (Breath)"},
-            {"q": "Main hoon jo duniya mein sabse bada hai, par main kisi ko dikhta nahi. Main kya hoon?", "a": "Pyaar (Love)"},
-            {"q": "Main hoon jo haath mein aata hai par pakda nahi jaata. Main kya hoon?", "a": "Pani (Water)"},
-            {"q": "Main hoon jo har insaan ko dikhta hai par koi dekh nahi sakta. Main kya hoon?", "a": "Andhera (Darkness)"},
-            {"q": "Main hoon jo kabhi nahi rukta, kabhi nahi thakta. Main kya hoon?", "a": "Samay (Time)"},
-            {"q": "Main hoon jo duniya mein sabse tez hai, par main kisi ko dikhta nahi. Main kya hoon?", "a": "Vichar (Thought)"},
-            {"q": "Main hoon jo andar hota hai par bahar nahi. Main kya hoon?", "a": "Dil (Heart)"},
-            {"q": "Main hoon jo har insaan ke paas hai par koi use nahi karta. Main kya hoon?", "a": "Dimag (Brain)"},
-            {"q": "Main hoon jo kabhi nahi sota, kabhi nahi thakta. Main kya hoon?", "a": "Aankh (Eye)"},
-            {"q": "Main hoon jo har insaan ki madad karta hai par koi use nahi dekhta. Main kya hoon?", "a": "Hawa (Air)"},
-            {"q": "Main hoon jo duniya mein sabse chhota hai, par sab se bada kaam karta hoon. Main kya hoon?", "a": "Beej (Seed)"},
-            {"q": "Main hoon jo kabhi nahi marta, kabhi nahi hota. Main kya hoon?", "a": "Atma (Soul)"},
-            {"q": "The person who makes it doesn't need it. The person who buys it doesn't use it. The person who uses it doesn't know they're using it. What is it?", "a": "coffin"},
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Nᴜᴄʟᴇᴀʀ Aᴛᴛᴀᴄᴋ""",
+        """🐉➖🐉➖➖🐉➖🐉
+    🌟        \\         /          🌟
+    ⭐️          \\🔥/            ⭐️
+    ✨           🐲             ✨
+                /    \\
+                🔥    🔥 
 
-        # ─── FUN TEXTS (Joke, Fact, Compliment, Quotes) ──────────────────────
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Dʀᴀɢᴏɴ Gʜᴜsᴀʏᴀ""",
+        """👿➖👿➖➖👿➖👿
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           👹             ✨
+                /    \\
+                🔱    🔱 
 
-        joke_list = [
-            "Main apni life mein itna positive hoon... ki blood group bhi B+ hai! 😂",
-            "Teacher: Kal absent kyun the? Student: Sir, mujhe bukhar tha. Teacher: Proof? Student: Aaj aa gaya na! 😹",
-            "Santa: Main ghar ke bahar khada hun. Banta: Andar aa jao. Santa: Andar wala bhi main hoon! 🤣",
-            "Meri girlfriend ne kaha — tujhse better koi nahi. Phir chali gayi. Better koi mila hoga shayad 😂",
-            "Doctor: Patient ko hawa ki zaroorat hai. Nurse: Kya karein? Doctor: Fan on karo. Nurse: Ceiling se pakad ke? 😹",
-            "Ghar mein sabse zyada kaam mera — internet chalaana! 😂",
-            "Padhai karo beta future bright hoga. Maine padhi — future gaya andhera mein. 😂",
-            "Wo bolti hai 'I need space' — main bola ठीक है, NASA se contact karo! 😂",
-            "Mera wifi itna slow hai ke circle of life bhi nahi chalta 🐢",
-            "Main sochta hoon kal se gym jaunga... kal kab aata hai? 🤔",
-            "Mummy ka 2 minute aur Maggi ka 2 minute kabhi same nahi hote",
-            "Aaj kal log 'seen' karke itna attitude dikhate hain, jaise message nahi loan approve kar rahe ho",
-            "Meri life itni private hai ki mujhe khud next update ka pata nahi hota 🤡 ",
-            "Mere jokes pe sirf do log haste hain... main aur meri overconfidence 🤣",
-            "Log bolte hain Be yourself... phir judge bhi wahi log karte hain",
-            "Life ne itne twists diye hain ki Google Maps bhi rerouting kar de",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Dᴇᴍᴏɴ Gʜᴜsᴀʏᴀ""",
+        """💀➖💀➖➖💀➖💀
+    🌟        \\         /          🌟
+    ⭐️          \\☠️/            ⭐️
+    ✨           💀             ✨
+                /    \\
+                🦴    🦴 
 
-        fact_list = [
-            "🧠 Insaan ka dimag 75% paani se bana hai!",
-            "🐙 Octopus ke teen dil hote hain!",
-            "🌙 Chand par mobile signal nahi hai — par WiFi aata hai ek satellite se! (Future plan 😂)",
-            "🍯 Sahi tarike se rakha hua honey kabhi kharab nahi hota!",
-            "⚡ Bijli ka ek bolt 5 times zyada garam hota hai sun ki surface se!",
-            "🦈 Shark insaan se zyada purana hai — dinasors se bhi pehle!",
-            "👁️ Insaan ki aankh 10 million rangon ko differentiate kar sakti hai!",
-            "🐝 Ek machhar ek second mein 600 baar apne pankh hilata hai!",
-            "🦒 Giraffe ki tongue 20 inches lambi hoti hai!",
-            "🐧 Penguins ek dusre ko pehchanne ke liye unique calls use karte hain!",
-            "🚀 Space mein awaaz travel nahi karti, kyunki wahan hawa nahi hoti.",
-            "👅 Har insaan ki tongue print fingerprints ki tarah unique hoti hai.",
-            "🦒 Giraffe apni 21-inch lambi tongue se kaan saaf kar sakta hai.",
-            "⚡ Lightning ka temperature Suraj ki surface se bhi zyada hota hai",
-            "🌍 Har second Earth par lagbhag 100 lightning strikes hoti hain.",
-            "🐌 Snail 3 saal tak so sakta hai (kuch species mein).",
-            "🧊 Garam paani kuch conditions mein thande paani se jaldi jam sakta hai (Mpemba effect).",
-            "👀 Insaan ka brain ulta image dekhta hai aur use seedha process karta hai.",
-            "🍌 Banana technically ek berry hai, lekin strawberry nahi.",
-            "🦘 Kangaroo peeche ki taraf chal nahi sakta.",
-            "🐧 Penguins propose karne ke liye apne partner ko chhota sa pathar gift karte hain (kuch species mein).",
-            "💀 Human body mein itni blood vessels hoti hain ki unhe line mein jodo to lagbhag 100,000 km lambi ho jaayengi.",
-            "🌌 Hum raat ko jo kuch stars dekhte hain, unki light kai saal pehle nikli hoti hai.",
-            "🐝 Bees insaanon ke chehre pehchaan sakti hain.",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴀʀ Gᴀʏɪ""",
+        """🔫➖🔫➖➖🔫➖🔫
+    🌟        \\         /          🌟
+    ⭐️          \\😎/            ⭐️
+    ✨           🎯             ✨
+                /    \\
+                💥    💥 
 
-        compliment_list = [
-            "Bhai tu bahut positive energy rakhta hai — seriously 🌟",
-            "Teri thinking bahut alag hai — creative hai tu 🧠✨",
-            "Tu jo bhi karta hai dil se karta hai — yeh rare hai ❤️",
-            "Teri sense of humor? Top tier 😂👑",
-            "Tujhse baat karna genuinely enjoyable hota hai 🗣️✨",
-            "Tu ek natural leader hai — log tujhe follow karte hain 👑",
-            "Teri mehnat dekh ke lagta hai, success teri waiting hai 💪",
-            "Teri smile contagious hai — sabko khushi deti hai 😊",
-            "Tu bahut strong insaan hai — sab handle kar leta hai 💪",
-            "Teri vibe bohot positive hai — tere saath time acha lagta hai ✨",
-            "You're one of a kind.",
-            "Tumhari vibe alag hi level ki hai.",
-            "You're effortlessly cool.",
-            "Tum jahan hote ho, wahan energy aa jaati hai.",
-            "You make everything look easy.",
-            "Tumhari personality hi alag hai.",
-            "You're genuinely impressive.",
-            "Tumhare ideas hamesha unique hote hain.",
-            "You're unforgettable.",
-            "Tum confidence ka perfect example ho.",
-            "Built different. 💯",
-            "Aura speaks louder than words.",
-            "You're the main character.",
-            "Tumhari smile mood fix kar deti hai.",
-            "You make people feel comfortable.",
-            "You're naturally adorable.",
-            "Tumhari laugh contagious hai.",
-            "You're a walking green flag.",
-            "You're sunshine in human form.",
-            "Tumhare saath time ka pata hi nahi chalta.",
-            "You have the kindest heart.",
-            "You're effortlessly charming.",
-            "You make ordinary moments special.",
-            "Standards on another level.",
-            "Too real to be fake.",
-            "Calm outside, dangerous inside.",
-            "Rare people have this kind of aura.",
-            "Silent, but unforgettable.",
-            "Class never chases attention.",
-            "You don't follow trends, you set them.",
-            "You're the flex you don't even need to show.",
-            "Some people have looks, you have presence.",
-            "Your aura deserves its own fan club.",
-            "You're proof that being real is attractive.",
-            "Not everyone shines, but you do.",
-            "You don't need attention, attention finds you.",
-            "Legends don't introduce themselves.",
-            "Your vibe is expensive.",
-            "You're the kind of person people remember.",
-            "You make confidence look natural. 😎",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Tᴀɴᴋ Gʜᴜsᴀʏᴀ""",
+        """⚔️➖⚔️➖➖⚔️➖⚔️
+    🌟        \\         /          🌟
+    ⭐️          \\🗡️/            ⭐️
+    ✨           ⚔️             ✨
+                /    \\
+                🩸    🩸 
 
-        quote_list = [
-            "💭 Sapne woh nahi jo sote waqt aate hain, sapne woh hain jo sone nahi dete. — APJ Abdul Kalam",
-            "💭 'Mehnat karo itna ki luck ko bhi mauka mile tujhe dhundhne ka.' — Unknown",
-            "💭 'Duniya ka sabse bada teacher: failure hai.' — Unknown",
-            "💭 'Ek accha dost aur ek accha kitaab — dono hi tujhe better banate hain.' — Unknown",
-            "💭 'Zindagi ek echo hai — jo bejhoge woh wapas aayega.' — Unknown",
-            "💭 'Success is not final, failure is not fatal: it is the courage to continue that counts.' — Churchill",
-            "💭 'The only way to do great work is to love what you do.' — Steve Jobs",
-            "💭 'In the middle of difficulty lies opportunity.' — Einstein",
-            "💭 'Believe you can and you're halfway there.' — Theodore Roosevelt",
-            "💭 'The best time to plant a tree was 20 years ago. The second best time is now.' — Chinese Proverb",
-            "💭 People's lives don't end when they die, it ends when they lose faith. — Itachi Uchiha",
-            "💭 Wake up to reality. Nothing ever goes as planned in this world. — Madara Uchiha",
-            "💭 Those who break the rules are trash, but those who abandon their friends are worse than trash. — Kakashi Hatake",
-            "💭 When people are protecting something truly precious, they truly become strong. — Haku",
-            "💭 A lesson without pain is meaningless. — Edward Elric",
-            "💭 A person grows up when they're able to overcome hardships. — Jiraiya",
-            "💭 Power comes in response to a need, not a desire. — Goku",
-            "💭 If you don't take risks, you can't create a future. — Monkey D. Luffy",
-            "💭 The world isn't perfect, but it's there for us. — Roy Mustang",
-            "💭 Fear is not evil. It tells you your weakness. — Gildarts Clive",
-            "💭 The moment you think of giving up, think of the reason why you held on so long. — Natsu Dragneel",
-            "💭 Hard work is worthless for those that don't believe in themselves. — Naruto Uzumaki",
-            "💭 The difference between the novice and the master is that the master has failed more times than the novice has tried. — Koro-sensei",
-            "💭 To know sorrow is not terrifying. What is terrifying is to know you can't go back to happiness. — Matsumoto Rangiku",
-            "💭 Whatever you lose, you'll find it again. But what you throw away you'll never get back. — Kenshin Himura",
-            "💭 Success is not final, failure is not fatal: it is the courage to continue that counts. — Winston Churchill",
-            "💭 The only way to do great work is to love what you do. — Steve Jobs",
-            "💭 Stay hungry, stay foolish. — Steve Jobs",
-            "💭 Your time is limited, so don't waste it living someone else's life. — Steve Jobs",
-            "💭 The future belongs to those who believe in the beauty of their dreams. — Eleanor Roosevelt",
-            "💭 Be yourself; everyone else is already taken. — Oscar Wilde",
-            "💭 It always seems impossible until it's done. — Nelson Mandela",
-            "💭 Dream big and dare to fail. — Norman Vaughan",
-            "💭 Do what you can, with what you have, where you are. — Theodore Roosevelt",
-            "💭 Believe you can and you're halfway there. — Theodore Roosevelt",
-            "💭 The best way to predict the future is to create it. — Peter Drucker",
-            "💭 Discipline is choosing between what you want now and what you want most.",
-            "💭 Don't watch the clock; do what it does. Keep going. — Sam Levenson",
-            "💭 The journey of a thousand miles begins with one step. — Lao Tzu",
-            "💭 Fall seven times, stand up eight. — Japanese Proverb",
-            "💭 Action is the foundational key to all success. — Pablo Picasso",
-            "💭 Work hard in silence, let success make the noise.",
-            "💭 Great things never come from comfort zones.",
-            "💭 Small steps every day lead to big results.",
-            "💭 Consistency beats motivation.",
-            "💭 Discipline creates freedom.",
-            "💭 Your only competition is the person you were yesterday.",
-            "💭 Never let success get to your head or failure get to your heart.",
-            "💭 A calm mind is a powerful weapon.",
-            "💭 Pressure creates diamonds.",
-        ]
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sᴡᴏʀᴅ Gʜᴜsᴀʏᴀ""",
+        """🐍➖🐍➖➖🐍➖🐍
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🐍             ✨
+                /    \\
+                ☠️    ☠️ 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Vɪᴘᴇʀ Gʜᴜsᴀʏᴀ""",
+        """🦂➖🦂➖➖🦂➖🦂
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🦂             ✨
+                /    \\
+                ☠️    ☠️ 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sᴄᴏʀᴘɪᴏɴ Gʜᴜsᴀʏᴀ""",
+        """🐦‍⬛➖🐦‍⬛➖➖🐦‍⬛➖🐦‍⬛
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🖤             ✨
+                /    \\
+                🪶    🪶 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Rᴀᴠᴇɴ Gʜᴜsᴀʏᴀ""",
+        """🐺➖🐺➖➖🐺➖🐺
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🐺             ✨
+                /    \\
+                🩸    🩸 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Wᴏʟғ Gʜᴜsᴀʏᴀ""",
+        """🔥➖🔥➖➖🔥➖🔥
+    🌟        \\         /          🌟
+    ⭐️          \\🦅/            ⭐️
+    ✨           🔥             ✨
+                /    \\
+                💫    💫 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Pʜᴏᴇɴɪx Gʜᴜsᴀʏᴀ""",
+        """🦁➖🦁➖➖🦁➖🦁
+    🌟        \\         /          🌟
+    ⭐️          \\👑/            ⭐️
+    ✨           🦁             ✨
+                /    \\
+                🩸    🩸 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Lɪᴏɴ Gʜᴜsᴀʏᴀ""",
+        """🐯➖🐯➖➖🐯➖🐯
+    🌟        \\         /          🌟
+    ⭐️          \\🐅/            ⭐️
+    ✨           🐯             ✨
+                /    \\
+                🩸    🩸 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Tɪɢᴇʀ Gʜᴜsᴀʏᴀ""",
+        """🦈➖🦈➖➖🦈➖🦈
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🦈             ✨
+                /    \\
+                🩸    🩸 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sʜᴀʀᴋ Gʜᴜsᴀʏᴀ""",
+        """🦅➖🦅➖➖🦅➖🦅
+    🌟        \\         /          🌟
+    ⭐️          \\🦅/            ⭐️
+    ✨           🦅             ✨
+                /    \\
+                🪶    🪶 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Eᴀɢʟᴇ Gʜᴜsᴀʏᴀ""",
+        """🐂➖🐂➖➖🐂➖🐂
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🐂             ✨
+                /    \\
+                💥    💥 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bᴜʟʟ Gʜᴜsᴀʏᴀ""",
+        """🦏➖🦏➖➖🦏➖🦏
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🦏             ✨
+                /    \\
+                💥    💥 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Rʜɪɴᴏ Gʜᴜsᴀʏᴀ""",
+        """🐘➖🐘➖➖🐘➖🐘
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🐘             ✨
+                /    \\
+                💥    💥 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Eʟᴇᴘʜᴀɴᴛ Gʜᴜsᴀʏᴀ""",
+        """🦛➖🦛➖➖🦛➖🦛
+    🌟        \\         /          🌟
+    ⭐️          \\😈/            ⭐️
+    ✨           🦛             ✨
+                /    \\
+                💥    💥 
+
+    Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Hɪᴘᴘᴏ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  💣  💣  █  █  █
+        █  █  █  💣  💣  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bᴏᴍʙ Pʜᴏᴅᴜɴɢᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  💀  💀  █  █  █
+        █  █  █  💀  💀  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴀʀ Gᴀʏɪ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  ☢️  ☢️  █  █  █
+        █  █  █  ☢️  ☢️  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Nᴜᴄʟᴇᴀʀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  🐉  🐉  █  █  █
+        █  █  █  🐉  🐉  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Dʀᴀɢᴏɴ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  🔫  🔫  █  █  █
+        █  █  █  🔫  🔫  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Tᴀɴᴋ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  🐍  🐍  █  █  █
+        █  █  █  🐍  🐍  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sᴀᴀᴘ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  👿  👿  █  █  █
+        █  █  █  👿  👿  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Dᴇᴍᴏɴ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  🦈  🦈  █  █  █
+        █  █  █  🦈  🦈  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Sʜᴀʀᴋ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  🦂  🦂  █  █  █
+        █  █  █  🦂  🦂  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bɪᴄʜʜᴜ Gʜᴜsᴀʏᴀ""",
+        """
+        ███████████████████████████
+        █  ░███████████████████░  █
+        █  █  █████████████  █  █
+        █  █  █  👻  👻  █  █  █
+        █  █  █  👻  👻  █  █  █
+        █  █  █████████████  █  █
+        █  ░███████████████████░  █
+        ███████████████████████████
+        
+        Tᴇʀɪ Mᴀᴀ Kɪ Cʜᴜᴛ Mᴇ Bʜᴏᴏᴛ Gʜᴜsᴀʏᴀ""",
+    ]
+            
+
+            # Store all premium raid and spam texts in dicts for easy lookup
+            premium_raid_texts = {
+                "mr": mr_texts, "mr2": mr2_texts, "br": br_texts, "br2": br2_texts, "br3": br3_texts,
+                "sqr": sqr_texts, "sq2": sq2_texts, "cr": cr_texts, "bar": bar_texts, "gr": gr_texts
+            }
+            premium_spam_texts = {
+                "ms": ms_texts, "ms2": ms2_texts, "bs": bs_texts, "bs2": bs2_texts, "bs3": bs3_texts,
+                "sqs": sqs_texts, "sqs2": sqs2_texts, "cs": cs_texts, "bas": bas_texts, "gs": gs_texts
+            }
+
+            # ─── EXISTING TEXT LISTS (as in original) ──────────────────────────
+            reply_list = [
+                "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                        "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                        "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                        "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                        "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
+                        "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
+                        "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
+                        "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                        "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SHAMBHOG करती है ! 🛐",
+                        "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                        "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                        "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                        "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                        "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
+                        "Hello hello?? saas aarahi है? रण्डी पुत्र 🧘🏻",
+                        "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
+                        "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                        "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐",
+                        "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                        "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                        "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                        "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                        "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
+                        "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
+                        "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
+                        "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                        "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐",
+                        "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                        "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                        "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                        "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                        "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
+                        "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
+                        "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
+                        "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                        "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝙃𝙄𝙎 𝙈𝙊𝙈 𝙋𝙍𝙊𝙋𝙀𝙍𝙇𝙔",
+                        "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘼𝙎𝙆 𝙃𝙄𝙈 𝙏𝙊 𝘾𝙊𝙑𝙀𝙍 𝙃𝙄𝙎 𝙈𝙊𝙈'𝙎 𝘼𝙎𝙎",
+                        "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙄𝙓 𝙈𝙔 𝘼‌𝙋𝙋𝙊𝙄𝙉𝙏𝙈𝙀𝙉𝙏 𝙒𝙄𝙏𝙃 𝙃𝙄𝙎 𝙎𝙄𝙎",
+                        "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝘼𝙉𝘿 𝙏𝙃𝙍𝙊𝙒 𝙏𝙃𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽 𝙎𝙊𝙉",
+                        "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘿𝙊 𝙉𝙊𝙏 𝙎𝙏𝙊𝙋 𝙁𝙐𝘾𝙆𝙄𝙉𝙂 𝙈𝙔 𝙂𝙐𝙇𝘼‌𝙈",
+                        "𝙂𝙀𝙈𝙄𝙉𝙄 𝙎𝘼𝙄𝘿  𝙄𝙎 𝙍𝙉𝘿𝙔 𝙋𝙐𝙏𝙍𝘼",
+                        "𝙋𝙀𝙍𝙋𝙇𝙀𝙓𝙄𝙏𝙔 𝙎𝘼𝙄𝘿 This 𝙄𝙎 𝙂𝙐𝙇𝘼𝙈",
+                        "𝙂𝙍𝙊𝙆 𝘼𝙄 𝙎𝘼𝙄𝘿 𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽",
+                        "𝘽𝙊𝙏 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝘾𝙃𝙐𝘿𝘼𝙆𝘼𝘿",
+                        "𝙈𝙊𝘿𝙄 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝙋𝙊𝙇𝙀 𝘿𝘼𝙉𝘾𝙀𝙍",
+                        "𝙏𝙍𝙐𝙈𝙋 𝙎𝘼𝙄𝘿 THis 𝙄𝙎 𝘽𝙇𝙊𝙊𝘿Y 𝙈𝙊𝙏𝙃𝙀𝙍𝙁*\"𝘾𝙆𝙀𝙍",
+                        "𝗧𝗢𝗛𝗔𝗥 𝗠𝗨𝗠𝗠𝗬 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜𝗡𝗚𝗙𝗜𝗦𝗛𝗘𝗥 𝗞𝗜 𝗕𝗢𝗧𝗧𝗟𝗘 𝗗𝗔𝗟 𝗞𝗘 𝗧𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗔𝗡𝗗𝗘𝗥 𝗛𝗜 😱😂🤩",
+                        "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄 ✋ 𝐇𝐀𝐓𝐓𝐇 𝐃𝐀𝐋𝐊𝐄 👶 𝐁𝐀𝐂𝐂𝐇𝐄 𝐍𝐈𝐊𝐀𝐋 𝐃𝐔𝐍𝐆𝐀 😍",
+                        "𝐓𝐄𝐑𝐀 𝐏𝐄𝐇𝐋𝐀 𝐁𝐀𝐀𝐏 𝐇𝐔 𝐌𝐀𝐃𝐀𝐑𝐂𝐇𝐎𝐃",
+                        "𝗧𝗘𝗥𝗜 𝗠𝗨𝗠𝗠𝗬 𝗞𝗘 𝗦𝗔𝗔𝗧𝗛 𝗟𝗨𝗗𝗼 𝗞𝗛𝗘𝗟𝗧𝗘 𝗞𝗛𝗘𝗟𝗧𝗘 𝗨𝗦𝗞𝗘 𝗠𝗨𝗛 𝗠𝗘 𝗔𝗣𝗡𝗔 𝗟𝗢𝗗𝗔 𝗗𝗘 𝗗𝗨𝗡𝗚𝗔☝🏻☝🏻😬",
+                        "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗦𝗨𝗧𝗟𝗜 𝗕𝗢𝗠𝗕 𝗙𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗝𝗛𝗔𝗔𝗧𝗘 𝗝𝗔𝗟 𝗞𝗘 𝗞𝗛𝗔𝗔𝗞 𝗛𝗢 𝗝𝗔𝗬𝗘𝗚𝗜💣🔥",
+                        "𝐓𝐄𝐑𝐈 𝐕𝐀𝐇𝐄𝐈𝐍 𝐊𝐎 𝐀𝐏𝐍𝐄 𝐋𝐔𝐍𝐃 𝐏𝐑 𝐈𝐓𝐍𝐀 𝐉𝐇𝐔𝐋𝐀𝐀𝐔𝐍𝐆𝐀 𝐊𝐈 𝐉𝐇𝐔𝐋𝐓𝐄 𝐉𝐇𝐔𝐋𝐓𝐄 𝐇𝐈 𝐁𝐀𝐂𝐇𝐀 𝐏𝐀𝐈𝐃𝐀 𝐊𝐑 𝐃𝐄𝐆𝐈 💦💋",
+                        "𝐆𝐀𝐋𝐈 𝐆𝐀𝐋𝐈 𝐌𝐄 𝐑𝐄𝐇𝐓𝐀 𝐇𝐄 𝐒𝐀𝐍𝐃 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐂𝐇𝐎𝐃 𝐃𝐀𝐋𝐀 𝐎𝐑 𝐁𝐀𝐍𝐀 𝐃𝐈𝐀 𝐑𝐀𝐍𝐃 🤤🤣",
+                        "𝐒𝐀𝐁 𝐁𝐎𝐋𝐓𝐄 𝐌𝐔𝐉𝐇𝐊𝐎 𝐏𝐀𝐏𝐀 𝐊𝐘𝐎𝐔𝐍𝐊𝐈 𝐌𝐄𝐍𝐄 𝐁𝐀𝐍𝐀𝐃𝐈𝐀 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐏𝐑𝐄𝐆𝐍𝐄𝐍𝐓 🤣🤣",
+                        "𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙇𝙀𝙏𝙄 𝙈𝙀𝙍𝙄 𝙇𝙐𝙉𝘿 𝘽𝘼𝘿𝙀 𝙈𝘼𝙎𝙏𝙄 𝙎𝙀 𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙆𝙊 𝙈𝙀𝙉𝙀 𝘾𝙃𝙊𝘿 𝘿𝘼𝙇𝘼 𝘽𝙊𝙃𝙊𝙏 𝙎𝘼𝙎𝙏𝙀 𝙎𝙀",
+                        "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗖𝗛𝗔𝗡𝗚𝗘𝗦 𝗖𝗢𝗠𝗠𝗜𝗧 𝗞𝗥𝗨𝗚𝗔 𝗙𝗜𝗥 𝗧𝗘𝗥𝗜 𝗕𝗛𝗘𝗘𝗡 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗔𝗨𝗧𝗢𝗠𝗔𝗧𝗜𝗖𝗔𝗟𝗟𝗬 𝗨𝗣𝗗𝗔𝗧𝗘 𝗛𝗢𝗝𝗔𝗔𝗬𝗘𝗚𝗜🤖🙏🤔",
+                        "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐀𝐊𝐈 𝐂𝐇𝐔𝐃𝐀𝐈 𝐊𝐎 𝐏𝐎𝐑𝐍𝐇𝐔𝐁.𝐂𝐎𝐌 𝐏𝐄 𝐔𝐏𝐋𝐎𝐀𝐃 𝐊𝐀𝐑𝐃𝐔𝐍𝐆𝐀 𝐒𝐔𝐀𝐑 𝐊𝐄 𝐂𝐇𝐎𝐃𝐄 🤣💋💦",
+                        "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐆𝐀𝐀𝐍𝐃 𝐌𝐄𝐈 𝐎𝐍𝐄𝐏𝐋𝐔𝐒 𝐊𝐀 𝐖𝐑𝐀𝐏 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 𝟑𝟎𝐖 𝐇𝐈𝐆𝐇 𝐏𝐎𝐖𝐄𝐑 💥😂😎",
+                        "𝐓𝐔𝐉𝐇𝐄 𝐀𝐁 𝐓𝐀𝐊 𝐍𝐀𝐇𝐈 𝐒𝐌𝐉𝐇 𝐀𝐘𝐀 𝐊𝐈 𝐌𝐀𝐈 𝐇𝐈 𝐇𝐔 𝐓𝐔𝐉𝐇𝐄 𝐏𝐀𝐈𝐃𝐀 𝐊𝐀𝐑𝐍𝐄 𝐖𝐀𝐋𝐀 𝐁𝐇𝐎𝐒𝐃𝐈𝐊𝐄𝐄 𝐀𝐏𝐍𝐈 𝐌𝐀𝐀 𝐒𝐄 𝐏𝐔𝐂𝐇 𝐑𝐀𝐍𝐃𝐈 𝐊𝐄 𝐁𝐀𝐂𝐇𝐄𝐄𝐄𝐄 🤩👊👤😍",
+                        "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄𝐈 𝐀𝐏𝐏𝐋𝐄 𝐊𝐀 𝟏𝟖𝐖 𝐖𝐀𝐋𝐀 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 🔥🤩",
+                        "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗢 𝗜𝗧𝗡𝗔 𝗖𝗛𝗢𝗗𝗨𝗡𝗚𝗔 𝗞𝗜 𝗦𝗔𝗣𝗡𝗘 𝗠𝗘𝗜 𝗕𝗛𝗜 𝗠𝗘𝗥𝗜 𝗖𝗛𝗨𝗗𝗔𝗜 𝗬𝗔𝗔𝗗 𝗞𝗔𝗥𝗘𝗚𝗜 𝗥Æ𝗡𝗗𝗜 🥳😍👊💥",
+                        "𝙋𝘼𝙋𝘼 𝙆𝙄 𝙎𝙋𝙀𝙀𝘿 𝙈𝙏𝘾𝙃 𝙉𝙃𝙄 𝙃𝙊 𝙍𝙃𝙄 𝙆𝙔𝘼",
+                        "𝙆𝙄𝙏𝙉𝙄 𝘾𝙃𝙊𝘿𝙐 𝙏𝙀𝙍𝙄 𝙈𝘼 𝘼𝘽 𝙊𝙍..",
+                        "𝗧𝗘𝗥𝗜 𝗠𝗔𝗨𝗦𝗜 𝗞𝗘 𝗕𝗛𝗢𝗦𝗗𝗘 𝗠𝗘𝗜 𝗜𝗡𝗗𝗜𝗔𝗡 𝗥𝗔𝗜𝗟𝗪𝗔𝗬 🚂💥😂",
+                        "𝙆𝙄𝙏𝙉𝙄 𝙂𝙇𝙄𝙔𝘼 𝙋𝘿𝙒𝙀𝙂𝘼 𝘼𝙋𝙉𝙄 𝙈𝘼 𝙆𝙊",
+                        "𝗧𝗘𝗥𝗜 𝗜𝗧𝗘𝗠 𝗞𝗜 𝗚𝗔𝗔𝗡𝗗 𝗠𝗘 𝗟𝗨𝗡𝗗 𝗗𝗔𝗔𝗟𝗞𝗘,𝗧𝗘𝗥𝗘 𝗝𝗔𝗜𝗦𝗔 𝗘𝗞 𝗢𝗥 𝗡𝗜𝗞𝗔𝗔𝗟 𝗗𝗨𝗡𝗚𝗔 𝗠𝗔‌𝗔‌𝗗𝗔𝗥𝗖𝗛Ø𝗗🤘🏻🙌🏻☠️",
+                        "2 𝙍𝙐𝙋𝘼𝙔 𝙆𝙄 𝙋𝙀𝙋𝙎𝙄 𝙏𝙀𝙍𝙄 𝙈𝙐𝙈𝙈𝙔 𝙎𝘼𝘽𝙎𝙀 𝙎𝙀𝙓𝙔 💋💦",
+                        "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐"
+                        "Baap bhi bnale muje rndike",
+                        "Tera baap randibaaz ey yaad ey tujhe",
+                        "Tu apni Maa cuda na tympass",
+                        "Oye unfunny swipe mtt kr",
+                        "Oh hello bihari tera baap bihari or tu v bihari aaukat me rha kr.",
+                        "Oyy kinner tujhe gc me aane ki permission kisne di.",
+                        "Cudke dikha",
+                        "Cudke dikha ek baar.",
+                        "Sun sun ma cuda.",
+                        "Teri maca bhosda.",
+                        "Oye choti jati ke tmr.",
+                        "Ky? jldi likh kidde.",
+                        "Bihari com gang ke baap ko tag crega tu",
+                        "Mujhe cya tu bihari ey tmkc bs",
+                        "Jaldi se randibaaz papa bol",
+                        "Side hoja bihari tery maa cud gai ab",
+                        "Hye pgl bhg mat ache se cud",
+                        "bhg ny randyke tu ajj",
+                        "Hye pgl ke bche bhag mat",
+                        "Hye dur hatt madchod ke bache",
+                        "koi bat ny tery maa randy ey esliye maf cr rha hu tujhe",
+                        "koi baat ny maa chudwa apni tu mafi de dunga",
+                        "Ache se maa chudwa apni tu mafi mil jayegi tujhe",
+                        "apni ma mat chuda muje swipe crke",
+                        "Ache se apni ma cudwa tu swipe crke",
+                        "Fr bolna na ki cudwa le apni ma swipe crke",
+                        "Cya hua ma cud gyi tery",
+                        "pr kese cud gyi tery ma",
+                        "mujhe pta tha ma cud gai tery",
+                        "mey ny manta ma cud gyi tery",
+                        "teri ma rndy",
+                        "lode se utr mc",
+                        "lun mt chus mera",
+                        "nikal madarchd",
+                        "chup oye gashti k bache",
+                        "makichut teri",
+                        "chup rndyke",
+                        "ma rndy teri",
+                        "teri ma k hath todh k tere baap k muh me fasadunga randyke",
+                        "leave le tu rndyke pasand nai aya meko",
+                        "leave le tu randyke ider se",
+                        "Leave le jldi se wrna ma chud gai tery",
+                        "Leave ny lega maa randy tery",
+                        "Smjh bat maa randy ey tery leave le",
+                        "fast leave le kamjor randyke",
+                        "tuto chup rndyk",
+                        "oy hijde khana kha ke aa kamzor",
+                        "teri mako ily rey🌚😂",
+                        "chup chap chud tmkc",
+                        "chupchap maa chudwa apni tu",
+                        "shi se maa chudwa apni tu chupchap",
+                        "fr se maa chudwa tu apni chupchap",
+                        "shi se likh wrna ma chud gai tery",
+                        "ma cyu chud gai tery chupchap",
+                        "proof cr maa chud gyi tery",
+                        "proof ey tery maa randy ey",
+                        "proof ho chuka maa randy tery",
+                        "Chup chillar",
+                        "chup chup maa k bosda tery",
+                        "oy hijde khana kha ke aa kamzor",
+                        "chup madarchod ?",
+                        "Ab tk cud gyi hogi tery maa ?",
+                        "ny ny me kuch ny janta bs teri ma rndy ey",
+                        "Sbse phele apni maa ko bol chudna kaam kre",
+                        "Yaha bhi chuda tu rndyce pille",
+                        "terimakabosda",
+                        "teri to bhen cudegi",
+                        "chup rndyke tommy",
+                        "nikal madarchd cudke yha se",
+                        "coz teri ma andhi randi he",
+                        "nyto baap bol mujhe",
+                        "nyny teri maa hogi rndii jo chudwati jogi",
+                        "try ammi ce bhosde me emoji dal mc",
+                        "cya ? chmr chud gya cya ?",
+                        "tm chudri hogi frrto",
+                        "cya ? kb ? pgl ey cya rndkek",
+                        "cya sch mey pgl ey cya tu randyke cudwa li tune apni ma",
+                        "itna sch ny bol ma chud gai tery",
+                        "sch mey pgl ey tu apni ma cudwa lia mere sth",
+                        "mtlb tmr",
+                        "nyto",
+                        "pura likh mc",
+                        "tmr frrto",
+                        "oh ok cudle fir",
+                        "teri maa ka damad",
+                        "cya ? ache se likhe pehle rndikebache",
+                        "nyto teri maa chodne me vyast hu",
+                        "nyto pgl ey cya kuch bi",
+                        "oyee cya ? chud gya ?",
+                        "chud mt hss",
+                        "yur rndii mom",
+                        "are sbki maa rndii or teri bi",
+                        "are idar cudle ek baar",
+                        "tri maa ci trh",
+                        "ek line me tmr",
+                        "Q",
+                        "ocy ab chudle",
+                        "pehele teri maa chodu",
+                        "nyto",
+                        "q ?",
+                        "hyyy chud ke dika ek baar",
+                        "oyee sun dost tmr",
+                        "bhag ja raand maaf crr dunga",
+                        "oyee pgl rndii idar aa",
+                        "cya tmr frrto",
+                        "oyee idar aake chud le chmr",
+                        "nyto aese hi cud",
+                        "oyee hyy aise hi cud lena",
+                        "or chud le",
+                        "chud ke dika or",
+                        "hyy chudo na",
+                        "chudo mt bhag jao",
+                        "byyee hyy cya ?",
+                        "Qchud q rhe ho ?",
+                        "pgl ey cya mc",
+                        "chud mt",
+                        "cya pgl rndii idar aa",
+                        "teri ammi ce bhosde me chappal",
+                        "oyee idar aa mc",
+                        "kmzror ey cya rndiek",
+                        "cya likh rha ?",
+                        "chud tha cya ?",
+                        "oyee slide leke baat crmc",
+                        "idar a teri maa chodu",
+                        "oyee cp mt crr chudle",
+                        "oyee hyy chud ke dika",
+                        "idar aa try ma schofu khachar khachar",
+                        "idar aa ja mc",
+                        "hyy idar aake chudle",
+                        "oyee kmzor mc idar aa",
+                        "ye cya tmr",
+                        "oyee ny cp ny crr",
+                        "oyee pgl mt crr",
+                        "cudle aram se mc",
+                        "pgl ey cya rndiek",
+                        "cp crce chudega !",
+                        "baap ? mc mera coi ma baap ny ey mai upar se rocket pe beth ce bss teri ma chodne aya hu",
+                        "Chota likh rndi k bache",
+                        "Chota likha wrna try ma rndy",
+                        "Try ma baka codega",
+                        "Tmkc main burf",
+                        "Bhikari ki jhat ma cuda le",
+                        "Chodke tery ma marjayegi",
+                        "Tmkc main Mount Everest",
+                        "Muh mey lega lund mera",
+                        "Hijde ki jhat chup wrna try ma rndi",
+                        "Menu ny pta tery ma randy",
+                        "Menu ki pta ma randy tery",
+                        "Menu pta maa cud gai tery",
+                        "Menu sb pta ma randy ey tery",
+                        "Menu pr tery ma randy",
+                        "Randy maa tery menu pta",
+                        "Tenu or menu pta ey maa randy tery",
+                        "Bs bs maa cudwa apni",
+                        "Bs bs ma randy tery thnkss",
+                        "Bs bs chudwa lia tu apni maa",
+                        "Bs bs kamjor maa randy tery",
+                        "Smjh gya apni ma cudwa le ab",
+                        "smjh gya tery maa randy ey",
+                        "smjh gya tu sabit kr maa randy tery",
+                        "Cya hua ma cudwa tu apni",
+                        "Easy maa cudwa le apni tu",
+                        "Easy w8 ma chudwa le apni ab",
+                        "Sans ari ha ky teri maa chudgi ajj",
+                        "Teri maa ko bina sanss lete hue chodunga",
+                        "chup randike kamjor",
+                        "apni ma normie cudwa le tu",
+                        "fr cya normie ma cud gai tery",
+                        "bas thek tery ma randy",
+                        "bas thek tery maa cud gyi",
+                        "kamjor thi tery ma esliye cud gai",
+                        "Mai sb janta ma cud gai tery",
+                        "chl chl ht tery maa cud gyi",
+                        "fr kaise cud gyi maa tery",
+                        "maa tery randy ey",
+                        "bas tery maa randy ey",
+                        "fr randy ma tery ey",
+                        "Kamjor ma ka bcha tu randyke",
+                        "bhot gndi cud gai maa tery",
+                        "pr kaise maa cud gai tery itna gnda",
+                        "mujhe cya bta rha maa randy tery",
+                        "mujhe cya pta ma cud gyi tery",
+                        "fir mujhe ny pta maa cud gai tery",
+                        "pta ny kon cod dia tery maa ko",
+                        "ruk aaya tery ma codke",
+                        "wait cr tery maa cod rha hu",
+                        "wait cr rabdyke maa cud rhi ey tery",
+                        "wait kr smjh rha tery ma codke",
+                        "wait le thoda chodne de tery mako",
+                        "ruk ja aand rkh dunga tery make liye",
+                        "tery maa famous randy ey",
+                        "maan lia mene maa randy sali tery",
+                        "maan lia maa cud gai tery",
+                        "shant beth randyke maa chudwa tu apni",
+                        "shant bethke chudwa le apni mako tu",
+                        "fr se shant Beth tu cud ab randyke yha",
+                        "mere smjh ny aya maa randy tery",
+                        "Le केला Kha tu madarchod",
+                        "Hye tery ma cud gyi cya",
+                        "hye tery maa mar gai cya",
+                        "Hye sch bta com cod dia tery mako",
+                        "Chl chod dia teri maa ko smjhle",
+                        "Baki koi dikkat ny tery maa randy ey",
+                        "baki sb jante ey ki maa chuddkad ey tery",
+                        "mujhe cya pta tha tery maa cudne wli ey",
+                        "pr mei kaise jnta tery ma ko koi chod dia",
+                        "pr mera vi manna shi tha maa chud gai tery",
+                        "pr wo glt ny tery maa randy ey",
+                        "pr wo shi ey tery maa chuddkad ey",
+                        "pr kaise kia maa chud gai tery omfoo",
+                        "bur cheer dunga tri ma ka",
+                        "teri ma ke dil me loda marke uski dhadkan rok dunga",
+                        "lulle kha tri makabhosda",
+                        "tri bhn ki bhosdi beta",
+                        "tri ma rndi baat khtm",
+                        "Sun ek maze ki baat batao kya teri maa randy ey"
+                        "codu codu mako tery",
+                        "aj cud gai tery maa oye",
+                        "sun sun randy make bache tu",
+                        "kilas ny randyke",
+                        "mujhe cya pta tery bhen cud gai",
+                        "pr pr cya hote ey tmkc",
+                        "tmcl sunle",
+                        "moot du tery maki chut mey",
+                        "bhgny cudke dikha fr",
+                        "fr se cudle tu",
+                        "ye vi shi ey tery mkc bs",
+                        "aj kuch ny ma cudwa tu apni",
+                        "try kr mera lund chuske",
+                        "tormakibur sun",
+                        "tor maki fuddi oye",
+                        "Haye Haye tery ma cud gai",
+                        "oye lundke pasine..",
+                        "kutte ke tatte sun",
+                        "kutta jaisa cud rha tu",
+                        "Muh mei le mera..",
+                        "jhaat ke pissu sun tmkc",
+                        "Hahahha ma cud gai tery",
+                        "weak tatte uth",
+                        "weak ey tu cud rha",
+                        "weak ache se cud tu",
+                        "weak tery ma cud rhi dekh",
+                        "week tery ma cud gai ab",
+                        "mujhe ny rok tu weak ey",
+                        "chup hizde",
+                        "okat ny meri ma cudwa tu apni",
+                        "lun lega tery maki gand mei ?",
+                        "tery maki bachi codu..",
+                        "tery bhen ki chut aj fad du",
+                        "speed lekr aa cudke dikha",
+                        "speed ny tere andr weak prosn",
+                        "ugly randyke chup",
+                        "makafuddatery",
+                        "tera baap ko tag kr..?",
+                        "ache se tag kr randibaaz bhagwn ko..",
+                        "cudke pgl ny ho tu",
+                        "cudke pgl ho rha tu kid",
+                        "ma to cud gai tery hawabzi cr..",
+                        "bs ma codni ey tery",
+                        "town mei cud tery mako lekr",
+                        "tery ma sexy ko bej - randibaaz bhgwn pe",
+                        "speed pkd cp ny kr",
+                        "Try ma rendy",
+                        "Bhkk cud",
+                        "tey maa rndi",
+                        "tery behen randi",
+                        "Cud ja",
+                        "tery didi rndi",
+                        "Slow",
+                        "teri Maiya ciodu",
+                        "Bhag?",
+                        "Bhak cud",
+                        "Tma codu",
+                        "Slow",
+                        "Slow firse",
+                        "Cudgrib",
+                        "Try ma dou",
+                        "tbkc codu",
+                        "Net on off wali rndy",
+                        "Oye try ma codu",
+                        "Idhar aake cud chup chaap",
+                        "tbkc mrdu",
+                        "oi maake lodee",
+                        "randyke beej",
+                        "tmkc chodu",
+                        "suar ke beej",
+                        "net off on kr randyke ladke",
+                        "Try ma cudi kese",
+                        "Chup slow madharcod",
+                        "tbkc codu kr msg delete",
+                        "oi suar ke ladke",
+                        "tmkc fufi",
+                        "tery didi chudi",
+                        "tmkc dikha",
+                        "Cud ab",
+                        "randyke cud",
+                        "Bhak cud",
+                        "cudle tbkc mru",
+                        "tmkl cudle grib",
+                        "tery behen vesiyaa rndi",
+                        "Itna gnda chuda tu firse net on off",
+                        "grib ke bete",
+                        "Bhag ja lode tmkc maru dunga",
+                        "tbkc mrdungaa",
+                        "bhag tmkc",
+                        "bhag tbkc",
+                        "tbkc mey cp",
+                        "cp tbkc mehh",
+                        "cp tmkl meh",
+                        "cp bol randyke",
+                        "Abe cp bol randyke",
+                        "double send ko cp tmkc codu",
+                        "tbkc me cp cod dunga Aaj mehh",
+                        "ht tbkc dalal ke bete.",
+                        "Rndy jldi jldi cudq tryma",
+                        "Para likhega..",
+                        "Tra rndhbhak",
+                        "Lagdi ke ladce cp bol",
+                        "cp bol lagdi ke bete..",
+                        "cudke cp bol",
+                        "bhikari lund chus mera.",
+                        "Low level cp cr",
+                        "cp bol low level weak",
+                        "mere lund pe ey tu hijde",
+                        "free cudwa tery mako",
+                        "Free mey cud tu randyke"
+                        "speed ny weak tatte terme",
+                        "kitni br cudwayega terymako",
+                        "lund le randibaaz bapka",
+                        "lun cus jaldi se randibaaz bapka",
+                        "koi ny dekh rha cudle tu",
+                        "cudle betichod ache se",
+                        "maki chut tery bs yehi janta mey",
+                        "cp bolega to tmkc",
+                        "wrna tery ma cud jayegi",
+                        "slow ey tu kid",
+                        "jldi likh..tmkc",
+                        "jldi likh..randce tu",
+                        "tym se phle cudke dikha",
+                        "tym hoga tery maa cudwa",
+                        "ma cud gai tery tym se phle",
+                        "uth randce ke ldke",
+                        "macabosdatery",
+                        "con kb cod dia mako tery",
+                        "koi hoga tml",
+                        "machar cudle tu",
+                        "menu tery mako codna se",
+                        "tery mako bol mujhe cod de",
+                        "bs mey tery ma se cudna chta hu",
+                        "Eww maka lode uth",
+                        "Meow cr tery mako codu",
+                        "lund rkh dia tery make fude pe",
+                        "mera lund ke bal uth",
+                        "kidee Zinda ho",
+                        "mar ny kidde type kr",
+                        "chup bkl",
+                        "bc tery maki chut",
+                        "mc randyke likh fast",
+                        "fast likh randyke",
+                        "fast likh kamzor"
+                        "tery maki chut claim crwa",
+                        "awz niche randce ke bche",
+                        "sawal ny puch tery makabosda",
+                        "fyter bnega lagde madrchod",
+                        "oye kaale ro ke dikha",
+                        "oye kaale roo ny",
+                        "short ny cud tu bina ruke",
+                        "short ny cud tu apni mako lekr",
+                        "tery make sth tery bhen vi cudwa le",
+                        "tery make sth tery didi vi cud gai",
+                        "Chat fyter bnega randce codu tery mako",
+                        "bol randibaaz daddy ey",
+                        "bullyx randyke uth",
+                        "mar marke cud rha tu",
+                        "or tery ma marke cud gai"
+                        "Jaldi likh rndyke bej",
+                        "Or bda likh tmc",
+                        "Or bda 2 line wla likh tmkc",
+                        "Or bda oye likh tml",
+                        "Teri maa ka bur",
+                        "Oye keede",
+                        "Randi ke ladke",
+                        "Jaldi likh teri behen chodu",
+                        "Mkl uth randi ke bacche",
+                        "Teri nani meri maal",
+                        "Tej likh randce",
+                        "Oye maake lode mrenga",
+                        "Teri maa chody",
+                        "Teri Maiya ki gand",
+                        "Tery dadi ka fudda",
+                        "Mkl uth behencod",
+                        "Teri maa ki bur de",
+                        "Tery maa ka fudda me lauda",
+                        "Teri maa chudva",
+                        "Randi ke bete mar gaya",
+                        "Teri maa ki chut mru",
+                        "Jalid kr spam",
+                        "Mc spam rokenga",
+                        "Teri maaki chut spam kr",
+                        "spam kr.maake lode",
+                        "Randyke chode spam kr wrna cud tu",
+                        "Spam kr kid",
+                        "Noob teri maa chodu",
+                        "Rndyke bete mar mat tu",
+                        "Noob jaldi likh wrna tery maa rand",
+                        "cud gai maa tery noob",
+                        "uth randyke noob",
+                        "chl cudke dikha noob",
+                        "jldi typ cr noob halke",
+                        "cud ke pgl ny ho noob",
+                        "cud cud ke rand bnja tu noob",
+                        "makichut tery noob",
+                        "ganda cyu cud rha tu ?",
+                        "itna gnda ny cud ache se cud",
+                        "Maan le cud gya tu sun bat ab",
+                        "makafudda fat gya tery ruk"
+                        "BAAP BHI BNALE MUJE RNDIKE",
+                        "TERA BAAP RANDIBAAZ EY YAAD EY TUJHE",
+                        "TU APNI MAA CUDA NA TYMPASS",
+                        "OYE UNFUNNY SWIPE MTT KR",
+                        "OH HELLO BIHARI TERA BAAP BIHARI OR TU V BIHARI AAUKAT ME RHA KR.",
+                        "OYY KINNER TUJHE GC ME AANE KI PERMISSION KISNE DI.",
+                        "CUDKE DIKHA",
+                        "CUDKE DIKHA EK BAAR.",
+                        "SUN SUN MA CUDA.",
+                        "TERI MACA BHOSDA.",
+                        "OYE CHOTI JATI KE TMR.",
+                        "KY? JLDI LIKH KIDDE.",
+                        "BIHARI COM GANG KE BAAP KO TAG CREGA TU",
+                        "MUJHE CYA TU BIHARI EY TMKC BS",
+                        "JALDI SE RANDIBAAZ PAPA BOL",
+                        "SIDE HOJA BIHARI TERY MAA CUD GAI AB",
+                        "HYE PGL BHG MAT ACHE SE CUD",
+                        "BHG NY RANDYKE TU AJJ",
+                        "HYE PGL KE BCHE BHAG MAT",
+                        "HYE DUR HATT MADCHOD KE BACHE",
+                        "KOI BAT NY TERY MAA RANDY EY ESLIYE MAF CR RHA HU TUJHE",
+                        "KOI BAAT NY MAA CHUDWA APNI TU MAFI DE DUNGA",
+                        "ACHE SE MAA CHUDWA APNI TU MAFI MIL JAYEGI TUJHE",
+                        "APNI MA MAT CHUDA MUJE SWIPE CRKE",
+                        "ACHE SE APNI MA CUDWA TU SWIPE CRKE",
+                        "FR BOLNA NA KI CUDWA LE APNI MA SWIPE CRKE",
+                        "CYA HUA MA CUD GYI TERY",
+                        "PR KESE CUD GYI TERY MA",
+                        "MUJHE PTA THA MA CUD GAI TERY",
+                        "MEY NY MANTA MA CUD GYI TERY",
+                        "TERI MA RNDY",
+                        "LODE SE UTR MC",
+                        "LUN MT CHUS MERA",
+                        "NIKAL MADARCHD",
+                        "CHUP OYE GASHTI K BACHE",
+                        "MAKICHUT TERI",
+                        "CHUP RNDYKE",
+                        "MA RNDY TERI",
+                        "TERI MA K HATH TODH K TERE BAAP K MUH ME FASADUNGA RANDYKE",
+                        "LEAVE LE TU RNDYKE PASAND NAI AYA MEKO",
+                        "LEAVE LE TU RANDYKE IDER SE",
+                        "LEAVE LE JLDI SE WRNA MA CHUD GAI TERY",
+                        "LEAVE NY LEGA MAA RANDY TERY",
+                        "SMJH BAT MAA RANDY EY TERY LEAVE LE",
+                        "FAST LEAVE LE KAMJOR RANDYKE",
+                        "TUTO CHUP RNDYK",
+                        "OY HIJDE KHANA KHA KE AA KAMZOR",
+                        "TERI MAKO ILY REY",
+                        "CHUP CHAP CHUD TMKC",
+                        "CHUPCHAP MAA CHUDWA APNI TU",
+                        "SHI SE MAA CHUDWA APNI TU CHUPCHAP",
+                        "FR SE MAA CHUDWA TU APNI CHUPCHAP",
+                        "SHI SE LIKH WRNA MA CHUD GAI TERY",
+                        "MA CYU CHUD GAI TERY CHUPCHAP",
+                        "PROOF CR MAA CHUD GYI TERY",
+                        "PROOF EY TERY MAA RANDY EY",
+                        "PROOF HO CHUKA MAA RANDY TERY",
+                        "CHUP CHILLAR",
+                        "CHUP CHUP MA K BOSDA TERY",
+                        "OY HIJDE KHANA KHA KE AA KAMZOR",
+                        "CHUP MADARCHOD ?",
+                        "AB TK CUD GYI HOGI TERY MAA ?",
+                        "NY NY ME KUCH NY JANTA BS TERI MA RNDY EY",
+                        "SBSE PHELE APNI MAA KO BOL CHUDNA KAAM KRE",
+                        "YAHA BHI CHUDA TU RNDYCE PILLE",
+                        "TERIMAKABOSDA",
+                        "TERI TO BHEN CUDEGI",
+                        "CHUP RNDYKE TOMMY",
+                        "NIKAL MADARCHD CUDKE YHA SE",
+                        "COZ TERI MA ANDHI RANDI HE",
+                        "NYTO BAAP BOL MUJHE",
+                        "NYNY TERI MAA HOGI RNDII JO CHUDWATI JOGI",
+                        "TRY AMMI CE BHOSDE ME EMOJI DAL MC",
+                        "CYA ? CHMR CHUD GYA CYA ?",
+                        "TM CHUDRI HOGI FRRTO",
+                        "CYA ? KB ? PGL EY CYA RNDKEK",
+                        "CYA SCH MEY PGL EY CYA TU RANDYKE CUDWA LI TUNE APNI MA",
+                        "ITNA SCH NY BOL MA CHUD GAI TERY",
+                        "SCH MEY PGL EY TU APNI MA CUDWA LIA MERE STH",
+                        "MTLB TMR",
+                        "NYTO",
+                        "PURA LIKH MC",
+                        "TMR FRRTO",
+                        "OH OK CUDLE FIR",
+                        "TERI MAA KA DAMAD",
+                        "CYA ? ACHE SE LIKHE PEHLE RNDIKEBACHE",
+                        "NYTO TERI MAA CHODNE ME VYAST HU",
+                        "NYTO PGL EY CYA KUCH BI",
+                        "OYEE CYA ? CHUD GYA ?",
+                        "CHUD MT HSS",
+                        "YUR RNDII MOM",
+                        "ARE SBKI MAA RNDII OR TERI BI",
+                        "ARE IDAR CUDLE EK BAAR",
+                        "TRI MAA CI TRH",
+                        "EK LINE ME TMR",
+                        "Q",
+                        "OCY AB CHUDLE",
+                        "PEHELE TERI MAA CHODU",
+                        "NYTO",
+                        "Q ?",
+                        "HYYY CHUD KE DIKA EK BAAR",
+                        "OYEE SUN DOST TMR",
+                        "BHAG JA RAAND MAAF CRR DUNGA",
+                        "OYEE PGL RNDII IDAR AA",
+                        "CYA TMR FRRTO",
+                        "OYEE IDAR Aake CHUD LE CHMR",
+                        "NYTO AESE HI CUD",
+                        "OYEE HYY AISE HI CUD LENA",
+                        "OR CHUD LE",
+                        "CHUD KE DIKA OR",
+                        "HYY CHUDO NA",
+                        "CHUDO MT BHAG JAO",
+                        "BYYEE HYY CYA ?",
+                        "QCHUD Q RHE HO ?",
+                        "PGL EY CYA MC",
+                        "CHUD MT",
+                        "CYA PGL RNDII IDAR AA",
+                        "TERI AMMI CE BHOSDE ME CHAPPAL",
+                        "OYEE IDAR AA MC",
+                        "KMZROR EY CYA RNDIEK",
+                        "CYA LIKH RHA ?",
+                        "CHUD THA CYA ?",
+                        "OYEE SLIDE LEKE BAAT CRMC",
+                        "IDAR A TERI MAA CHODU",
+                        "OYEE CP MT CRR CHUDLE",
+                        "OYEE HYY CHUD KE DIKA",
+                        "IDAR AA TRY MA SCHOFU KHACHAR KHACHAR",
+                        "IDAR AA JA MC",
+                        "HYY IDAR Aake CHUDLE",
+                        "OYEE KMZOR MC IDAR AA",
+                        "YE CYA TMR",
+                        "OYEE NY CP NY CRR",
+                        "OYEE PGL MT CRR",
+                        "CUDLE ARAM SE MC",
+                        "PGL EY CYA RNDIEK",
+                        "CP CRCE CHUDEGA !",
+                        "BAAP ? MC MERA COI MA BAAP NY EY MAI UPAR SE ROCKET PE BETH CE BSS TERI MA CHODNE AYA HU",
+                        "CHOTA LIKH RNDI K BACHE",
+                        "CHOTA LIKHA WRNA TRY MA RNDY",
+                        "TRY MA BAKA CODEGA",
+                        "TMKC MAIN BURF",
+                        "BHIKARI KI JHAT MA CUDA LE",
+                        "CHODKE TERY MA MARJAYEGI",
+                        "TMKC MAIN MOUNT EVEREST",
+                        "MUH MEY LEGA LUND MERA",
+                        "HIJDE KI JHAT CHUP WRNA TRY MA RNDI",
+                        "MENU NY PTA TERY MA RANDY",
+                        "MENU KI PTA MA RANDY TERY",
+                        "MENU PTA MAA CUD GAI TERY",
+                        "MENU SB PTA MA RANDY EY TERY",
+                        "MENU PR TERY MA RANDY",
+                        "RANDY MAA TERY MENU PTA",
+                        "TENU OR MENU PTA EY MAA RANDY TERY",
+                        "BS BS MAA CUDWA APNI",
+                        "BS BS MA RANDY TERY THNKSS",
+                        "BS BS CHUDWA LIA TU APNI MAA",
+                        "BS BS KAMJOR MAA RANDY TERY",
+                        "SMJH GYA APNI MA CUDWA LE AB",
+                        "SMJH GYA TERY MAA RANDY EY",
+                        "SMJH GYA TU SABIT KR MAA RANDY TERY",
+                        "CYA HUA MA CUDWA TU APNI",
+                        "EASY MAA CUDWA LE APNI TU",
+                        "EASY W8 MA CHUDWA LE APNI AB",
+                        "SANS ARI HA KY TERI MAA CHUDGI AJJ",
+                        "TERI MAA KO BINA SANSS LETE HUE CHODUNGA",
+                        "CHUP RANDIKE KAMJOR",
+                        "APNI MA NORMIE CUDWA LE TU",
+                        "FR CYA NORMIE MA CUD GAI TERY",
+                        "BAS THEK TERY MA RANDY",
+                        "BAS THEK TERY MAA CUD GYI",
+                        "KAMJOR THI TERY MA ESLIYE CUD GAI",
+                        "MAI SB JANTA MA CUD GAI TERY",
+                        "CHL CHL HT TERY MAA CUD GYI",
+                        "FR KAISE CUD GYI MAA TERY",
+                        "MAA TERY RANDY EY",
+                        "BAS TERY MAA RANDY EY",
+                        "FR RANDY MA TERY EY",
+                        "KAMJOR MA KA BCHA TU RANDYKE",
+                        "BHOT GNDI CUD GAI MAA TERY",
+                        "PR KAISE MAA CUD GAI TERY ITNA GNDA",
+                        "MUJHE CYA BTA RHA MAA RANDY TERY",
+                        "MUJHE CYA PTA MA CUD GYI TERY",
+                        "FIR MUJHE NY PTA MAA CUD GAI TERY",
+                        "PTA NY KON COD DIA TERY MAA KO",
+                        "RUK AAYA TERY MA CODKE",
+                        "WAIT CR TERY MAA COD RHA HU",
+                        "WAIT CR RABDYKE MAA CUD RHI EY TERY",
+                        "WAIT KR SMJH RHA TERY MA CODKE",
+                        "WAIT LE THODA CHODNE DE TERY MAKO",
+                        "RUK JA AAND RKH DUNGA TERY MAKE LIYE",
+                        "TERY MAA FAMOUS RANDY EY",
+                        "MAAN LIA MENE MAA RANDY SALI TERY",
+                        "MAAN LIA MAA CUD GAI TERY",
+                        "SHANT BETH RANDYKE MAA CHUDWA TU APNI",
+                        "SHANT BETHKE CHUDWA LE APNI MAKO TU",
+                        "FR SE SHANT BETH TU CUD AB RANDYKE YHA",
+                        "MERE SMJH NY AYA MAA RANDY TERY",
+                        "LE KELA KHA TU MADARCHOD",
+                        "HYE TERY MA CUD GYI CYA",
+                        "HYE TERY MAA MAR GAI CYA",
+                        "HYE SCH BTA COM COD DIA TERY MAKO",
+                        "CHL CHOD DIA TERI MAA KO SMJHLE",
+                        "BAKI KOI DIKKAT NY TERY MAA RANDY EY",
+                        "BAKI SB JANTE EY KI MAA CHUDDKAD EY TERY",
+                        "MUJHE CYA PTA THA TERY MAA CUDNE WLI EY",
+                        "PR MEI KAISE JNTA TERY MA KO KOI CHOD DIA",
+                        "PR MERA VI MANNA SHI THA MAA CHUD GAI TERY",
+                        "PR WO GLT NY TERY MAA RANDY EY",
+                        "PR WO SHI EY TERY MAA CHUDDKAD EY",
+                        "PR KAISE KIA MAA CHUD GAI TERY OMFOO",
+                        "BUR CHEER DUNGA TRI MA KA",
+                        "TERI MA KE DIL ME LODA MARKE USKI DHADKAN ROK DUNGA",
+                        "LULLE KHA TRI MAKABHOSDA",
+                        "TRI BHN KI BHOSDI BETA",
+                        "TRI MA RNDI BAAT KHTM",
+                        "SUN EK MAZE KI BAAT BATAO KYA TERI MAA RANDY EY",
+                        "CODU CODU MAKO TERY",
+                        "AJ CUD GAI TERY MAA OYE",
+                        "SUN SUN RANDY MAKE BACHE TU",
+                        "KILAS NY RANDYKE",
+                        "MUJHE CYA PTA TERY BHEN CUD GAI",
+                        "PR PR CYA HOTE EY TMKC",
+                        "TMCL SUNLE",
+                        "MOOT DU TERY MAKI CHUT MEY",
+                        "BHGNY CUDKE DIKHA FR",
+                        "FR SE CUDLE TU",
+                        "YE VI SHI EY TERY MKC BS",
+                        "AJ KUCH NY MA CUDWA TU APNI",
+                        "TRY KR MERA LUND CHUSKE",
+                        "TORMAKIBUR SUN",
+                        "TOR MAKI FUDDI OYE",
+                        "HAYE HAYE TERY MA CUD GAI",
+                        "OYE LUNDKE PASINE..",
+                        "KUTTE KE TATTE SUN",
+                        "KUTTA JAISA CUD RHA TU",
+                        "MUH MEI LE MERA..",
+                        "JHAAT KE PISSU SUN TMKC",
+                        "HAHAHHA MA CUD GAI TERY",
+                        "WEAK TATTE UTH",
+                        "WEAK EY TU CUD RHA",
+                        "WEAK ACHE SE CUD TU",
+                        "WEAK TERY MA CUD RHI DEKH",
+                        "WEEK TERY MA CUD GAI AB",
+                        "MUJHE NY ROK TU WEAK EY",
+                        "CHUP HIZDE",
+                        "OKAT NY MERI MA CUDWA TU APNI",
+                        "LUN LEGA TERY MAKI GAND MEI ?",
+                        "TERY MAKI BACHI CODU..",
+                        "TERY BHEN KI CHUT AJ FAD DU",
+                        "SPEED LEKR AA CUDKE DIKHA",
+                        "SPEED NY TERE ANDR WEAK PROSN",
+                        "UGLY RANDYKE CHUP",
+                        "MAKAFUDDATERY",
+                        "TERA BAAP KO TAG KR..?",
+                        "ACHE SE TAG KR RANDIBAAZ BHAGWN KO..",
+                        "CUDKE PGL NY HO TU",
+                        "CUDKE PGL HO RHA TU KID",
+                        "MA TO CUD GAI TERY HAWABZI CR..",
+                        "BS MA CODNI EY TERY",
+                        "TOWN MEI CUD TERY MAKO LEKR",
+                        "TERY MA SEXY KO BEJ - RANDIBAAZ BHGWN PE",
+                        "SPEED PKD CP NY KR",
+                        "TRY MA RENDY",
+                        "BHKK CUD",
+                        "TEY MAA RNDI",
+                        "TERY BEHEN RANDI",
+                        "CUD JA TMC",
+                        "TERY DIDI RNDI",
+                        "SLOW",
+                        "TERI MAIYA CIODU",
+                        "BHAG?TMC ",
+                        "BHAK CUD TML",
+                        "TMA CODU",
+                        "SLOW TMKC ",
+                        "SLOW FIRSE TMKC ",
+                        "CUDGRIB TML",
+                        "TRY MA DOU",
+                        "TBKC CODU",
+                        "NET ON OFF WALI RNDY",
+                        "OYE TRY MA CODU",
+                        "IDHAR AAKE CUD CHUP CHAAP",
+                        "TBKC MRDU",
+                        "OI MAAKE LODEE",
+                        "RANDYKE BEEJ",
+                        "TMKC CHODU",
+                        "SUAR KE BEEJ",
+                        "NET OFF ON KR RANDYKE LADKE",
+                        "TRY MA CUDI KESE",
+                        "CHUP SLOW MADHARCOD",
+                        "TBKC CODU KR MSG DELETE",
+                        "OI SUAR KE LADKE",
+                        "TMKC FUFI",
+                        "TERY DIDI CHUDI",
+                        "TMKC DIKHA",
+                        "CUD AB",
+                        "RANDYKE CUD",
+                        "BHAK CUD",
+                        "CUDLE TBKC MRU",
+                        "TMKL CUDLE GRIB",
+                        "TERY BEHEN VESITYA RNDI",
+                        "ITNA GNDA CHUDA TU FIRSE NET ON OFF",
+                        "GRIB KE BETE",
+                        "BHAG JA LODE TMKC MARU DUNGA",
+                        "TBKC MRDUNGAA",
+                        "BHAG TMKC",
+                        "BHAG TBKC",
+                        "TBKC MEY CP",
+                        "CP TBKC MEHH",
+                        "CP TMKL MEH",
+                        "CP BOL RANDYKE",
+                        "ABE CP BOL RANDYKE",
+                        "DOUBLE SEND KO CP TMKC CODU",
+                        "TBKC ME CP COD DUNGA AAJ MEHH",
+                        "HT TBKC DALAL KE BETE.",
+                        "RNDY JLDI JLDI CUDQ TRYMA",
+                        "PARA LIKHEGA..",
+                        "TRA RNDHBHAK",
+                        "LAGDI KE LADCE CP BOL",
+                        "CP BOL LAGDI KE BETE..",
+                        "CUDKE CP BOL",
+                        "BHIKARI LUND CHUS MERA.",
+                        "LOW LEVEL CP CR",
+                        "CP BOL LOW LEVEL WEAK",
+                        "MERE LUND PE EY TU HIJDE",
+                        "FREE CUDWA TERY MAKO",
+                        "FREE MEY CUD TU RANDYKE",
+                        "SPEED NY WEAK TATTE TERME",
+                        "KITNI BR CUDWAYEGA TERYMAKO",
+                        "LUND LE RANDIBAAZ BAPKA",
+                        "LUN CUS JALDI SE RANDIBAAZ BAPKA",
+                        "KOI NY DEKH RHA CUDLE TU",
+                        "CUDLE BETICHOD ACHE SE",
+                        "MAKI CHUT TERY BS YEHI JANTA MEY",
+                        "CP BOLEGA TO TMKC",
+                        "WRNA TERY MA CUD JAYEGI",
+                        "SLOW EY TU KID",
+                        "JLDI LIKH..TMKC",
+                        "JLDI LIKH..RANDCE TU",
+                        "TYM SE PHLE CUDKE DIKHA",
+                        "TYM HOGA TERY MAA CUDWA",
+                        "MA CUD GAI TERY TYM SE PHLE",
+                        "UTH RANDCE KE LDKE",
+                        "MACABOSDATERY",
+                        "CON KB COD DIA MAKO TERY",
+                        "KOI HOGA TML",
+                        "MACHAR CUDLE TU",
+                        "MENU TERY MAKO CODNA SE",
+                        "TERY MAKO BOL MUJHE COD DE",
+                        "BS MEY TERY MA SE CUDNA CHTA HU",
+                        "EWW MAKA LODE UTH",
+                        "MEOW CR TERY MAKO CODU",
+                        "LUND RKH DIA TERY MAKE FUDE PE",
+                        "MERA LUND KE BAL UTH",
+                        "KIDEE ZINDA HO",
+                        "MAR NY KIDDE TYPE KR",
+                        "CHUP BKL",
+                        "BC TERY MAKI CHUT",
+                        "MC RANDYKE LIKH FAST",
+                        "FAST LIKH RANDYKE",
+                        "FAST LIKH KAMZOR",
+                        "TERY MAKI CHUT CLAIM CRWA",
+                        "AWZ NICHE RANDCE KE BCHE",
+                        "SAWAL NY PUCH TERY MAKABOSDA",
+                        "FYTER BNEGA LAGDE MADRCHOD",
+                        "OYE KAALE RO KE DIKHA",
+                        "OYE KAALE ROO NY",
+                        "SHORT NY CUD TU BINA RUKE",
+                        "SHORT NY CUD TU APNI MAKO LEKR",
+                        "TERY MAKE STH TERY BHEN VI CUDWA LE",
+                        "TERY MAKE STH TERY DIDI VI CUD GAI",
+                        "CHAT FYTER BNEGA RANDCE CODU TERY MAKO",
+                        "BOL RANDIBAAZ DADDY EY",
+                        "BULLYX RANDYKE UTH",
+                        "MAR MARKE CUD RHA TU",
+                        "OR TERY MA MARKE CUD GAI",
+                        "JALDI LIKH RNDYKE BEJ",
+                        "OR BDA LIKH TMC",
+                        "OR BDA 2 LINE WLA LIKH TMKC",
+                        "OR BDA OYE LIKH TML",
+                        "TERI MAA KA BUR",
+                        "OYE KEEDE",
+                        "RANDI KE LADKE",
+                        "JALDI LIKH TERI BEHEN CHODU",
+                        "MKL UTH RANDI KE BACCHE",
+                        "TERI NANI MERI MAAL",
+                        "TEJ LIKH RANDCE",
+                        "OYE MAAKE LODE MRENGA",
+                        "TERI MAA CHODY",
+                        "TERI MAIYA KI GAND",
+                        "TERY DADI KA FUDDA",
+                        "MKL UTH BEHENCOD",
+                        "TERI MAA KI BUR DE",
+                        "TERY MAA KA FUDDA ME LAUDA",
+                        "TERI MAA CHUDVA",
+                        "RANDI KE BETE MAR GAYA",
+                        "TERI MAA KI CHUT MRU",
+                        "JALID KR SPAM",
+                        "MC SPAM ROKENGA",
+                        "TERI MAAKI CHUT SPAM KR",
+                        "SPAM KR.MAAKE LODE",
+                        "RANDYKE CHODE SPAM KR WRNA CUD TU",
+                        "SPAM KR KID",
+                        "NOOB TERI MAA CHODU",
+                        "RNDYKE BETE MAR MAT TU",
+                        "NOOB JALDI LIKH WRNA TERY MAA RAND",
+                        "CUD GAI MAA TERY NOOB",
+                        "UTH RANDYKE NOOB",
+                        "CHL CUDKE DIKHA NOOB",
+                        "JLDI TYP CR NOOB HALKE",
+                        "CUD KE PGL NY HO NOOB",
+                        "CUD CUD KE RAND BNJA TU NOOB",
+                        "MAKICHUT TERY NOOB",
+                        "GANDA CYU CUD RHA TU ?",
+                        "ITNA GNDA NY CUD ACHE SE CUD",
+                        "MAAN LE CUD GYA TU SUN BAT AB",
+                        "MAKAFUDDA FAT GYA TERY RUK",
+                    "sʜᴀɴᴛ ʙᴇᴛʜ ᴍᴀᴅʀᴄʜᴏᴅ ᴡʀɴᴀ ᴍᴀᴋᴀʙᴏsᴅᴀ ᴛᴇᴇʏ.",
+                    "ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴄʜᴜᴛ..",
+                    "ʟᴡᴅᴇ ᴋᴇ ʙᴀᴀᴀʟʟʟ ᴛᴇʀʏ ᴍᴀᴀ ᴄᴜᴅᴋᴇ ᴘɢʟ ᴅᴇᴋʜ.",
+                    "ᴍᴀᴄʜᴀʀ ᴋɪ ᴊʜᴀᴀᴛ ᴋᴇ ʙᴀᴀᴀʟʟʟʟ ᴄᴜᴅ ᴀᴄʜᴇ sᴇ ʏʜᴀᴘᴇ ᴛᴜ",
+                    "ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴄʜᴜᴛ ᴍ ᴅᴜ ᴛᴀᴘᴀ ᴛᴀᴘ?",
+                    "ᴛᴇʀɪ ᴍᴀ ᴋᴀ ʙʜᴏꜱᴅᴀᴀ",
+                    "ᴛᴇʀɪ ʙʜɴ ꜱʙꜱʙᴇ ʙᴅɪ ʀᴀɴᴅɪ.",
+                    "ᴛᴇʀɪ ᴍᴀ ᴏꜱꜱᴇ ʙᴀᴅɪ ʀᴀɴᴅᴅᴅᴅᴅ",
+                    "ᴛᴇʀᴀ ʙᴀᴀᴘ ʀᴀɴᴅɪʙᴀᴀᴢ ᴇʏ ᴅᴇᴋʜ",
+                    "ᴋɪᴛɴɪ ᴄʜᴏᴅᴜ ᴛᴇʀɪ ᴍᴀ ᴀʙ ᴏʀ..",
+                    "ᴛᴇʀɪ ᴍᴀ ᴄʜᴏᴅ ᴅɪ ʜᴍ ɴᴇ",
+                    "ᴛᴇʀɪ ᴍᴀ ᴋᴇ ꜱᴛʜ ʀᴇᴇʟꜱ ʙɴᴇɢᴀ ʀᴏᴀᴅ ᴘᴇᴇ",
+                    "ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴄʜᴜᴛ ᴇᴋ ᴅᴀᴍ ᴛᴏᴘ ꜱᴇxʏ",
+                    "ᴍᴀʟᴜᴍ ɴᴀ ᴘʜʀ ᴋᴇꜱᴇ ʟᴇᴛᴀ ʜᴜ ᴍ ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴄʜᴜᴛ ᴛᴀᴘᴀ ᴛᴀᴘᴘᴘᴘᴘ",
+                    "ʟᴜɴᴅ ᴋᴇ ᴄʜᴏᴅᴇ ᴛᴜ ᴋᴇʀᴇɢᴀ ᴛʏᴘɪɴɢ ᴋʀᴇɢᴀ ᴛᴍᴋᴄ",
+                    "ꜱᴘᴇᴇᴅ ᴘᴋᴅ ʟᴡᴅᴇᴇᴇᴇ ᴡʀɴᴀ ᴍᴇʀᴀ ʟᴜɴᴅ ᴘᴋᴅ",
+                    "ʙᴀᴀᴘ ᴋɪ ꜱᴘᴇᴇᴅ ᴍᴛᴄʜ ᴋʀʀʀ",
+                    "ʟᴡᴅᴀ ʟᴇ ᴍᴇʀᴀ ᴊᴀʟᴅɪ sᴇ ᴛᴜ",
+                    "ᴘᴀᴘᴀ ᴋɪ ꜱᴘᴇᴇᴅ ᴍᴛᴄʜ ɴʜɪ ʜᴏ ʀʜɪ ᴋʏᴀ ᴛᴇʀᴇsᴇ",
+                    "ᴀʟᴇ ᴀʟᴇ ᴍᴇʟᴀ ʙᴄʜᴀᴀᴀᴀ ᴛᴇʀʏ ᴍᴀᴋᴀ ʙᴏsᴅᴀ sᴜɴ",
+                    "ᴄʜᴜᴅ ɢʏᴀ ʀᴀɴᴅɪʙᴀᴀᴢ ᴘᴀᴘᴀ ꜱᴇᴇᴇ ᴛᴜ",
+                    "ᴍᴇɴᴜ ᴋɪ ᴘᴛᴀ ᴛᴇʀʏ ᴍᴀ ᴄᴜᴅ ɢᴀɪ",
+                    "ᴋᴏɪ ʙᴀᴀᴛ ɴʏ ᴍᴀᴀ ʀᴀɴᴅʏ ᴛᴇʀʏ",
+                    "ʜᴀʜᴀʜᴀᴀᴀᴀᴀ ᴍᴀᴋᴀʙᴏsᴅᴀ ᴛᴇʀʏ",
+                    "xʜᴜᴅ ɢᴀɪ ᴍᴀᴀ ᴛᴇʀʏ ᴋɪᴅꜱꜱꜱꜱ",
+                    "ᴛᴇʀɪ ᴍᴀ ᴄʜᴜᴅ ɢʏɪ ᴀʙ ꜰʀᴀʀ ᴍᴛ ʜᴏɴᴀ",
+                    "ʏᴇ ʟᴜɴᴅ ʟᴇ ᴍᴇʀᴀ ᴄʜʟ ᴊᴀʟᴅɪ sᴇ",
+                    "ᴋɪᴅꜱꜱꜱ ꜰʀᴀʀ ɴᴀ ʜᴏ ᴛᴜ ʜᴀʜᴀʜʜ",
+                    "ʙʜᴇɴ ᴋᴇ ʟᴡᴅᴇ ꜱʜʀᴍ ᴋʀ",
+                    "ᴋɪᴛɴɪ ɢʟɪʏᴀ ᴘᴅᴡᴇɢᴀ ᴀᴘɴɪ ᴍᴀ ᴋᴏ",
+                    "ᴄʜᴜᴘ ɴᴀʟʟɪɪ ʀᴀɴᴅʏᴋᴇ ʟᴀᴅᴋᴇ",
+                    "ꜱᴜᴀʀ ᴋᴇ ᴘɪʟʟᴇ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ꜱᴀᴅᴀᴋ ᴘʀ ʟɪᴛᴀᴋᴇ ᴄʜᴏᴅ ᴅᴜɴɢᴀ 😂😆🤤",
+                    "ᴀʙᴇ ᴛᴇʀɪ ᴍᴀᴀᴋᴀ ʙʜᴏꜱᴅᴀ ᴍᴀᴅᴇʀᴄʜᴏᴏᴅ ᴋʀ ᴘɪʟʟᴇ ᴘᴀᴘᴀ ꜱᴇ ʟᴀᴅᴇɢᴀ ᴛᴜ 😼😂🤤",
+                    "ɢᴀʟɪ ɢᴀʟɪ ɴᴇ ꜱʜᴏʀ ʜᴇ ᴛᴇʀɪ ᴍᴀᴀ ʀᴀɴᴅɪ ᴄʜᴏʀ ʜᴇ 💋💋💦",
+                    "ᴀʙᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅᴜ ʀᴀɴᴅɪᴋᴇ ᴘɪʟʟᴇ ᴋᴜᴛᴛᴇ ᴋᴇ ᴄʜᴏᴅᴇ 😂👻🔥",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴀɪꜱᴇ ᴄʜᴏᴅᴀ ᴀɪꜱᴇ ᴄʜᴏᴅᴀ ᴛᴇʀɪ ᴍᴀᴀᴀ ʙᴇᴅ ᴘᴇʜɪ ᴍᴜᴛʜ ᴅɪᴀ 💦💦💦💦",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴇ ʙʜᴏꜱᴅᴇ ᴍᴇ ᴀᴀᴀɢ ʟᴀɢᴀᴅɪᴀ ᴍᴇʀᴀ ᴍᴏᴛᴀ ʟᴜɴᴅ ᴅᴀʟᴋᴇ 🔥🔥💦😆😆",
+                    "ʀᴀɴᴅɪᴋᴇ ʙᴀᴄʜʜᴇ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴏᴅᴜ ᴄʜᴀʟ ɴɪᴋᴀʟ",
+                    "ᴋɪᴛɴᴀ ᴄʜᴏᴅᴜ ᴛᴇʀɪ ʀᴀɴᴅɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴛʜ ᴀʙʙ ᴀᴘɴɪ ʙᴇʜᴇɴ ᴋᴏ ʙʜᴇᴊ 😆👻🤤",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏᴛᴏ ᴄʜᴏᴅ ᴄʜᴏᴅᴋᴇ ᴘᴜʀᴀ ꜰᴀᴀᴅ ᴅɪᴀ ᴄʜᴜᴛʜ ᴀʙʙ ᴛᴇʀɪ ɢꜰ ᴋᴏ ʙʜᴇᴊ 😆💦🤤",
+                    "ᴛᴇʀɪ ɢꜰ ᴋᴏ ᴇᴛɴᴀ ᴄʜᴏᴅᴀ ʙᴇʜᴇɴ ᴋᴇ ʟᴏᴅᴇ ᴛᴇʀɪ ɢꜰ ᴛᴏ ᴍᴇʀɪ ʀᴀɴᴅɪ ʙᴀɴɢᴀʏɪ ᴀʙʙ ᴄʜᴀʟ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴏᴅᴛᴀ ꜰɪʀꜱᴇ ♥️💦😆😆😆😆",
+                    "ʜᴀʀɪ ʜᴀʀɪ ɢʜᴀᴀꜱ ᴍᴇ ᴊʜᴏᴘᴅᴀ ᴛᴇʀɪ ᴍᴀᴀᴋᴀ ʙʜᴏꜱᴅᴀ 🤣🤣💋💦",
+                    "ᴄʜᴀʟ ᴛᴇʀᴇ ʙᴀᴀᴘ ᴋᴏ ʙʜᴇᴊ ᴛᴇʀᴀ ʙᴀꜱᴋᴀ ɴʜɪ ʜᴇ ᴘᴀᴘᴀ ꜱᴇ ʟᴀᴅᴇɢᴀ ᴛᴜ",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ʙᴏᴍʙ ᴅᴀʟᴋᴇ ᴜᴅᴀ ᴅᴜɴɢᴀ ᴍᴀᴀᴋᴇ ʟᴀᴡᴅᴇ",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴛʀᴀɪɴ ᴍᴇ ʟᴇᴊᴀᴋᴇ ᴛᴏᴘ ʙᴇᴅ ᴘᴇ ʟɪᴛᴀᴋᴇ ᴄʜᴏᴅ ᴅᴜɴɢᴀ ꜱᴜᴀʀ ᴋᴇ ᴘɪʟʟᴇ 🤣🤣💋💋",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴀᴋᴇ ɴᴜᴅᴇꜱ ɢᴏᴏɢʟᴇ ᴘᴇ ᴜᴘʟᴏᴀᴅ ᴋᴀʀᴅᴜɴɢᴀ ʙᴇʜᴇɴ ᴋᴇ ʟᴀᴇᴡᴅᴇ 👻🔥",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴀᴋᴇ ɴᴜᴅᴇꜱ ɢᴏᴏɢʟᴇ ᴘᴇ ᴜᴘʟᴏᴀᴅ ᴋᴀʀᴅᴜɴɢᴀ ʙᴇʜᴇɴ ᴋᴇ ʟᴀᴇᴡᴅᴇ 👻🔥",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅ ᴄʜᴏᴅᴋᴇ ᴠɪᴅᴇᴏ ʙᴀɴᴀᴋᴇ xɴxx ᴘᴇ ɴᴇᴇʟᴀᴍ ᴋᴀʀᴅᴜɴɢᴀ ᴋᴜᴛᴛᴇ ᴋᴇ ᴘɪʟʟᴇ 💦💋",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴀᴋɪ ᴄʜᴜᴅᴀɪ ᴋᴏ ᴘᴏ*ʀɴʜᴜʙ ᴘᴇ ᴜᴘʟᴏᴀᴅ ᴋᴀʀᴅᴜɴɢᴀ ꜱᴜᴀʀ ᴋᴇ ᴄʜᴏᴅᴇ 🤣💋💦",
+                    "ᴀʙᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅᴜ ʀᴀɴᴅɪᴋᴇ ʙᴀᴄʜʜᴇ ᴛᴇʀᴇᴋᴏ ᴄʜᴀᴋᴋᴏ ꜱᴇ ᴘɪʟᴡᴀᴠᴜɴɢᴀ ʀᴀɴᴅɪᴋᴇ ʙᴀᴄʜʜᴇ 🤣🤣",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴛʜ ꜰᴀᴀᴅᴋᴇ ʀᴀᴋᴅɪᴀ ᴍᴀᴀᴋᴇ ʟᴏᴅᴇ ᴊᴀᴀ ᴀʙʙ ꜱɪʟᴡᴀʟᴇ 👄👄",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ᴍᴇʀᴀ ʟᴜɴᴅ ᴋᴀᴀʟᴀ",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ʟᴇᴛɪ ᴍᴇʀɪ ʟᴜɴᴅ ʙᴀᴅᴇ ᴍᴀꜱᴛɪ ꜱᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴍᴇɴᴇ ᴄʜᴏᴅ ᴅᴀʟᴀ ʙᴏʜᴏᴛ ꜱᴀꜱᴛᴇ ꜱᴇ",
+                    "ʙᴇᴛᴇ ᴛᴜ ʙᴀᴀᴘ ꜱᴇ ʟᴇɢᴀ ᴘᴀɴɢᴀ ᴛᴇʀɪ ᴍᴀᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴅᴜɴɢᴀ ᴋᴀʀᴋᴇ ɴᴀɴɢᴀ 💦💋",
+                    "ʜᴀʜᴀʜᴀʜ ᴍᴇʀᴇ ʙᴇᴛᴇ ᴀɢʟɪ ʙᴀᴀʀ ᴀᴘɴɪ ᴍᴀᴀᴋᴏ ʟᴇᴋᴇ ᴀᴀʏᴀ ᴍᴀᴛʜ ᴋᴀᴛ ᴏʀ ᴍᴇʀᴇ ᴍᴏᴛᴇ ʟᴜɴᴅ ꜱᴇ ᴄʜᴜᴅᴡᴀʏᴀ ᴍᴀᴛʜ ᴋᴀʀ",
+                    "ᴄʜᴀʟ ʙᴇᴛᴀ ᴛᴜᴊʜᴇ ᴍᴀᴀꜰ ᴋɪᴀ 🤣ᴛᴜ ᴀʙʙ ᴀᴘɴɪ ᴍᴀᴋᴏ ʙʜᴇᴊ",
+                    "ꜱʜᴀʀᴀᴍ ᴋᴀʀ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴀ ʙʜᴏꜱᴅᴀ ᴋɪᴛɴᴀ ɢᴀᴀʟɪᴀ ꜱᴜɴᴡᴀʏᴇɢᴀ ᴀᴘɴɪ ᴍᴀᴀᴀ ʙᴇʜᴇɴ ᴋᴇ ᴜᴘᴇʀ",
+                    "ᴀʙᴇ ʀᴀɴᴅɪᴋᴇ ʙᴀᴄʜʜᴇ ᴀᴜᴋᴀᴛ ɴʜɪ ʜᴇᴛᴏ ᴀᴘɴɪ ʀᴀɴᴅɪ ᴍᴀᴀᴋᴏ ʟᴇᴋᴇ ᴀᴀʏᴀ ᴍᴀᴛʜ ᴋᴀʀ ʜᴀʜᴀʜᴀʜᴀ",
+                    "ᴋɪᴅᴢ ᴍᴀᴅᴀʀᴄʜᴏᴅ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴏᴅ ᴄʜᴏᴅᴋᴇ ᴛᴇʀʀ ʟɪʏᴇ ʙʜᴀɪ ᴅᴇᴅɪʏᴀ",
+                    "ᴊᴜɴɢʟᴇ ᴍᴇ ɴᴀᴄʜᴛᴀ ʜᴇ ᴍᴏʀᴇ ᴛᴇʀɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴅᴀɪ ᴅᴇᴋᴋᴇ ꜱᴀʙ ʙᴏʟᴛᴇ ᴏɴᴄᴇ ᴍᴏʀᴇ ᴏɴᴄᴇ ᴍᴏʀᴇ 🤣🤣💦💋",
+                    "ɢᴀʟɪ ɢᴀʟɪ ᴍᴇ ʀᴇʜᴛᴀ ʜᴇ ꜱᴀɴᴅ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴏᴅ ᴅᴀʟᴀ ᴏʀ ʙᴀɴᴀ ᴅɪᴀ ʀᴀɴᴅ 🤤🤣",
+                    "ꜱᴀʙ ʙᴏʟᴛᴇ ᴍᴜᴊʜᴋᴏ ᴘᴀᴘᴀ ᴄʏᴜᴋɪ ᴍᴇɴᴇ ᴋʀᴅɪᴀ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴘʀᴇɢɴᴇɴᴛ 🤣🤣",
+                    "ꜱᴜᴀʀ ᴋᴇ ᴘɪʟʟᴇ ᴛᴇʀɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ꜱᴜᴀʀ ᴋᴀ ʟᴏᴜᴅᴀ ᴏʀ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ᴍᴇʀᴀ ʟᴏᴅᴀ",
+                    "ᴄʜᴀʟ ᴄʜᴀʟ ᴛᴜ ᴀᴘɴɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴄʜɪʏᴀ ᴅɪᴋᴀ",
+                    "ʜᴀʜᴀʜᴀʜᴀ ʙᴀᴄʜʜᴇ ᴛᴇʀɪ ᴍᴀᴀᴀᴋᴏ ᴄʜᴏᴅ ᴅɪᴀ ɴᴀɴɢᴀ ᴋᴀʀᴋᴇ",
+                    "ᴛᴇʀɪ ɢꜰ ʜᴇ ʙᴀᴅɪ ꜱᴇxʏ ᴜꜱᴋᴏ ᴘɪʟᴀᴋᴇ ᴄʜᴏᴏᴅᴇɴɢᴇ ᴘᴇᴘꜱɪ",
+                    "2 ʀᴜᴘᴀʏ ᴋɪ ᴘᴇᴘꜱɪ ᴛᴇʀɪ ᴍᴜᴍᴍʏ ꜱᴀʙꜱᴇ ꜱᴇxʏ 💋💦",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴇᴇᴍꜱ ꜱᴇ ᴄʜᴜᴅᴡᴀᴠᴜɴɢᴀ ᴍᴀᴅᴇʀᴄʜᴏᴏᴅ ᴋᴇ ᴘɪʟʟᴇ 💦🤣",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ᴍᴜᴛʜᴋᴇ ꜰᴀʀᴀʀ ʜᴏᴊᴀᴠᴜɴɢᴀ ʜᴜɪ ʜᴜɪ ʜᴜɪ",
+                    "ꜱᴘᴇᴇᴅ ʟᴀᴀᴀ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴄʜᴏᴅᴜ ʀᴀɴᴅɪᴋᴇ ᴘɪʟʟᴇ 💋💦🤣",
+                    "ᴀʀᴇ ʀᴇ ᴍᴇʀᴇ ʙᴇᴛᴇ ᴄʏᴜ ꜱᴘᴇᴇᴅ ᴘᴀᴋᴀᴅ ɴᴀ ᴘᴀᴀᴀ ʀᴀʜᴀ ᴀᴘɴᴇ ʙᴀᴀᴘ ᴋᴀ ʜᴀʜᴀʜᴀ ᴛᴇʀɪ ᴍᴀᴀ ᴄᴜᴅ ɢᴀɪ🤣🤣",
+                    "ꜱᴜɴ ꜱᴜɴ ꜱᴜᴀʀ ᴋᴇ ᴘɪʟʟᴇ ᴊʜᴀɴᴛᴏ ᴋᴇ ꜱᴏᴜᴅᴀɢᴀʀ ᴀᴘɴɪ ᴍᴜᴍᴍʏ ᴋɪ ɴᴜᴅᴇꜱ ʙʜᴇᴊ",
+                    "ᴀʙᴇ ꜱᴜɴ ʟᴏᴅᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴀ ʙʜᴏꜱᴅᴀ ꜰᴀᴀᴅ ᴅᴜɴɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴋʜᴜʟᴇ ʙᴀᴊᴀʀ ᴍᴇ ᴄʜᴏᴅ ᴅᴀʟᴀ 🤣🤣💋",
+                    "ꜱʜʀᴍ ᴋʀ ᴛᴇʀʏ ᴍᴀᴀ ᴄᴜᴅ ɢᴀɪ ʏʜᴀ",
+                    "ᴍᴇʀᴇ ʟᴜɴᴅ ᴋᴇ ʙᴀᴀᴀᴀᴀʟʟʟʟʟ ᴘᴋᴅ ᴊᴀʟᴅɪ sᴇ",
+                    "ᴛᴜ ᴇᴋ ᴋᴀᴀᴍ ᴋʀ ᴀᴘɴɪ ᴍᴀ ʙʜᴇɴ ᴋᴏ ᴄᴜᴅᴡᴀ ʟᴇ ᴍᴇʀᴇ sᴛʜ",
+                    "ʀɴᴅɪ ᴋᴇ ʟᴅᴋᴇᴇᴇᴇᴇᴇᴇᴇᴇ ᴄʜᴜᴘ ᴏʀ ᴄᴜᴅ ʏʜᴀ",
+                    "ᴄʜᴜᴘ ᴛᴍᴋᴄ ᴋɪᴅꜱꜱꜱꜱꜱꜱꜱꜱꜱꜱꜱꜱ",
+                    "ᴀᴘɴɪ ɢᴀᴀɴᴅ ᴍᴇɪɴ ᴍᴜᴛʜɪ ᴅᴀᴀʟ",
+                    "ᴍᴇʀᴀ ʟᴜɴᴅ ᴄʜᴏᴏꜱ ᴊᴀʟᴅɪ sᴇ",
+                    "ᴀᴘɴɪ ᴍᴀ ᴋᴏ ᴄᴜsᴡᴀ ᴍᴇʀᴀ ʟᴜɴᴅ",
+                    "ʙʜᴇɴ ᴋᴇ ʟᴀᴜᴅᴇ ᴛᴍᴄ",
+                    "ʙʜᴇɴ ᴋᴇ ᴛᴀᴋᴋᴇ ᴛᴍʟ",
+                    "ᴀʙʟᴀ ᴛᴇʀᴀ ᴋʜᴀɴ ᴅᴀɴ ᴄʜᴏᴅɴᴇ ᴋɪ ʙᴀʀɪɪɪ",
+                    "ʙᴇᴛᴇ ᴛᴇʀɪ ᴍᴀ ꜱʙꜱᴇ ʙᴅɪ ʀᴀɴᴅ",
+                    "ʟᴜɴᴅ ᴋᴇ ʙᴀᴀᴀʟ ᴊʜᴀᴛ ᴋᴇ ᴘɪꜱꜱꜱᴜᴜᴜᴜᴜᴜᴜ ᴛᴍᴋᴄ",
+                    "ʟᴜɴᴅ ᴘᴇ ʟᴛᴋɪᴛ ᴍᴀᴀᴀʟʟʟʟ ᴋɪ ʙᴏɴᴅ ʜ ᴛᴜᴜᴜ",
+                    "ᴋᴀꜱʜ ᴏꜱ ᴅɪɴ ᴍᴜᴛʜ ᴍʀᴋᴇ ꜱᴏᴊᴛᴀ ᴍ ᴛᴜ ᴘᴀɪᴅᴀ ɴᴀ ʜᴏᴛᴀᴀ",
+                    "ɢʟᴛɪ ᴋʀᴅɪ ᴛᴜᴊᴡ ᴘᴀɪᴅᴀ ᴋʀᴋᴇ ᴛᴇʀʏ ᴍᴀ ɴᴇ ᴀʙ ᴄᴜᴅ ᴛᴜ ʏʜᴀ",
+                    "ꜱᴘᴇᴇᴅ ᴘᴋᴅᴅᴅ",
+                    "ɢᴀᴀɴᴅ ᴍᴀɪɴ ʟᴡᴅᴀ ᴅᴀʟ ʟᴇ ᴀᴘɴɪ ᴍᴇʀᴀᴀᴀ",
+                    "ɢᴀᴀɴᴅ ᴍᴇɪɴ ʙᴀᴍʙᴜ ᴅᴇᴅᴜɴɢᴀᴀᴀᴀᴀᴀ",
+                    "ɢᴀɴᴅ ꜰᴛɪ ᴋᴇ ʙᴀʟᴋᴋᴋ ᴛᴜ ᴄᴜᴅ ʏʜᴀ",
+                    "ɢᴏᴛᴇ ᴋɪᴛɴᴇ ʙʜɪ ʙᴀᴅᴇ ʜᴏ, ʟᴜɴᴅ ᴋᴇ ɴɪᴄʜᴇ ʜɪ ʀᴇʜᴛᴇ ʜᴀɪ",
+                    "ʜᴀᴢᴀᴀʀ ʟᴜɴᴅ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀɪɴ",
+                    "ᴊʜᴀᴀɴᴛ ᴋᴇ ᴘɪꜱꜱᴜ ᴛᴍᴋᴄ sᴜɴ",
+                    "ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴋᴀʟɪ ᴄʜᴜᴛ",
+                    "ᴋʜᴏᴛᴇʏ ᴋɪ ᴀᴜʟᴅᴀ ᴇʏ ᴛᴜ ʀᴀɴᴅʏᴋᴇ",
+                    "ᴋᴜᴛᴛᴇ ᴋᴀ ᴀᴡʟᴀᴛ ᴊᴀɪsᴀ ʟɢ ʀʜᴀ ᴛᴜ",
+                    "ᴋᴜᴛᴛᴇ ᴋɪ ᴊᴀᴛ ᴊᴀɪsᴀ ᴇʏ ᴛᴜ ",
+                    "ᴋᴜᴛᴛᴇ ᴋᴇ ᴛᴀᴛᴛᴀ ᴇʏ ᴛᴜ",
+                    "ᴛᴇᴛɪ ᴍᴀ ᴋɪ.ᴄʜᴜᴛ , ᴛᴇʀɪ ᴍᴀ ʀɴᴅɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪ",
+                    "ʟᴀᴠᴅᴇ ᴋᴇ ʙᴀʟ ᴘᴋᴅ ʟᴇ ᴍᴇʀᴇ",
+                    "ᴍᴜʜ ᴍᴇɪ ʟᴇʟᴇ ᴍᴇʀᴀ ʟᴜɴᴅ",
+                    "ʟᴜɴᴅ ᴋᴇ ᴘᴀꜱɪɴᴇ ᴄʜᴜᴘ ʙᴇᴛʜ ᴏʀ ᴄᴜᴅ",
+                    "ᴍᴇʀᴇ ʟᴡᴅᴇ ᴋᴇ ʙᴀᴀᴀᴀᴀʟʟʟ",
+                    "ʜᴀʜᴀʜᴀᴀᴀᴀᴀᴀ ᴛᴇʀʏ ᴍᴀᴀ ᴄᴜᴅ ɢᴀɪ",
+                    "ᴛᴜ ᴄʜᴜᴅ ɢʏᴀᴀᴀᴀᴀ",
+                    "ʀᴀɴᴅɪ ᴋʜᴀɴᴇ ᴋɪ ᴜʟᴀᴅᴅᴅ",
+                    "ꜱᴀᴅɪ ʜᴜɪ ɢᴀᴀɴᴅ",
+                    "ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀɪɴ ᴋᴜᴛᴇ ᴋᴀ ʟᴜɴᴅ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ",
+                    "ᴛᴇʀᴇ ɢᴀᴀɴᴅ ᴍᴇɪɴ ᴋᴇᴇᴅᴇ ᴘᴀᴅᴀʏ",
+                    "ɴʏ ɴʏ ᴛᴇʀʏ ᴍᴀᴀ ʀᴀɴᴅɪ",
+                    "ꜱᴜɴɴ ᴍᴀᴅᴇʀᴄʜᴏᴅ ᴛᴍʟ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ",
+                    "ʙᴇʜᴇɴ ᴋ ʟᴜɴᴅ ᴄʜᴜᴘᴄʜᴀᴘ ᴄᴜᴅ ʏʜᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ᴄʜᴜᴛ ᴋɪ ᴄʜᴛɴɪɪɪɪ",
+                    "ᴍᴇʀᴀ ʟᴀᴡᴅᴀ ʟᴇʟᴇ ᴛᴜ ᴀɢᴀʀ ᴄʜᴀɪʏᴇ ᴛᴏʜ",
+                    "ᴄʜᴜᴘ ɢᴀᴀɴᴅᴜ",
+                    "ᴄʜᴜᴘ ᴄʜᴜᴛɪʏᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴘᴇ ᴊᴄʙ ᴄʜᴀᴅʜᴀᴀ ᴅᴜɴɢᴀ",
+                    "ꜱᴀᴍᴊʜᴀᴀ ʟᴀᴡᴅᴇ",
+                    "ʏᴀ ᴅᴜ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴇ ᴛᴀᴘᴀᴀ ᴛᴀᴘ��",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴍᴇʀᴀ ʀᴏᴢ ʟᴇᴛɪ ʜᴀɪ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴇ ꜱᴀᴀᴛʜ ᴍᴍꜱ ʙᴀɴᴀᴀ ᴄʜᴜᴋᴀ ʜᴜ���不�不",
+                    "ᴛᴜ ᴄʜᴜᴛɪʏᴀ ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀᴀɴ ᴄʜᴜᴛɪʏᴀ",
+                    "ᴀᴜʀ ᴋɪᴛɴᴀ ʙᴏʟᴜ ʙᴇʏ ᴍᴀɴɴ ʙʜᴀʀ ɢᴀʏᴀ ᴍᴇʀᴀ�不",
+                    "ᴛᴇʀɪɪɪɪɪɪ ᴍᴀᴀᴀᴀ ᴋɪ ᴄʜᴜᴛᴛᴛ ᴍᴇ ᴀʙᴄᴅ ʟɪᴋʜ ᴅᴜɴɢᴀ ᴍᴀᴀ ᴋᴇ ʟᴏᴅᴇ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ʟᴇᴋᴀʀ ᴍᴀɪ ꜰᴀʀᴀʀ",
+                    "ᴛᴇʀʏ ᴍᴀᴀ ʀᴀɴɪᴅɪɪɪ",
+                    "ᴄʜᴜᴘ ʙᴀᴄʜᴇᴇ ᴛᴍᴋᴄ",
+                    "ᴛᴇʀʏ ᴍᴀᴋᴏᴄʜᴏᴅᴜ",
+                    "ʀᴀɴᴅɪ ᴍᴀᴀ ᴛᴇʀʏ",
+                    "ᴛᴜ ʀᴀɴᴅɪ ᴋᴇ ᴘɪʟʟᴀ ᴇʏ",
+                    "ᴛᴇʀɪɪɪɪɪ ᴍᴀᴀᴀ ᴋᴏ ʙʜᴇᴊᴊᴊ",
+                    "ᴛᴇʀᴀᴀ ʙᴀᴀᴀᴀᴘ ʜᴜ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʜᴀᴀᴛ ᴅᴀᴀʟʟᴋᴇ ʙʜᴀᴀɢ ᴊᴀᴀɴᴜɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ꜱᴀʀᴀᴋ ᴘᴇ ʟᴇᴛᴀᴀ ᴅᴜɴɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ɢʙ ʀᴏᴀᴅ ᴘᴇ ʟᴇᴊᴀᴋᴇ ʙᴇᴄʜ ᴅᴜɴɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍÉ ᴋᴀᴀʟɪ ᴍɪᴛᴄʜ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ꜱᴀꜱᴛɪ ʀᴀɴᴅɪ ʜᴀɪ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴋᴀʙᴜᴛᴀʀ ᴅᴀᴀʟ ᴋᴇ ꜱᴏᴜᴘ ʙᴀɴᴀᴜɴɢᴀ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴀ ʀᴀɴᴅɪ ʜᴀɪ",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴅᴇᴛᴏʟ ᴅᴀᴀʟ ᴅᴜɴɢᴀ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀᴀᴀ ʙʜᴏꜱᴅᴀᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴀᴘᴛᴏᴘ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ʀᴀɴᴅɪ ʜᴀɪ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ʙɪꜱᴛᴀʀ ᴘᴇ ʟᴇᴛᴀᴀᴋᴇ ᴄʜᴏᴅᴜɴɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴀᴍᴇʀɪᴄᴀ ɢʜᴜᴍᴀᴀᴜɴɢᴀ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ɴᴀᴀʀɪʏᴀʟ ᴘʜᴏʀ ᴅᴜɴɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴇ ɢᴀɴᴅ ᴍᴇ ᴅᴇᴛᴏʟ ᴅᴀᴀʟ ᴅᴜɴɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴀ ᴋᴏ ʜᴏʀʟɪᴄᴋꜱ ᴘɪʟᴀᴜɴɢᴀ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ꜱᴀʀᴀᴋ ᴘᴇ ʟᴇᴛᴀᴀᴀ ᴅᴜɴɢᴀᴀᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀᴀ ʙʜᴏꜱᴅᴀ",
+                    "ᴍᴇʀᴀᴀᴀ ʟᴜɴᴅ ᴘᴀᴋᴀᴅ ʟᴇ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                    "ᴄʜᴜᴘ ᴛᴇʀɪ ᴍᴀᴀ ᴀᴋᴀᴀ ʙʜᴏꜱᴅᴀᴀ",
+                    "ᴛᴇʀɪɪɪ ᴍᴀᴀ ᴄʜᴜꜰ ɢᴇʏɪɪ ᴋʏᴀᴀᴀ ʟᴀᴡᴅᴇᴇᴇ",
+                    "ᴛᴇʀɪɪɪ ᴍᴀᴀ ᴋᴀᴀ ʙᴊꜱᴏᴅᴀᴀᴀ",
+                    "ᴍᴀᴅᴀʀxʜᴏᴅᴅᴅ",
+                    "ᴛᴇʀɪᴜᴜɪ ᴍᴀᴀᴀ ᴋᴀᴀ ʙʜꜱᴏᴅᴀᴀᴀ",
+                    "ᴛᴇʀɪɪɪɪɪɪ ʙᴇʜᴇɴɴɴɴ ᴋᴏ ᴄʜᴏᴅᴅᴅᴜᴜᴜᴜ ᴍᴀᴅᴀʀxʜᴏᴅᴅᴅᴅ",
+                    "ᴛᴜ ɴɪᴋᴀʟ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                    "ᴄʜᴜᴘ ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜᴇ",
+                    "ᴛᴇʀᴀ ᴍᴀᴀ ᴍᴇʀɪ ᴊᴀᴀɴ ᴇʏ",
+                    "ᴛᴇʀɪ ꜱᴇxʏ ʙᴀʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴏᴘ"
+                    "👩🏿      👩🏻‍🦳        👵🏼         👱🏿‍♀️     \n👖      👖        👖         👖     \n\nतेरी बहन /तेरी माँ /तेरी दादि/ तेरीभुआ.\n\nसब की 𝐂hu𝐃𝐀i hogi",
+                        "तेरी माँ के（ ͜.人 ͜.）दबा दूंगा",
+                        "तेरी मा चुदी हुई थी\nचुदी हुई है\nऔर चुदी हुई रहेगी \n\n\"MARK MY WORD\" 😈",
+                        "𝐊ʏᴀ?\n𝐂ʏᴀ?\n𝐂ᴜᴀ?\n\n𝐌ᴛᴛ 𝐊ʀʀ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴛ 𝐏𝐞 𝐓ʜ𝐀ᴘᴘᴀᴅ 𝐌ᴀ𝐚ʀ 𝐃ᴜɴɢᴀ",
+                        "˚∧＿∧  　+        — ͟͞͞🥛\n(  •‿• )つ  — ͟͞͞ 🥛 \nSpecial attack tery mummy ke chuchiya ka dudu 🐱🎀",
+                        "Aaj Rakshabandhan Ke Avsar Pr तेरी मांँ मेरे लंड पर राखी Bandh Ke चुदेगी 😍🥰",
+                        "Sun दोस्त terko ye तीन चीजे कभी nahi भूलनी chaiye 😁👇🏻🤙🏿\n\n1 :- तेरी औकात\n2 :- तेरी बहन का फटा bhosda\n3 :- तेरी मां के भोसड़े में मेरा मूत",
+                        "Tery Maa Behen Ke Boshde Me Kya Maarun Jaldi Bata 😜🤙",
+                        "Tery Maa\nⓘ Verified Randy // 🦅🔥",
+                        "𝐒ᴀʏ 𝐑ᴀɴᴅɪʙᴀᴀᴢ 𝐃ᴀᴅᴅʏ 𓆩💗𓆪",
+                        "𝐖ᴏ ʙʜɪ ᴋʏᴀ ᴅɪɴ ᴛʜᴇ ᴊᴀʙ ᴛʀʏ ᴍᴀᴀ ᴍᴜᴊʜᴇ 𝐀ᴘɴᴀ 𝐂ʜᴜᴛ 𝐃ᴇᴛɪ ᴛʜɪ ʏᴀᴀʀ 💔🥀👌🏻",
+                        "𝐀ᴡᴀᴢ 𝐍ɪᴄʜᴇ 𝐆ᴜʟᴀᴀᴍ 🤢👇🏻",
+                        "𝐓ʀʏ 𝐌ᴀᴀ ɴᴇ 𝐂ʜᴜᴅɴᴇ 𝐌ᴀɪ ɢᴏʟᴅ 𝐌ᴇᴅᴀʟ 𝐉ᴇᴇᴛᴀ ᴇʏ 𝐃ᴏꜱᴛ 🤩👑",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐌ᴇʀᴀ 𝐋ᴜɴᴅ 🖕🏻😈",
+                        "𝐁ʜᴏꜱᴀᴅɪᴋᴇ 𝐀ᴘɴɪ 𝐁ᴇʜᴇɴ 𝐂ʜᴜᴅᴀ 🖕🏻😈",
+                        "𝐑ᴀɴᴅɪ ᴋᴇ 𝐁ᴀᴄᴄʜᴇ 𝐀ᴜᴋᴀᴛ 𝐌ᴇ 𝐑ᴇʜ 🖕🏻😈",
+                        "𝐌ᴀᴅᴀʀᴄʜᴏᴅ 𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 🖕🏻😈",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋᴀ 𝐁ʜᴏꜱᴅᴀ ᴋʜᴏʟ ᴅᴜɴɢᴀ 🔓😈",
+                        "𝐁ʜᴇɴᴄʜᴏᴅ ??ᴘɴɪ 𝐀ᴜᴋᴀᴛ 𝐌ᴇ 𝐑ᴇʜ 🤡💩",
+                        "𝐓𝐌𝐊𝐂 ᴘᴇ 𝐂ʜᴀᴘᴘᴀʟ 𝐌ᴀᴀʀᴜɴɢᴀ 👟💥",
+                        "𝐁ʜᴏꜱᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐊ʜᴀɴᴅᴀɴ ᴋɪ 𝐁𝐊𝐂 💀🖕🏻",
+                        "𝐑ᴀɴᴅɪ ᴋɪ 𝐀ᴜʟᴀᴅ ᴄʜᴜᴘ ʜᴏ ᴊᴀ 🔇😒",
+                        "𝐑ᴀɴᴅɪʙᴀᴀᴢ ka 𝐆ᴜʟᴀᴀᴍ ey ᴛᴜ ᴀʙ ᴛᴜ ʏʜᴀ ᴄᴜᴅᴋᴇ ᴅɪᴋʜᴀ ᴛᴇʀʏ ᴍᴀᴋᴏ ʟᴇᴋʀ 👑😎",
+                        "𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐌ɪʀᴄʜɪ 🌶️🖕🏻",
+                        "𝐌ᴀᴅᴀʀᴄʜᴏᴅ 𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐏ᴀɪʀ 🦶🏻😈",
+                        "𝐁ʜᴏꜱᴀᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋᴀ 𝐁ʜᴏꜱᴅᴀ 🗑️😏",
+                        "𝐑ᴀɴᴅɪ ᴋᴀ 𝐏ɪʟʟᴀ ʜᴀɪ ᴛᴜ 🐕💩",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋᴏ 𝐁ᴀᴢᴀᴀʀ 𝐌ᴇ 𝐂ʜᴏᴅᴜɴɢᴀ 🌃😈",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐆ᴀʀᴀᴍ 𝐓ᴇʟ 🌡️🖕🏻",
+                        "𝐌ᴀᴅᴀʀᴄʜᴏᴅ 𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴍᴇʀɪ 𝐑ᴀɴᴅɪ 💋👿",
+                        "𝐑ᴀɴᴅɪ ᴋᴇ 𝐁ᴀᴄᴄʜᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 🖕🏻😈",
+                        "𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋᴏ 𝐑ᴀᴀᴛ ʙʜᴀʀ 𝐂ʜᴏᴅᴜɴɢᴀ 🌙😈",
+                        "𝐑ᴀɴᴅɪ ᴋᴀ 𝐁ᴀᴄᴄʜᴀ ʜᴀɪ ᴛᴜ ꜱᴀᴀʟᴇ 🤡💀",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐌ᴇʀᴀ 𝐉ᴏᴏᴛᴀ 👞🖕🏻",
+                        "𝐑ᴀɴᴅɪʙᴀᴀᴢ 𝐃ᴀᴅᴅʏ ᴋᴀ 𝐆ᴜʟᴀᴀᴍ ʜᴀɪ ᴛᴜ 🥀😤",
+                        "ᴊɪꜱ ᴅɪɴ ᴛᴜ ᴘᴀɪᴅᴀ ʜᴜᴀ 𝐓ᴇʀɪ 𝐌ᴀᴀ ɴᴇ ꜱᴏᴄʜᴀ ᴛʜᴀ ᴋᴀꜱʜ ᴀʙᴏʀᴛ ᴋᴀʀ ᴅᴇᴛɪ 💀🥀",
+                        "𝐀ᴘɴɪ 𝐀ᴜᴋᴀᴛ ᴅᴇᴋʜ ᴋᴜᴛᴛᴇ 𝐓ᴇʀʏ 𝐌ᴀ 𝐂ᴜᴅ 𝐑ʜɪ🐕😂",
+                        "𝐓ᴇʀʏ 𝐌ᴀ 𝐂ᴜᴅ 𝐑ʜɪ 𝐆ᴀʟɪ ᴋᴀ 𝐊ᴜᴛᴛᴀ ʜᴀɪ ᴛᴜ 🐕🗑️",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ɴᴇ ᴍᴜᴊʜᴇ ᴅᴇᴋʜ ᴋᴇ ꜱᴏᴄʜᴀ ᴋᴀꜱʜ ʏᴇ ᴍᴇʀᴀ ʙᴇᴛᴀ ʜᴏᴛᴀ 🫦😏",
+                        "𝐂ʜᴜᴘ ᴋᴀʀ 𝐌ᴀᴅᴀʀᴄʜᴏᴅ ᴛᴇʀɪ ᴀᴜᴋᴀᴛ ɴᴀʜɪ ᴍᴇʀᴇ ꜱᴀᴀᴍɴᴇ ʙᴏʟɴᴇ ᴋɪ 🤐💀",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴅᴀɪ ᴍᴇ ᴊᴀʙ ᴍᴀɪ ᴛʜᴀ ᴛᴏ ᴛᴜ ᴘᴀɪᴅᴀ ʜᴜᴀ 💀😂",
+                        "𝐁ʜᴀɢ ʏᴀʜᴀɴ ꜱᴇ ᴋᴜᴛᴛᴇ ᴋᴇ ᴘɪʟʟᴇ 🐕💨",
+                        "𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋɪ ꜱᴀᴅɪ 𝐌ᴇ ᴍᴇʀᴀ ʟᴜɴᴅ 💍😈",
+                        "𝐌ᴀᴅᴀʀᴄʜᴏᴅ ᴀᴘɴɪ 𝐌ᴀᴀ ᴍᴀᴛ ᴄʜᴜᴅᴀ 🖕🏻👹",
+                        "𝐁ʜᴇɴᴄʜᴏᴅ 𝐓ᴇʀɪ 𝐊ʜᴀɴᴅᴀɴ ᴋɪ 𝐁𝐊𝐂 💀🖕🏻",
+                        "tery ma cudke pgl dekh..𝐁𝐊𝐂 🦴🐕",
+                        "𝐊ʏᴀ 𝐑ᴇ 𝐑ᴀɴᴅɪᴋᴇ 𝐂ᴏᴏʟ 𝐁ᴀɴᴇɢᴀ 𝐓ᴜ 𝐂ʜᴀʟ 𝐀ʙ 𝐂ʜᴜᴅ 𝐀ᴘɴᴇ 𝐁ᴀᴀᴘ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 𝐒ᴇ - 🦢💘",
+                        "tery 𝐌ᴀᴀ cudke 𝐌ᴀʀʀ  𝐆ᴀʏɪ 𝐘ᴀᴀʀ - 𝐉ᴀɪ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 ! 🌙",
+                        "acha beta 😂🔥👊🏻 ? coi na me toh HATER codunga tery mako 😹💔🔥😆👊🏻💥",
+                        "chudke bhaga kaise 😂💥🤣🤘🏻",
+                        "ne toh - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 ka lun muh me lelia tune or tery maa ne😂🙏🏻😂🙏🏻",
+                        "try maa सूर्य☀ nikalte hi pel du 😹🔥💔",
+                        "mkl lun te vaj 😂✊🏻💦",
+                        "𝗧ᴍᴋ𝗕 pe - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 ka hamla 😂⚔🔥💥",
+                        "𝐂ʜʟ 𝐇ᴀʀᴍᴢᴀᴅ𝐈 𝐊ᴇ लड़के 💛🤍🩵",
+                        "oi 𝐓ᴇʀɪ 𝐌‌ᴀᴀ गुलाम ₰🖤",
+                        "chl rndyce chud ke dikha 😂💥🤣🔥",
+                        "tery 𝐌ᴀᴀ or bhen 𝐌ᴀʀʀ  𝐆ᴀʏɪ naacho 💃🏻💃🏻🕺🏻🎶😂😆💞🔥 !",
+                        "tera baap bass - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 ey 😂🎀",
+                        "try maa hagte hue paad mari -#😹🔥🥀",
+                        "𝐓ᴇʀɪ 𝐌ᴜᴍᴍʏ 𝐂ʜᴏᴅ 𝐃ɪ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 𝐍ᴇ 𝐁ᴡᴀʜᴀʜᴀʜᴀ ⚜",
+                        "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                        "नहीं नहीं तेरी मां को 𝐒ɪʀғ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                        "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                        "𝑻𝒆𝒓?? 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                        "सोच तेरी बहन को - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 बाप का गुलाम चोद रहा 😎🔥",
+                        "Hello hello?? Oxygen aarahi है? रण्डी पुत्र 🧘🏻",
+                        "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 /~ 👑 बाप से सही chudi 🥵🔥",
+                        "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                        "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके MOAN करती है ! 🛐",
+                        "Tᴇʀɪ Mᴀᴀ Rᴀɴᴅɪ (🩷)—(❤️)—(🧡)—(💛)—(💚)—(🩵)—(💙)—(💜)—(🖤)—(🩶)—(🤍)—(🤎)—(🌸)—(✨)—(🌙)—(⭐)—(🦋)—(💎)—(👑)—(⚡)—(🔥)—(🌌)—(🎀)—(💫)—(🪽)—(🫧)—(🌸)—(💘)—(💓)—(💖)—(💕)—(💞)",
+                        "Teri make hath me chakku se hole karke lund daluga apna 🤢🤢",
+                        "Subha ho ya sham chudte rhena hai teri maaka kaam😂🔥😂🔥😂🔥",
+                        "𝐓ᴜ 𝐒ᴡɪᴘᴇ 𝐊ᴀʀᴛᴀ 𝐑ᴇʜ 𝐌ᴀɪ ᴄʜᴀʟᴀ 𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋᴇ 𝐒ᴀᴛʜ 𝐊ʜᴇʟɴᴇ 😭😭",
+                        "🍑\n🟨  😂\n🟨🟥🟥🟨\n     🟥🟥🟨\n     ⬛⬛ \n     ⬛⬛\nTery ma ki bund hi okhad li.",
+                        "𝘗𝘺𝘢𝘴 𝘭𝘢𝘨 𝘳𝘢𝘩𝘪 𝘵𝘦𝘳𝘪 𝘮𝘢𝘢 𝘬𝘰 𝘤𝘰𝘥 𝘬𝘦 𝘱𝘺𝘢𝘴 𝘣𝘶𝘫𝘩𝘢𝘶𝘯𝘨𝘢 🖕🏿😂🔥🙏🏿",
+                        "▶︎ •၊၊၊|။||။‌‌‌‌‌၊|• 0:60\n𝘋𝘦𝘬𝘩 𝘵𝘦𝘳𝘪 𝘣𝘦𝘩𝘦𝘯 ??𝘪 𝘤𝘩𝘪𝘬𝘩 😂😱🔥🙏🏿",
+                        "      ᴹᴱ:\n👆       🤬 ᴷᴬᴴᴬ ᴮᴴᴬᴳᵀᴵ ᴴᴬᴵ ᴿᴬᴺᴰᴵ\n  🐛💤👔🤳\n            ⛽  👢\n          ⚡👟\n       🎸    🌂\n      👢       👢     ᵀᴱᴿᴵ ᴹᴬᴬ:🏃‍♀‍➡️ᴹᵁᴶᴴᴱ ᴹᴬᵀ ᶜᴴᴼᴰᴼ",
+                        "🙌\n😛 ᴹᴱ:\n  |      👩 ᵀᴱᴿᴵ ᴹᴬᴬ:\n  |   8_/ 👐\n / \\  / \\\n  \"Take a look how i am chodunging your Mummy in ghodi pose 🗿\"",
+                        "../\\_/\\\n  ( • _ •)  \n  /    >🍆 \n\nʏᴇ ᴘᴀᴋᴀᴅᴏ ᴀᴘᴋɪ ᴍᴏᴍ ᴋᴏ ᴀᴘɴᴇ ᴄʜᴜᴛ ᴍᴇ ɢʜᴜssᴀ ɴᴇ ᴍᴇ ᴋᴀᴀᴍ ᴀʏᴇɴɢᴀ 🤗",
+                        "ㅤㅤ😎 ᴹᴱ:\n          |\\👐\n         / \\_\n━━━━━┓ ＼＼\n┓┓┓┓┓┃ᵀᴼᴴᴬᴿ ᴿᴬᴺᴰᴵ ᴹᴬᴬ:\n┓┓┓┓┓┃ ヽ😩ノ\n┓┓┓┓┓┃ 　 /　ᴼᴿᴵᴵ ᴬᴹᴹᴬ\n┓┓┓┓┓┃  ノ)　\n┓┓┓┓┓┃\n\nLE TERI MAA KO CHOD KAR FHEK DIA 🥸",
+                        "😎 ᴍᴀɪ:\nく|)へ\n   〉\n￣┗┓       ヾ😫ｼ ᴛᴇʀɪ ᴍᴀᴀ:\n         ┗┓   ヘ/    \n             ┗┓ノ\n                 ┗┓       ヾ😨ｼ ᴛᴇʀᴀ ʙᴀᴀᴘ:\n                      ┗┓   ヘ/\n                          ┗┓ノ\n                               ┗┓       ヾ😩ｼ ᴛᴇʀᴀ ᴄʜᴀᴄʜᴀ:\n                                   ┗┓   ヘ/    \n                                       ┗┓ノ\nᴅᴇᴋʜ ᴀɪsᴇ ʜɪ ʟᴀᴀᴛ ᴍᴀᴀʀ ᴋᴀʀ ʙʜᴀɢᴀᴜɴɢᴀ ᴛᴇʀᴇ ᴋʜᴀᴀɴᴅᴀɴ ᴋᴏ 🤫🤣",
+                        "╭👇 ͡ ͡° ͜   ͡ ͡°)╭👇 \n      \\   .   .\\\n        \\        \\\n         \\╰[ ]╯\\ \n          /   U   \\\n       👟       👟\n\nᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇʀᴀ ʟᴜɴᴅ ᴍᴜʙᴀʀᴀᴋ ʜᴏ 😝",
+                        "Once a man said: \n\"You deserve all the chudayi and teri maa ki chutt dhulayi, and this text proves it! You should be proud!\" 🕊️",
+                        "😏 ᴍᴀɪ:\n    | 👐💵\n    |//    💵\n    |          💸 ᴛᴇʀɪ ʀᴀɴᴅʏ ᴍᴀᴀ:\n   /\\            👯👯\n👟👟\n\nDᴇᴋʜ Kᴇsᴇ Tᴇʀɪ Mᴀᴀ Kᴏ Aᴘɴᴇ Pᴀɪsᴏ Sᴇ Rᴀɴᴅɪ Nᴀᴄʜ Kᴀʀᴡᴀ Rʜᴀ Hᴜ 🤙😎",
+                        "Loading your maa ki chudai video 😳\n\n■■■■■■■■□\n99%",
+                        "Sun दोस्त terko ye तीन चीजे कभी nahi भूलनी chaiye  😁👇🏻🤙🏿\n\n1 :- तेरी औकात\n2 :- तेरी बहन का फटा bhosda\n3 :- तेरी मां के भोसड़े में मेरा मूत",
+                        "this message could't be display because teri maa randy ey",
+                    
+
+                    reply_texts = [
+                        "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                        "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                        "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                        "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                        "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
+                        "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
+                        "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
+                        "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                        "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SHAMBHOG करती है ! 🛐",
+                        "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                        "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                        "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                        "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                        "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
+                        "Hello hello?? saas aarahi है? रण्डी पुत्र 🧘🏻",
+                        "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
+                        "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                        "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐",
+                        "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                        "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                        "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                        "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                        "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
+                        "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
+                        "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
+                        "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                        "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐",
+                        "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                        "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                        "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                        "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                        "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
+                        "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
+                        "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
+                        "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                        "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝙃𝙄𝙎 𝙈𝙊𝙈 𝙋𝙍𝙊𝙋𝙀𝙍𝙇𝙔",
+                        "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘼𝙎𝙆 𝙃𝙄𝙈 𝙏𝙊 𝘾𝙊𝙑𝙀𝙍 𝙃𝙄𝙎 𝙈𝙊𝙈'𝙎 𝘼𝙎𝙎",
+                        "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙄𝙓 𝙈𝙔 𝘼‌𝙋𝙋𝙊𝙄𝙉𝙏𝙈𝙀𝙉𝙏 𝙒𝙄𝙏𝙃 𝙃𝙄𝙎 𝙎𝙄𝙎",
+                        "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝘼𝙉𝘿 𝙏𝙃𝙍𝙊𝙒 𝙏𝙃𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽 𝙎𝙊𝙉",
+                        "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘿𝙊 𝙉𝙊𝙏 𝙎𝙏𝙊𝙋 𝙁𝙐𝘾𝙆𝙄𝙉𝙂 𝙈𝙔 𝙂𝙐𝙇𝘼‌𝙈",
+                        "𝙂𝙀𝙈𝙄𝙉𝙄 𝙎𝘼𝙄𝘿  𝙄𝙎 𝙍𝙉𝘿𝙔 𝙋𝙐𝙏𝙍𝘼",
+                        "𝙋𝙀𝙍𝙋𝙇𝙀𝙓𝙄𝙏𝙔 𝙎𝘼𝙄𝘿 This 𝙄𝙎 𝙂𝙐𝙇𝘼𝙈",
+                        "𝙂𝙍𝙊𝙆 𝘼𝙄 𝙎𝘼𝙄𝘿 𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽",
+                        "𝘽𝙊𝙏 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝘾𝙃𝙐𝘿𝘼𝙆𝘼𝘿",
+                        "𝙈𝙊𝘿𝙄 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝙋𝙊𝙇𝙀 𝘿𝘼𝙉𝘾𝙀𝙍",
+                        "𝙏𝙍𝙐𝙈𝙋 𝙎𝘼𝙄𝘿 THis 𝙄𝙎 𝘽𝙇𝙊𝙊𝘿Y 𝙈𝙊𝙏𝙃𝙀𝙍𝙁*\"𝘾𝙆𝙀𝙍",
+                        "𝗧𝗢𝗛𝗔𝗥 𝗠𝗨𝗠𝗠𝗬 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜𝗡𝗚𝗙𝗜𝗦𝗛𝗘𝗥 𝗞𝗜 𝗕𝗢𝗧𝗧𝗟𝗘 𝗗𝗔𝗟 𝗞𝗘 𝗧𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗔𝗡𝗗𝗘𝗥 𝗛𝗜 😱😂🤩",
+                        "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄 ✋ 𝐇𝐀𝐓𝐓𝐇 𝐃𝐀𝐋𝐊𝐄 👶 𝐁𝐀𝐂𝐂𝐇𝐄 𝐍𝐈𝐊𝐀𝐋 𝐃𝐔𝐍𝐆𝐀 😍",
+                        "𝐓𝐄𝐑𝐀 𝐏𝐄𝐇𝐋𝐀 𝐁𝐀𝐀𝐏 𝐇𝐔 𝐌𝐀𝐃𝐀𝐑𝐂𝐇𝐎𝐃",
+                        "𝗧𝗘𝗥𝗜 𝗠𝗨𝗠𝗠𝗬 𝗞𝗘 𝗦𝗔𝗔𝗧𝗛 𝗟𝗨𝗗𝗼 𝗞𝗛𝗘𝗟𝗧𝗘 𝗞𝗛𝗘𝗟𝗧𝗘 𝗨𝗦𝗞𝗘 𝗠𝗨𝗛 𝗠𝗘 𝗔𝗣𝗡𝗔 𝗟𝗢𝗗𝗔 𝗗𝗘 𝗗𝗨𝗡𝗚𝗔☝🏻☝🏻😬",
+                        "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗦𝗨𝗧𝗟𝗜 𝗕𝗢𝗠𝗕 𝗙𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗝𝗛𝗔𝗔𝗧𝗘 𝗝𝗔𝗟 𝗞𝗘 𝗞𝗛𝗔𝗔𝗞 𝗛𝗢 𝗝𝗔𝗬𝗘𝗚𝗜💣🔥",
+                        "𝐓𝐄𝐑𝐈 𝐕𝐀𝐇𝐄𝐈𝐍 𝐊𝐎 𝐀𝐏𝐍𝐄 𝐋𝐔𝐍𝐃 𝐏𝐑 𝐈𝐓𝐍𝐀 𝐉𝐇𝐔𝐋𝐀𝐀𝐔𝐍𝐆𝐀 𝐊𝐈 𝐉𝐇𝐔𝐋𝐓𝐄 𝐉𝐇𝐔𝐋𝐓𝐄 𝐇𝐈 𝐁𝐀𝐂𝐇𝐀 𝐏𝐀𝐈𝐃𝐀 𝐊𝐑 𝐃𝐄𝐆𝐈 💦💋",
+                        "𝐆𝐀𝐋𝐈 𝐆𝐀𝐋𝐈 𝐌𝐄 𝐑𝐄𝐇𝐓𝐀 𝐇𝐄 𝐒𝐀𝐍𝐃 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐂𝐇𝐎𝐃 𝐃𝐀𝐋𝐀 𝐎𝐑 𝐁𝐀𝐍𝐀 𝐃𝐈𝐀 𝐑𝐀𝐍𝐃 🤤🤣",
+                        "𝐒𝐀𝐁 𝐁𝐎𝐋𝐓𝐄 𝐌𝐔𝐉𝐇𝐊𝐎 𝐏𝐀𝐏𝐀 𝐊𝐘𝐎𝐔𝐍𝐊𝐈 𝐌𝐄𝐍𝐄 𝐁𝐀𝐍𝐀𝐃𝐈𝐀 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐏𝐑𝐄𝐆𝐍𝐄𝐍𝐓 🤣🤣",
+                        "𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙇𝙀𝙏𝙄 𝙈𝙀𝙍𝙄 𝙇𝙐𝙉𝘿 𝘽𝘼𝘿𝙀 𝙈𝘼𝙎𝙏𝙄 𝙎𝙀 𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙆𝙊 𝙈𝙀𝙉𝙀 𝘾𝙃𝙊𝘿 𝘿𝘼𝙇𝘼 𝘽𝙊𝙃𝙊𝙏 𝙎𝘼𝙎𝙏𝙀 𝙎𝙀",
+                        "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗖𝗛𝗔𝗡𝗚𝗘𝗦 𝗖𝗢𝗠𝗠𝗜𝗧 𝗞𝗥𝗨𝗚𝗔 𝗙𝗜𝗥 𝗧𝗘𝗥𝗜 𝗕𝗛𝗘𝗘𝗡 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗔𝗨𝗧𝗢𝗠𝗔𝗧𝗜𝗖𝗔𝗟𝗟𝗬 𝗨𝗣𝗗𝗔𝗧𝗘 𝗛𝗢𝗝𝗔𝗔𝗬𝗘𝗚𝗜🤖🙏🤔",
+                        "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐀𝐊𝐈 𝐂𝐇𝐔𝐃𝐀𝐈 𝐊𝐎 𝐏𝐎𝐑𝐍𝐇𝐔𝐁.𝐂𝐎𝐌 𝐏𝐄 𝐔𝐏𝐋𝐎𝐀𝐃 𝐊𝐀𝐑𝐃𝐔𝐍𝐆𝐀 𝐒𝐔𝐀𝐑 𝐊𝐄 𝐂𝐇𝐎𝐃𝐄 🤣💋💦",
+                        "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐆𝐀𝐀𝐍𝐃 𝐌𝐄𝐈 𝐎𝐍𝐄𝐏𝐋𝐔𝐒 𝐊𝐀 𝐖𝐑𝐀𝐏 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 𝟑𝟎𝐖 𝐇𝐈𝐆𝐇 𝐏𝐎𝐖𝐄𝐑 💥😂😎",
+                        "𝐓𝐔𝐉𝐇𝐄 𝐀𝐁 𝐓𝐀𝐊 𝐍𝐀𝐇𝐈 𝐒𝐌𝐉𝐇 𝐀𝐘𝐀 𝐊𝐈 𝐌𝐀𝐈 𝐇𝐈 𝐇𝐔 𝐓𝐔𝐉𝐇𝐄 𝐏𝐀𝐈𝐃𝐀 𝐊𝐀𝐑𝐍𝐄 𝐖𝐀𝐋𝐀 𝐁𝐇𝐎𝐒𝐃𝐈𝐊𝐄𝐄 𝐀𝐏𝐍𝐈 𝐌𝐀𝐀 𝐒𝐄 𝐏𝐔𝐂𝐇 𝐑𝐀𝐍𝐃𝐈 𝐊𝐄 𝐁𝐀𝐂𝐇𝐄𝐄𝐄𝐄 🤩👊👤😍",
+                        "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄𝐈 𝐀𝐏𝐏𝐋𝐄 𝐊𝐀 𝟏𝟖𝐖 𝐖𝐀𝐋𝐀 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 🔥🤩",
+                        "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗢 𝗜𝗧𝗡𝗔 𝗖𝗛𝗢𝗗𝗨𝗡𝗚𝗔 𝗞𝗜 𝗦𝗔𝗣𝗡𝗘 𝗠𝗘𝗜 𝗕𝗛𝗜 𝗠𝗘𝗥𝗜 𝗖𝗛𝗨𝗗𝗔𝗜 𝗬𝗔𝗔𝗗 𝗞𝗔𝗥𝗘𝗚𝗜 𝗥Æ𝗡𝗗𝗜 🥳😍👊💥",
+                        "𝙋𝘼𝙋𝘼 𝙆𝙄 𝙎𝙋𝙀𝙀𝘿 𝙈𝙏𝘾𝙃 𝙉𝙃𝙄 𝙃𝙊 𝙍𝙃𝙄 𝙆𝙔𝘼",
+                        "𝙆𝙄𝙏𝙉𝙄 𝘾𝙃𝙊𝘿𝙐 𝙏𝙀𝙍𝙄 𝙈𝘼 𝘼𝘽 𝙊𝙍..",
+                        "𝗧𝗘𝗥𝗜 𝗠𝗔𝗨𝗦𝗜 𝗞𝗘 𝗕𝗛𝗢𝗦𝗗𝗘 𝗠𝗘𝗜 𝗜𝗡𝗗𝗜𝗔𝗡 𝗥𝗔𝗜𝗟𝗪𝗔𝗬 🚂💥😂",
+                        "𝙆𝙄𝙏𝙉𝙄 𝙂𝙇𝙄𝙔𝘼 𝙋𝘿𝙒𝙀𝙂𝘼 𝘼𝙋𝙉𝙄 𝙈𝘼 𝙆𝙊",
+                        "𝗧𝗘𝗥𝗜 𝗜𝗧𝗘𝗠 𝗞𝗜 𝗚𝗔𝗔𝗡𝗗 𝗠𝗘 𝗟𝗨𝗡𝗗 𝗗𝗔𝗔𝗟𝗞𝗘,𝗧𝗘𝗥𝗘 𝗝𝗔𝗜𝗦𝗔 𝗘𝗞 𝗢𝗥 𝗡𝗜𝗞𝗔𝗔𝗟 𝗗𝗨𝗡𝗚𝗔 𝗠𝗔‌𝗔‌𝗗𝗔𝗥𝗖𝗛Ø𝗗🤘🏻🙌🏻☠️",
+                        "2 𝙍𝙐𝙋𝘼𝙔 𝙆𝙄 𝙋𝙀𝙋𝙎𝙄 𝙏𝙀𝙍𝙄 𝙈𝙐𝙈𝙈𝙔 𝙎𝘼𝘽𝙎𝙀 𝙎𝙀𝙓𝙔 💋💦",
+                        "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐"
+                        "Baap bhi bnale muje rndike",
+                        "Tera baap randibaaz ey yaad ey tujhe",
+                        "Tu apni Maa cuda na tympass",
+                        "Oye unfunny swipe mtt kr",
+                        "Oh hello bihari tera baap bihari or tu v bihari aaukat me rha kr.",
+                        "Oyy kinner tujhe gc me aane ki permission kisne di.",
+                        "Cudke dikha",
+                        "Cudke dikha ek baar.",
+                        "Sun sun ma cuda.",
+                        "Teri maca bhosda.",
+                        "Oye choti jati ke tmr.",
+                        "Ky? jldi likh kidde.",
+                        "Bihari com gang ke baap ko tag crega tu",
+                        "Mujhe cya tu bihari ey tmkc bs",
+                        "Jaldi se randibaaz papa bol",
+                        "Side hoja bihari tery maa cud gai ab",
+                        "Hye pgl bhg mat ache se cud",
+                        "bhg ny randyke tu ajj",
+                        "Hye pgl ke bche bhag mat",
+                        "Hye dur hatt madchod ke bache",
+                        "koi bat ny tery maa randy ey esliye maf cr rha hu tujhe",
+                        "koi baat ny maa chudwa apni tu mafi de dunga",
+                        "Ache se maa chudwa apni tu mafi mil jayegi tujhe",
+                        "apni ma mat chuda muje swipe crke",
+                        "Ache se apni ma cudwa tu swipe crke",
+                        "Fr bolna na ki cudwa le apni ma swipe crke",
+                        "Cya hua ma cud gyi tery",
+                        "pr kese cud gyi tery ma",
+                        "mujhe pta tha ma cud gai tery",
+                        "mey ny manta ma cud gyi tery",
+                        "teri ma rndy",
+                        "lode se utr mc",
+                        "lun mt chus mera",
+                        "nikal madarchd",
+                        "chup oye gashti k bache",
+                        "makichut teri",
+                        "chup rndyke",
+                        "ma rndy teri",
+                        "teri ma k hath todh k tere baap k muh me fasadunga randyke",
+                        "leave le tu rndyke pasand nai aya meko",
+                        "leave le tu randyke ider se",
+                        "Leave le jldi se wrna ma chud gai tery",
+                        "Leave ny lega maa randy tery",
+                        "Smjh bat maa randy ey tery leave le",
+                        "fast leave le kamjor randyke",
+                        "tuto chup rndyk",
+                        "oy hijde khana kha ke aa kamzor",
+                        "teri mako ily rey🌚😂",
+                        "chup chap chud tmkc",
+                        "chupchap maa chudwa apni tu",
+                        "shi se maa chudwa apni tu chupchap",
+                        "fr se maa chudwa tu apni chupchap",
+                        "shi se likh wrna ma chud gai tery",
+                        "ma cyu chud gai tery chupchap",
+                        "proof cr maa chud gyi tery",
+                        "proof ey tery maa randy ey",
+                        "proof ho chuka maa randy tery",
+                        "Chup chillar",
+                        "chup chup maa k bosda tery",
+                        "oy hijde khana kha ke aa kamzor",
+                        "chup madarchod ?",
+                        "Ab tk cud gyi hogi tery maa ?",
+                        "ny ny me kuch ny janta bs teri ma rndy ey",
+                        "Sbse phele apni maa ko bol chudna kaam kre",
+                        "Yaha bhi chuda tu rndyce pille",
+                        "terimakabosda",
+                        "teri to bhen cudegi",
+                        "chup rndyke tommy",
+                        "nikal madarchd cudke yha se",
+                        "coz teri ma andhi randi he",
+                        "nyto baap bol mujhe",
+                        "nyny teri maa hogi rndii jo chudwati jogi",
+                        "try ammi ce bhosde me emoji dal mc",
+                        "cya ? chmr chud gya cya ?",
+                        "tm chudri hogi frrto",
+                        "cya ? kb ? pgl ey cya rndkek",
+                        "cya sch mey pgl ey cya tu randyke cudwa li tune apni ma",
+                        "itna sch ny bol ma chud gai tery",
+                        "sch mey pgl ey tu apni ma cudwa lia mere sth",
+                        "mtlb tmr",
+                        "nyto",
+                        "pura likh mc",
+                        "tmr frrto",
+                        "oh ok cudle fir",
+                        "teri maa ka damad",
+                        "cya ? ache se likhe pehle rndikebache",
+                        "nyto teri maa chodne me vyast hu",
+                        "nyto pgl ey cya kuch bi",
+                        "oyee cya ? chud gya ?",
+                        "chud mt hss",
+                        "yur rndii mom",
+                        "are sbki maa rndii or teri bi",
+                        "are idar cudle ek baar",
+                        "tri maa ci trh",
+                        "ek line me tmr",
+                        "Q",
+                        "ocy ab chudle",
+                        "pehele teri maa chodu",
+                        "nyto",
+                        "q ?",
+                        "hyyy chud ke dika ek baar",
+                        "oyee sun dost tmr",
+                        "bhag ja raand maaf crr dunga",
+                        "oyee pgl rndii idar aa",
+                        "cya tmr frrto",
+                        "oyee idar aake chud le chmr",
+                        "nyto aese hi cud",
+                        "oyee hyy aise hi cud lena",
+                        "or chud le",
+                        "chud ke dika or",
+                        "hyy chudo na",
+                        "chudo mt bhag jao",
+                        "byyee hyy cya ?",
+                        "Qchud q rhe ho ?",
+                        "pgl ey cya mc",
+                        "chud mt",
+                        "cya pgl rndii idar aa",
+                        "teri ammi ce bhosde me chappal",
+                        "oyee idar aa mc",
+                        "kmzror ey cya rndiek",
+                        "cya likh rha ?",
+                        "chud tha cya ?",
+                        "oyee slide leke baat crmc",
+                        "idar a teri maa chodu",
+                        "oyee cp mt crr chudle",
+                        "oyee hyy chud ke dika",
+                        "idar aa try ma schofu khachar khachar",
+                        "idar aa ja mc",
+                        "hyy idar aake chudle",
+                        "oyee kmzor mc idar aa",
+                        "ye cya tmr",
+                        "oyee ny cp ny crr",
+                        "oyee pgl mt crr",
+                        "cudle aram se mc",
+                        "pgl ey cya rndiek",
+                        "cp crce chudega !",
+                        "baap ? mc mera coi ma baap ny ey mai upar se rocket pe beth ce bss teri ma chodne aya hu",
+                        "Chota likh rndi k bache",
+                        "Chota likha wrna try ma rndy",
+                        "Try ma baka codega",
+                        "Tmkc main burf",
+                        "Bhikari ki jhat ma cuda le",
+                        "Chodke tery ma marjayegi",
+                        "Tmkc main Mount Everest",
+                        "Muh mey lega lund mera",
+                        "Hijde ki jhat chup wrna try ma rndi",
+                        "Menu ny pta tery ma randy",
+                        "Menu ki pta ma randy tery",
+                        "Menu pta maa cud gai tery",
+                        "Menu sb pta ma randy ey tery",
+                        "Menu pr tery ma randy",
+                        "Randy maa tery menu pta",
+                        "Tenu or menu pta ey maa randy tery",
+                        "Bs bs maa cudwa apni",
+                        "Bs bs ma randy tery thnkss",
+                        "Bs bs chudwa lia tu apni maa",
+                        "Bs bs kamjor maa randy tery",
+                        "Smjh gya apni ma cudwa le ab",
+                        "smjh gya tery maa randy ey",
+                        "smjh gya tu sabit kr maa randy tery",
+                        "Cya hua ma cudwa tu apni",
+                        "Easy maa cudwa le apni tu",
+                        "Easy w8 ma chudwa le apni ab",
+                        "Sans ari ha ky teri maa chudgi ajj",
+                        "Teri maa ko bina sanss lete hue chodunga",
+                        "chup randike kamjor",
+                        "apni ma normie cudwa le tu",
+                        "fr cya normie ma cud gai tery",
+                        "bas thek tery ma randy",
+                        "bas thek tery maa cud gyi",
+                        "kamjor thi tery ma esliye cud gai",
+                        "Mai sb janta ma cud gai tery",
+                        "chl chl ht tery maa cud gyi",
+                        "fr kaise cud gyi maa tery",
+                        "maa tery randy ey",
+                        "bas tery maa randy ey",
+                        "fr randy ma tery ey",
+                        "Kamjor ma ka bcha tu randyke",
+                        "bhot gndi cud gai maa tery",
+                        "pr kaise maa cud gai tery itna gnda",
+                        "mujhe cya bta rha maa randy tery",
+                        "mujhe cya pta ma cud gyi tery",
+                        "fir mujhe ny pta maa cud gai tery",
+                        "pta ny kon cod dia tery maa ko",
+                        "ruk aaya tery ma codke",
+                        "wait cr tery maa cod rha hu",
+                        "wait cr rabdyke maa cud rhi ey tery",
+                        "wait kr smjh rha tery ma codke",
+                        "wait le thoda chodne de tery mako",
+                        "ruk ja aand rkh dunga tery make liye",
+                        "tery maa famous randy ey",
+                        "maan lia mene maa randy sali tery",
+                        "maan lia maa cud gai tery",
+                        "shant beth randyke maa chudwa tu apni",
+                        "shant bethke chudwa le apni mako tu",
+                        "fr se shant Beth tu cud ab randyke yha",
+                        "mere smjh ny aya maa randy tery",
+                        "Le केला Kha tu madarchod",
+                        "Hye tery ma cud gyi cya",
+                        "hye tery maa mar gai cya",
+                        "Hye sch bta com cod dia tery mako",
+                        "Chl chod dia teri maa ko smjhle",
+                        "Baki koi dikkat ny tery maa randy ey",
+                        "baki sb jante ey ki maa chuddkad ey tery",
+                        "mujhe cya pta tha tery maa cudne wli ey",
+                        "pr mei kaise jnta tery ma ko koi chod dia",
+                        "pr mera vi manna shi tha maa chud gai tery",
+                        "pr wo glt ny tery maa randy ey",
+                        "pr wo shi ey tery maa chuddkad ey",
+                        "pr kaise kia maa chud gai tery omfoo",
+                        "bur cheer dunga tri ma ka",
+                        "teri ma ke dil me loda marke uski dhadkan rok dunga",
+                        "lulle kha tri makabhosda",
+                        "tri bhn ki bhosdi beta",
+                        "tri ma rndi baat khtm",
+                        "Sun ek maze ki baat batao kya teri maa randy ey"
+                        "codu codu mako tery",
+                        "aj cud gai tery maa oye",
+                        "sun sun randy make bache tu",
+                        "kilas ny randyke",
+                        "mujhe cya pta tery bhen cud gai",
+                        "pr pr cya hote ey tmkc",
+                        "tmcl sunle",
+                        "moot du tery maki chut mey",
+                        "bhgny cudke dikha fr",
+                        "fr se cudle tu",
+                        "ye vi shi ey tery mkc bs",
+                        "aj kuch ny ma cudwa tu apni",
+                        "try kr mera lund chuske",
+                        "tormakibur sun",
+                        "tor maki fuddi oye",
+                        "Haye Haye tery ma cud gai",
+                        "oye lundke pasine..",
+                        "kutte ke tatte sun",
+                        "kutta jaisa cud rha tu",
+                        "Muh mei le mera..",
+                        "jhaat ke pissu sun tmkc",
+                        "Hahahha ma cud gai tery",
+                        "weak tatte uth",
+                        "weak ey tu cud rha",
+                        "weak ache se cud tu",
+                        "weak tery ma cud rhi dekh",
+                        "week tery ma cud gai ab",
+                        "mujhe ny rok tu weak ey",
+                        "chup hizde",
+                        "okat ny meri ma cudwa tu apni",
+                        "lun lega tery maki gand mei ?",
+                        "tery maki bachi codu..",
+                        "tery bhen ki chut aj fad du",
+                        "speed lekr aa cudke dikha",
+                        "speed ny tere andr weak prosn",
+                        "ugly randyke chup",
+                        "makafuddatery",
+                        "tera baap ko tag kr..?",
+                        "ache se tag kr randibaaz bhagwn ko..",
+                        "cudke pgl ny ho tu",
+                        "cudke pgl ho rha tu kid",
+                        "ma to cud gai tery hawabzi cr..",
+                        "bs ma codni ey tery",
+                        "town mei cud tery mako lekr",
+                        "tery ma sexy ko bej - randibaaz bhgwn pe",
+                        "speed pkd cp ny kr",
+                        "Try ma rendy",
+                        "Bhkk cud",
+                        "tey maa rndi",
+                        "tery behen randi",
+                        "Cud ja",
+                        "tery didi rndi",
+                        "Slow",
+                        "teri Maiya ciodu",
+                        "Bhag?",
+                        "Bhak cud",
+                        "Tma codu",
+                        "Slow",
+                        "Slow firse",
+                        "Cudgrib",
+                        "Try ma dou",
+                        "tbkc codu",
+                        "Net on off wali rndy",
+                        "Oye try ma codu",
+                        "Idhar aake cud chup chaap",
+                        "tbkc mrdu",
+                        "oi maake lodee",
+                        "randyke beej",
+                        "tmkc chodu",
+                        "suar ke beej",
+                        "net off on kr randyke ladke",
+                        "Try ma cudi kese",
+                        "Chup slow madharcod",
+                        "tbkc codu kr msg delete",
+                        "oi suar ke ladke",
+                        "tmkc fufi",
+                        "tery didi chudi",
+                        "tmkc dikha",
+                        "Cud ab",
+                        "randyke cud",
+                        "Bhak cud",
+                        "cudle tbkc mru",
+                        "tmkl cudle grib",
+                        "tery behen vesiyaa rndi",
+                        "Itna gnda chuda tu firse net on off",
+                        "grib ke bete",
+                        "Bhag ja lode tmkc maru dunga",
+                        "tbkc mrdungaa",
+                        "bhag tmkc",
+                        "bhag tbkc",
+                        "tbkc mey cp",
+                        "cp tbkc mehh",
+                        "cp tmkl meh",
+                        "cp bol randyke",
+                        "Abe cp bol randyke",
+                        "double send ko cp tmkc codu",
+                        "tbkc me cp cod dunga Aaj mehh",
+                        "ht tbkc dalal ke bete.",
+                        "Rndy jldi jldi cudq tryma",
+                        "Para likhega..",
+                        "Tra rndhbhak",
+                        "Lagdi ke ladce cp bol",
+                        "cp bol lagdi ke bete..",
+                        "cudke cp bol",
+                        "bhikari lund chus mera.",
+                        "Low level cp cr",
+                        "cp bol low level weak",
+                        "mere lund pe ey tu hijde",
+                        "free cudwa tery mako",
+                        "Free mey cud tu randyke"
+                        "speed ny weak tatte terme",
+                        "kitni br cudwayega terymako",
+                        "lund le randibaaz bapka",
+                        "lun cus jaldi se randibaaz bapka",
+                        "koi ny dekh rha cudle tu",
+                        "cudle betichod ache se",
+                        "maki chut tery bs yehi janta mey",
+                        "cp bolega to tmkc",
+                        "wrna tery ma cud jayegi",
+                        "slow ey tu kid",
+                        "jldi likh..tmkc",
+                        "jldi likh..randce tu",
+                        "tym se phle cudke dikha",
+                        "tym hoga tery maa cudwa",
+                        "ma cud gai tery tym se phle",
+                        "uth randce ke ldke",
+                        "macabosdatery",
+                        "con kb cod dia mako tery",
+                        "koi hoga tml",
+                        "machar cudle tu",
+                        "menu tery mako codna se",
+                        "tery mako bol mujhe cod de",
+                        "bs mey tery ma se cudna chta hu",
+                        "Eww maka lode uth",
+                        "Meow cr tery mako codu",
+                        "lund rkh dia tery make fude pe",
+                        "mera lund ke bal uth",
+                        "kidee Zinda ho",
+                        "mar ny kidde type kr",
+                        "chup bkl",
+                        "bc tery maki chut",
+                        "mc randyke likh fast",
+                        "fast likh randyke",
+                        "fast likh kamzor"
+                        "tery maki chut claim crwa",
+                        "awz niche randce ke bche",
+                        "sawal ny puch tery makabosda",
+                        "fyter bnega lagde madrchod",
+                        "oye kaale ro ke dikha",
+                        "oye kaale roo ny",
+                        "short ny cud tu bina ruke",
+                        "short ny cud tu apni mako lekr",
+                        "tery make sth tery bhen vi cudwa le",
+                        "tery make sth tery didi vi cud gai",
+                        "Chat fyter bnega randce codu tery mako",
+                        "bol randibaaz daddy ey",
+                        "bullyx randyke uth",
+                        "mar marke cud rha tu",
+                        "or tery ma marke cud gai"
+                        "Jaldi likh rndyke bej",
+                        "Or bda likh tmc",
+                        "Or bda 2 line wla likh tmkc",
+                        "Or bda oye likh tml",
+                        "Teri maa ka bur",
+                        "Oye keede",
+                        "Randi ke ladke",
+                        "Jaldi likh teri behen chodu",
+                        "Mkl uth randi ke bacche",
+                        "Teri nani meri maal",
+                        "Tej likh randce",
+                        "Oye maake lode mrenga",
+                        "Teri maa chody",
+                        "Teri Maiya ki gand",
+                        "Tery dadi ka fudda",
+                        "Mkl uth behencod",
+                        "Teri maa ki bur de",
+                        "Tery maa ka fudda me lauda",
+                        "Teri maa chudva",
+                        "Randi ke bete mar gaya",
+                        "Teri maa ki chut mru",
+                        "Jalid kr spam",
+                        "Mc spam rokenga",
+                        "Teri maaki chut spam kr",
+                        "spam kr.maake lode",
+                        "Randyke chode spam kr wrna cud tu",
+                        "Spam kr kid",
+                        "Noob teri maa chodu",
+                        "Rndyke bete mar mat tu",
+                        "Noob jaldi likh wrna tery maa rand",
+                        "cud gai maa tery noob",
+                        "uth randyke noob",
+                        "chl cudke dikha noob",
+                        "jldi typ cr noob halke",
+                        "cud ke pgl ny ho noob",
+                        "cud cud ke rand bnja tu noob",
+                        "makichut tery noob",
+                        "ganda cyu cud rha tu ?",
+                        "itna gnda ny cud ache se cud",
+                        "Maan le cud gya tu sun bat ab",
+                        "makafudda fat gya tery ruk"
+                        "BAAP BHI BNALE MUJE RNDIKE",
+                        "TERA BAAP RANDIBAAZ EY YAAD EY TUJHE",
+                        "TU APNI MAA CUDA NA TYMPASS",
+                        "OYE UNFUNNY SWIPE MTT KR",
+                        "OH HELLO BIHARI TERA BAAP BIHARI OR TU V BIHARI AAUKAT ME RHA KR.",
+                        "OYY KINNER TUJHE GC ME AANE KI PERMISSION KISNE DI.",
+                        "CUDKE DIKHA",
+                        "CUDKE DIKHA EK BAAR.",
+                        "SUN SUN MA CUDA.",
+                        "TERI MACA BHOSDA.",
+                        "OYE CHOTI JATI KE TMR.",
+                        "KY? JLDI LIKH KIDDE.",
+                        "BIHARI COM GANG KE BAAP KO TAG CREGA TU",
+                        "MUJHE CYA TU BIHARI EY TMKC BS",
+                        "JALDI SE RANDIBAAZ PAPA BOL",
+                        "SIDE HOJA BIHARI TERY MAA CUD GAI AB",
+                        "HYE PGL BHG MAT ACHE SE CUD",
+                        "BHG NY RANDYKE TU AJJ",
+                        "HYE PGL KE BCHE BHAG MAT",
+                        "HYE DUR HATT MADCHOD KE BACHE",
+                        "KOI BAT NY TERY MAA RANDY EY ESLIYE MAF CR RHA HU TUJHE",
+                        "KOI BAAT NY MAA CHUDWA APNI TU MAFI DE DUNGA",
+                        "ACHE SE MAA CHUDWA APNI TU MAFI MIL JAYEGI TUJHE",
+                        "APNI MA MAT CHUDA MUJE SWIPE CRKE",
+                        "ACHE SE APNI MA CUDWA TU SWIPE CRKE",
+                        "FR BOLNA NA KI CUDWA LE APNI MA SWIPE CRKE",
+                        "CYA HUA MA CUD GYI TERY",
+                        "PR KESE CUD GYI TERY MA",
+                        "MUJHE PTA THA MA CUD GAI TERY",
+                        "MEY NY MANTA MA CUD GYI TERY",
+                        "TERI MA RNDY",
+                        "LODE SE UTR MC",
+                        "LUN MT CHUS MERA",
+                        "NIKAL MADARCHD",
+                        "CHUP OYE GASHTI K BACHE",
+                        "MAKICHUT TERI",
+                        "CHUP RNDYKE",
+                        "MA RNDY TERI",
+                        "TERI MA K HATH TODH K TERE BAAP K MUH ME FASADUNGA RANDYKE",
+                        "LEAVE LE TU RNDYKE PASAND NAI AYA MEKO",
+                        "LEAVE LE TU RANDYKE IDER SE",
+                        "LEAVE LE JLDI SE WRNA MA CHUD GAI TERY",
+                        "LEAVE NY LEGA MAA RANDY TERY",
+                        "SMJH BAT MAA RANDY EY TERY LEAVE LE",
+                        "FAST LEAVE LE KAMJOR RANDYKE",
+                        "TUTO CHUP RNDYK",
+                        "OY HIJDE KHANA KHA KE AA KAMZOR",
+                        "TERI MAKO ILY REY",
+                        "CHUP CHAP CHUD TMKC",
+                        "CHUPCHAP MAA CHUDWA APNI TU",
+                        "SHI SE MAA CHUDWA APNI TU CHUPCHAP",
+                        "FR SE MAA CHUDWA TU APNI CHUPCHAP",
+                        "SHI SE LIKH WRNA MA CHUD GAI TERY",
+                        "MA CYU CHUD GAI TERY CHUPCHAP",
+                        "PROOF CR MAA CHUD GYI TERY",
+                        "PROOF EY TERY MAA RANDY EY",
+                        "PROOF HO CHUKA MAA RANDY TERY",
+                        "CHUP CHILLAR",
+                        "CHUP CHUP MA K BOSDA TERY",
+                        "OY HIJDE KHANA KHA KE AA KAMZOR",
+                        "CHUP MADARCHOD ?",
+                        "AB TK CUD GYI HOGI TERY MAA ?",
+                        "NY NY ME KUCH NY JANTA BS TERI MA RNDY EY",
+                        "SBSE PHELE APNI MAA KO BOL CHUDNA KAAM KRE",
+                        "YAHA BHI CHUDA TU RNDYCE PILLE",
+                        "TERIMAKABOSDA",
+                        "TERI TO BHEN CUDEGI",
+                        "CHUP RNDYKE TOMMY",
+                        "NIKAL MADARCHD CUDKE YHA SE",
+                        "COZ TERI MA ANDHI RANDI HE",
+                        "NYTO BAAP BOL MUJHE",
+                        "NYNY TERI MAA HOGI RNDII JO CHUDWATI JOGI",
+                        "TRY AMMI CE BHOSDE ME EMOJI DAL MC",
+                        "CYA ? CHMR CHUD GYA CYA ?",
+                        "TM CHUDRI HOGI FRRTO",
+                        "CYA ? KB ? PGL EY CYA RNDKEK",
+                        "CYA SCH MEY PGL EY CYA TU RANDYKE CUDWA LI TUNE APNI MA",
+                        "ITNA SCH NY BOL MA CHUD GAI TERY",
+                        "SCH MEY PGL EY TU APNI MA CUDWA LIA MERE STH",
+                        "MTLB TMR",
+                        "NYTO",
+                        "PURA LIKH MC",
+                        "TMR FRRTO",
+                        "OH OK CUDLE FIR",
+                        "TERI MAA KA DAMAD",
+                        "CYA ? ACHE SE LIKHE PEHLE RNDIKEBACHE",
+                        "NYTO TERI MAA CHODNE ME VYAST HU",
+                        "NYTO PGL EY CYA KUCH BI",
+                        "OYEE CYA ? CHUD GYA ?",
+                        "CHUD MT HSS",
+                        "YUR RNDII MOM",
+                        "ARE SBKI MAA RNDII OR TERI BI",
+                        "ARE IDAR CUDLE EK BAAR",
+                        "TRI MAA CI TRH",
+                        "EK LINE ME TMR",
+                        "Q",
+                        "OCY AB CHUDLE",
+                        "PEHELE TERI MAA CHODU",
+                        "NYTO",
+                        "Q ?",
+                        "HYYY CHUD KE DIKA EK BAAR",
+                        "OYEE SUN DOST TMR",
+                        "BHAG JA RAAND MAAF CRR DUNGA",
+                        "OYEE PGL RNDII IDAR AA",
+                        "CYA TMR FRRTO",
+                        "OYEE IDAR Aake CHUD LE CHMR",
+                        "NYTO AESE HI CUD",
+                        "OYEE HYY AISE HI CUD LENA",
+                        "OR CHUD LE",
+                        "CHUD KE DIKA OR",
+                        "HYY CHUDO NA",
+                        "CHUDO MT BHAG JAO",
+                        "BYYEE HYY CYA ?",
+                        "QCHUD Q RHE HO ?",
+                        "PGL EY CYA MC",
+                        "CHUD MT",
+                        "CYA PGL RNDII IDAR AA",
+                        "TERI AMMI CE BHOSDE ME CHAPPAL",
+                        "OYEE IDAR AA MC",
+                        "KMZROR EY CYA RNDIEK",
+                        "CYA LIKH RHA ?",
+                        "CHUD THA CYA ?",
+                        "OYEE SLIDE LEKE BAAT CRMC",
+                        "IDAR A TERI MAA CHODU",
+                        "OYEE CP MT CRR CHUDLE",
+                        "OYEE HYY CHUD KE DIKA",
+                        "IDAR AA TRY MA SCHOFU KHACHAR KHACHAR",
+                        "IDAR AA JA MC",
+                        "HYY IDAR Aake CHUDLE",
+                        "OYEE KMZOR MC IDAR AA",
+                        "YE CYA TMR",
+                        "OYEE NY CP NY CRR",
+                        "OYEE PGL MT CRR",
+                        "CUDLE ARAM SE MC",
+                        "PGL EY CYA RNDIEK",
+                        "CP CRCE CHUDEGA !",
+                        "BAAP ? MC MERA COI MA BAAP NY EY MAI UPAR SE ROCKET PE BETH CE BSS TERI MA CHODNE AYA HU",
+                        "CHOTA LIKH RNDI K BACHE",
+                        "CHOTA LIKHA WRNA TRY MA RNDY",
+                        "TRY MA BAKA CODEGA",
+                        "TMKC MAIN BURF",
+                        "BHIKARI KI JHAT MA CUDA LE",
+                        "CHODKE TERY MA MARJAYEGI",
+                        "TMKC MAIN MOUNT EVEREST",
+                        "MUH MEY LEGA LUND MERA",
+                        "HIJDE KI JHAT CHUP WRNA TRY MA RNDI",
+                        "MENU NY PTA TERY MA RANDY",
+                        "MENU KI PTA MA RANDY TERY",
+                        "MENU PTA MAA CUD GAI TERY",
+                        "MENU SB PTA MA RANDY EY TERY",
+                        "MENU PR TERY MA RANDY",
+                        "RANDY MAA TERY MENU PTA",
+                        "TENU OR MENU PTA EY MAA RANDY TERY",
+                        "BS BS MAA CUDWA APNI",
+                        "BS BS MA RANDY TERY THNKSS",
+                        "BS BS CHUDWA LIA TU APNI MAA",
+                        "BS BS KAMJOR MAA RANDY TERY",
+                        "SMJH GYA APNI MA CUDWA LE AB",
+                        "SMJH GYA TERY MAA RANDY EY",
+                        "SMJH GYA TU SABIT KR MAA RANDY TERY",
+                        "CYA HUA MA CUDWA TU APNI",
+                        "EASY MAA CUDWA LE APNI TU",
+                        "EASY W8 MA CHUDWA LE APNI AB",
+                        "SANS ARI HA KY TERI MAA CHUDGI AJJ",
+                        "TERI MAA KO BINA SANSS LETE HUE CHODUNGA",
+                        "CHUP RANDIKE KAMJOR",
+                        "APNI MA NORMIE CUDWA LE TU",
+                        "FR CYA NORMIE MA CUD GAI TERY",
+                        "BAS THEK TERY MA RANDY",
+                        "BAS THEK TERY MAA CUD GYI",
+                        "KAMJOR THI TERY MA ESLIYE CUD GAI",
+                        "MAI SB JANTA MA CUD GAI TERY",
+                        "CHL CHL HT TERY MAA CUD GYI",
+                        "FR KAISE CUD GYI MAA TERY",
+                        "MAA TERY RANDY EY",
+                        "BAS TERY MAA RANDY EY",
+                        "FR RANDY MA TERY EY",
+                        "KAMJOR MA KA BCHA TU RANDYKE",
+                        "BHOT GNDI CUD GAI MAA TERY",
+                        "PR KAISE MAA CUD GAI TERY ITNA GNDA",
+                        "MUJHE CYA BTA RHA MAA RANDY TERY",
+                        "MUJHE CYA PTA MA CUD GYI TERY",
+                        "FIR MUJHE NY PTA MAA CUD GAI TERY",
+                        "PTA NY KON COD DIA TERY MAA KO",
+                        "RUK AAYA TERY MA CODKE",
+                        "WAIT CR TERY MAA COD RHA HU",
+                        "WAIT CR RABDYKE MAA CUD RHI EY TERY",
+                        "WAIT KR SMJH RHA TERY MA CODKE",
+                        "WAIT LE THODA CHODNE DE TERY MAKO",
+                        "RUK JA AAND RKH DUNGA TERY MAKE LIYE",
+                        "TERY MAA FAMOUS RANDY EY",
+                        "MAAN LIA MENE MAA RANDY SALI TERY",
+                        "MAAN LIA MAA CUD GAI TERY",
+                        "SHANT BETH RANDYKE MAA CHUDWA TU APNI",
+                        "SHANT BETHKE CHUDWA LE APNI MAKO TU",
+                        "FR SE SHANT BETH TU CUD AB RANDYKE YHA",
+                        "MERE SMJH NY AYA MAA RANDY TERY",
+                        "LE KELA KHA TU MADARCHOD",
+                        "HYE TERY MA CUD GYI CYA",
+                        "HYE TERY MAA MAR GAI CYA",
+                        "HYE SCH BTA COM COD DIA TERY MAKO",
+                        "CHL CHOD DIA TERI MAA KO SMJHLE",
+                        "BAKI KOI DIKKAT NY TERY MAA RANDY EY",
+                        "BAKI SB JANTE EY KI MAA CHUDDKAD EY TERY",
+                        "MUJHE CYA PTA THA TERY MAA CUDNE WLI EY",
+                        "PR MEI KAISE JNTA TERY MA KO KOI CHOD DIA",
+                        "PR MERA VI MANNA SHI THA MAA CHUD GAI TERY",
+                        "PR WO GLT NY TERY MAA RANDY EY",
+                        "PR WO SHI EY TERY MAA CHUDDKAD EY",
+                        "PR KAISE KIA MAA CHUD GAI TERY OMFOO",
+                        "BUR CHEER DUNGA TRI MA KA",
+                        "TERI MA KE DIL ME LODA MARKE USKI DHADKAN ROK DUNGA",
+                        "LULLE KHA TRI MAKABHOSDA",
+                        "TRI BHN KI BHOSDI BETA",
+                        "TRI MA RNDI BAAT KHTM",
+                        "SUN EK MAZE KI BAAT BATAO KYA TERI MAA RANDY EY",
+                        "CODU CODU MAKO TERY",
+                        "AJ CUD GAI TERY MAA OYE",
+                        "SUN SUN RANDY MAKE BACHE TU",
+                        "KILAS NY RANDYKE",
+                        "MUJHE CYA PTA TERY BHEN CUD GAI",
+                        "PR PR CYA HOTE EY TMKC",
+                        "TMCL SUNLE",
+                        "MOOT DU TERY MAKI CHUT MEY",
+                        "BHGNY CUDKE DIKHA FR",
+                        "FR SE CUDLE TU",
+                        "YE VI SHI EY TERY MKC BS",
+                        "AJ KUCH NY MA CUDWA TU APNI",
+                        "TRY KR MERA LUND CHUSKE",
+                        "TORMAKIBUR SUN",
+                        "TOR MAKI FUDDI OYE",
+                        "HAYE HAYE TERY MA CUD GAI",
+                        "OYE LUNDKE PASINE..",
+                        "KUTTE KE TATTE SUN",
+                        "KUTTA JAISA CUD RHA TU",
+                        "MUH MEI LE MERA..",
+                        "JHAAT KE PISSU SUN TMKC",
+                        "HAHAHHA MA CUD GAI TERY",
+                        "WEAK TATTE UTH",
+                        "WEAK EY TU CUD RHA",
+                        "WEAK ACHE SE CUD TU",
+                        "WEAK TERY MA CUD RHI DEKH",
+                        "WEEK TERY MA CUD GAI AB",
+                        "MUJHE NY ROK TU WEAK EY",
+                        "CHUP HIZDE",
+                        "OKAT NY MERI MA CUDWA TU APNI",
+                        "LUN LEGA TERY MAKI GAND MEI ?",
+                        "TERY MAKI BACHI CODU..",
+                        "TERY BHEN KI CHUT AJ FAD DU",
+                        "SPEED LEKR AA CUDKE DIKHA",
+                        "SPEED NY TERE ANDR WEAK PROSN",
+                        "UGLY RANDYKE CHUP",
+                        "MAKAFUDDATERY",
+                        "TERA BAAP KO TAG KR..?",
+                        "ACHE SE TAG KR RANDIBAAZ BHAGWN KO..",
+                        "CUDKE PGL NY HO TU",
+                        "CUDKE PGL HO RHA TU KID",
+                        "MA TO CUD GAI TERY HAWABZI CR..",
+                        "BS MA CODNI EY TERY",
+                        "TOWN MEI CUD TERY MAKO LEKR",
+                        "TERY MA SEXY KO BEJ - RANDIBAAZ BHGWN PE",
+                        "SPEED PKD CP NY KR",
+                        "TRY MA RENDY",
+                        "BHKK CUD",
+                        "TEY MAA RNDI",
+                        "TERY BEHEN RANDI",
+                        "CUD JA TMC",
+                        "TERY DIDI RNDI",
+                        "SLOW",
+                        "TERI MAIYA CIODU",
+                        "BHAG?TMC ",
+                        "BHAK CUD TML",
+                        "TMA CODU",
+                        "SLOW TMKC ",
+                        "SLOW FIRSE TMKC ",
+                        "CUDGRIB TML",
+                        "TRY MA DOU",
+                        "TBKC CODU",
+                        "NET ON OFF WALI RNDY",
+                        "OYE TRY MA CODU",
+                        "IDHAR AAKE CUD CHUP CHAAP",
+                        "TBKC MRDU",
+                        "OI MAAKE LODEE",
+                        "RANDYKE BEEJ",
+                        "TMKC CHODU",
+                        "SUAR KE BEEJ",
+                        "NET OFF ON KR RANDYKE LADKE",
+                        "TRY MA CUDI KESE",
+                        "CHUP SLOW MADHARCOD",
+                        "TBKC CODU KR MSG DELETE",
+                        "OI SUAR KE LADKE",
+                        "TMKC FUFI",
+                        "TERY DIDI CHUDI",
+                        "TMKC DIKHA",
+                        "CUD AB",
+                        "RANDYKE CUD",
+                        "BHAK CUD",
+                        "CUDLE TBKC MRU",
+                        "TMKL CUDLE GRIB",
+                        "TERY BEHEN VESITYA RNDI",
+                        "ITNA GNDA CHUDA TU FIRSE NET ON OFF",
+                        "GRIB KE BETE",
+                        "BHAG JA LODE TMKC MARU DUNGA",
+                        "TBKC MRDUNGAA",
+                        "BHAG TMKC",
+                        "BHAG TBKC",
+                        "TBKC MEY CP",
+                        "CP TBKC MEHH",
+                        "CP TMKL MEH",
+                        "CP BOL RANDYKE",
+                        "ABE CP BOL RANDYKE",
+                        "DOUBLE SEND KO CP TMKC CODU",
+                        "TBKC ME CP COD DUNGA AAJ MEHH",
+                        "HT TBKC DALAL KE BETE.",
+                        "RNDY JLDI JLDI CUDQ TRYMA",
+                        "PARA LIKHEGA..",
+                        "TRA RNDHBHAK",
+                        "LAGDI KE LADCE CP BOL",
+                        "CP BOL LAGDI KE BETE..",
+                        "CUDKE CP BOL",
+                        "BHIKARI LUND CHUS MERA.",
+                        "LOW LEVEL CP CR",
+                        "CP BOL LOW LEVEL WEAK",
+                        "MERE LUND PE EY TU HIJDE",
+                        "FREE CUDWA TERY MAKO",
+                        "FREE MEY CUD TU RANDYKE",
+                        "SPEED NY WEAK TATTE TERME",
+                        "KITNI BR CUDWAYEGA TERYMAKO",
+                        "LUND LE RANDIBAAZ BAPKA",
+                        "LUN CUS JALDI SE RANDIBAAZ BAPKA",
+                        "KOI NY DEKH RHA CUDLE TU",
+                        "CUDLE BETICHOD ACHE SE",
+                        "MAKI CHUT TERY BS YEHI JANTA MEY",
+                        "CP BOLEGA TO TMKC",
+                        "WRNA TERY MA CUD JAYEGI",
+                        "SLOW EY TU KID",
+                        "JLDI LIKH..TMKC",
+                        "JLDI LIKH..RANDCE TU",
+                        "TYM SE PHLE CUDKE DIKHA",
+                        "TYM HOGA TERY MAA CUDWA",
+                        "MA CUD GAI TERY TYM SE PHLE",
+                        "UTH RANDCE KE LDKE",
+                        "MACABOSDATERY",
+                        "CON KB COD DIA MAKO TERY",
+                        "KOI HOGA TML",
+                        "MACHAR CUDLE TU",
+                        "MENU TERY MAKO CODNA SE",
+                        "TERY MAKO BOL MUJHE COD DE",
+                        "BS MEY TERY MA SE CUDNA CHTA HU",
+                        "EWW MAKA LODE UTH",
+                        "MEOW CR TERY MAKO CODU",
+                        "LUND RKH DIA TERY MAKE FUDE PE",
+                        "MERA LUND KE BAL UTH",
+                        "KIDEE ZINDA HO",
+                        "MAR NY KIDDE TYPE KR",
+                        "CHUP BKL",
+                        "BC TERY MAKI CHUT",
+                        "MC RANDYKE LIKH FAST",
+                        "FAST LIKH RANDYKE",
+                        "FAST LIKH KAMZOR",
+                        "TERY MAKI CHUT CLAIM CRWA",
+                        "AWZ NICHE RANDCE KE BCHE",
+                        "SAWAL NY PUCH TERY MAKABOSDA",
+                        "FYTER BNEGA LAGDE MADRCHOD",
+                        "OYE KAALE RO KE DIKHA",
+                        "OYE KAALE ROO NY",
+                        "SHORT NY CUD TU BINA RUKE",
+                        "SHORT NY CUD TU APNI MAKO LEKR",
+                        "TERY MAKE STH TERY BHEN VI CUDWA LE",
+                        "TERY MAKE STH TERY DIDI VI CUD GAI",
+                        "CHAT FYTER BNEGA RANDCE CODU TERY MAKO",
+                        "BOL RANDIBAAZ DADDY EY",
+                        "BULLYX RANDYKE UTH",
+                        "MAR MARKE CUD RHA TU",
+                        "OR TERY MA MARKE CUD GAI",
+                        "JALDI LIKH RNDYKE BEJ",
+                        "OR BDA LIKH TMC",
+                        "OR BDA 2 LINE WLA LIKH TMKC",
+                        "OR BDA OYE LIKH TML",
+                        "TERI MAA KA BUR",
+                        "OYE KEEDE",
+                        "RANDI KE LADKE",
+                        "JALDI LIKH TERI BEHEN CHODU",
+                        "MKL UTH RANDI KE BACCHE",
+                        "TERI NANI MERI MAAL",
+                        "TEJ LIKH RANDCE",
+                        "OYE MAAKE LODE MRENGA",
+                        "TERI MAA CHODY",
+                        "TERI MAIYA KI GAND",
+                        "TERY DADI KA FUDDA",
+                        "MKL UTH BEHENCOD",
+                        "TERI MAA KI BUR DE",
+                        "TERY MAA KA FUDDA ME LAUDA",
+                        "TERI MAA CHUDVA",
+                        "RANDI KE BETE MAR GAYA",
+                        "TERI MAA KI CHUT MRU",
+                        "JALID KR SPAM",
+                        "MC SPAM ROKENGA",
+                        "TERI MAAKI CHUT SPAM KR",
+                        "SPAM KR.MAAKE LODE",
+                        "RANDYKE CHODE SPAM KR WRNA CUD TU",
+                        "SPAM KR KID",
+                        "NOOB TERI MAA CHODU",
+                        "RNDYKE BETE MAR MAT TU",
+                        "NOOB JALDI LIKH WRNA TERY MAA RAND",
+                        "CUD GAI MAA TERY NOOB",
+                        "UTH RANDYKE NOOB",
+                        "CHL CUDKE DIKHA NOOB",
+                        "JLDI TYP CR NOOB HALKE",
+                        "CUD KE PGL NY HO NOOB",
+                        "CUD CUD KE RAND BNJA TU NOOB",
+                        "MAKICHUT TERY NOOB",
+                        "GANDA CYU CUD RHA TU ?",
+                        "ITNA GNDA NY CUD ACHE SE CUD",
+                        "MAAN LE CUD GYA TU SUN BAT AB",
+                        "MAKAFUDDA FAT GYA TERY RUK",
+                    "sʜᴀɴᴛ ʙᴇᴛʜ ᴍᴀᴅʀᴄʜᴏᴅ ᴡʀɴᴀ ᴍᴀᴋᴀʙᴏsᴅᴀ ᴛᴇᴇʏ.",
+                    "ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴄʜᴜᴛ..",
+                    "ʟᴡᴅᴇ ᴋᴇ ʙᴀᴀᴀʟʟʟ ᴛᴇʀʏ ᴍᴀᴀ ᴄᴜᴅᴋᴇ ᴘɢʟ ᴅᴇᴋʜ.",
+                    "ᴍᴀᴄʜᴀʀ ᴋɪ ᴊʜᴀᴀᴛ ᴋᴇ ʙᴀᴀᴀʟʟʟʟ ᴄᴜᴅ ᴀᴄʜᴇ sᴇ ʏʜᴀᴘᴇ ᴛᴜ",
+                    "ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴄʜᴜᴛ ᴍ ᴅᴜ ᴛᴀᴘᴀ ᴛᴀᴘ?",
+                    "ᴛᴇʀɪ ᴍᴀ ᴋᴀ ʙʜᴏꜱᴅᴀᴀ",
+                    "ᴛᴇʀɪ ʙʜɴ ꜱʙꜱʙᴇ ʙᴅɪ ʀᴀɴᴅɪ.",
+                    "ᴛᴇʀɪ ᴍᴀ ᴏꜱꜱᴇ ʙᴀᴅɪ ʀᴀɴᴅᴅᴅᴅᴅ",
+                    "ᴛᴇʀᴀ ʙᴀᴀᴘ ʀᴀɴᴅɪʙᴀᴀᴢ ᴇʏ ᴅᴇᴋʜ",
+                    "ᴋɪᴛɴɪ ᴄʜᴏᴅᴜ ᴛᴇʀɪ ᴍᴀ ᴀʙ ᴏʀ..",
+                    "ᴛᴇʀɪ ᴍᴀ ᴄʜᴏᴅ ᴅɪ ʜᴍ ɴᴇ",
+                    "ᴛᴇʀɪ ᴍᴀ ᴋᴇ ꜱᴛʜ ʀᴇᴇʟꜱ ʙɴᴇɢᴀ ʀᴏᴀᴅ ᴘᴇᴇ",
+                    "ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴄʜᴜᴛ ᴇᴋ ᴅᴀᴍ ᴛᴏᴘ ꜱᴇxʏ",
+                    "ᴍᴀʟᴜᴍ ɴᴀ ᴘʜʀ ᴋᴇꜱᴇ ʟᴇᴛᴀ ʜᴜ ᴍ ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴄʜᴜᴛ ᴛᴀᴘᴀ ᴛᴀᴘᴘᴘᴘᴘ",
+                    "ʟᴜɴᴅ ᴋᴇ ᴄʜᴏᴅᴇ ᴛᴜ ᴋᴇʀᴇɢᴀ ᴛʏᴘɪɴɢ ᴋʀᴇɢᴀ ᴛᴍᴋᴄ",
+                    "ꜱᴘᴇᴇᴅ ᴘᴋᴅ ʟᴡᴅᴇᴇᴇᴇ ᴡʀɴᴀ ᴍᴇʀᴀ ʟᴜɴᴅ ᴘᴋᴅ",
+                    "ʙᴀᴀᴘ ᴋɪ ꜱᴘᴇᴇᴅ ᴍᴛᴄʜ ᴋʀʀʀ",
+                    "ʟᴡᴅᴀ ʟᴇ ᴍᴇʀᴀ ᴊᴀʟᴅɪ sᴇ ᴛᴜ",
+                    "ᴘᴀᴘᴀ ᴋɪ ꜱᴘᴇᴇᴅ ᴍᴛᴄʜ ɴʜɪ ʜᴏ ʀʜɪ ᴋʏᴀ ᴛᴇʀᴇsᴇ",
+                    "ᴀʟᴇ ᴀʟᴇ ᴍᴇʟᴀ ʙᴄʜᴀᴀᴀᴀ ᴛᴇʀʏ ᴍᴀᴋᴀ ʙᴏsᴅᴀ sᴜɴ",
+                    "ᴄʜᴜᴅ ɢʏᴀ ʀᴀɴᴅɪʙᴀᴀᴢ ᴘᴀᴘᴀ ꜱᴇᴇᴇ ᴛᴜ",
+                    "ᴍᴇɴᴜ ᴋɪ ᴘᴛᴀ ᴛᴇʀʏ ᴍᴀ ᴄᴜᴅ ɢᴀɪ",
+                    "ᴋᴏɪ ʙᴀᴀᴛ ɴʏ ᴍᴀᴀ ʀᴀɴᴅʏ ᴛᴇʀʏ",
+                    "ʜᴀʜᴀʜᴀᴀᴀᴀᴀ ᴍᴀᴋᴀʙᴏsᴅᴀ ᴛᴇʀʏ",
+                    "xʜᴜᴅ ɢᴀɪ ᴍᴀᴀ ᴛᴇʀʏ ᴋɪᴅꜱꜱꜱꜱ",
+                    "ᴛᴇʀɪ ᴍᴀ ᴄʜᴜᴅ ɢʏɪ ᴀʙ ꜰʀᴀʀ ᴍᴛ ʜᴏɴᴀ",
+                    "ʏᴇ ʟᴜɴᴅ ʟᴇ ᴍᴇʀᴀ ᴄʜʟ ᴊᴀʟᴅɪ sᴇ",
+                    "ᴋɪᴅꜱꜱꜱ ꜰʀᴀʀ ɴᴀ ʜᴏ ᴛᴜ ʜᴀʜᴀʜʜ",
+                    "ʙʜᴇɴ ᴋᴇ ʟᴡᴅᴇ ꜱʜʀᴍ ᴋʀ",
+                    "ᴋɪᴛɴɪ ɢʟɪʏᴀ ᴘᴅᴡᴇɢᴀ ᴀᴘɴɪ ᴍᴀ ᴋᴏ",
+                    "ᴄʜᴜᴘ ɴᴀʟʟɪɪ ʀᴀɴᴅʏᴋᴇ ʟᴀᴅᴋᴇ",
+                    "ꜱᴜᴀʀ ᴋᴇ ᴘɪʟʟᴇ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ꜱᴀᴅᴀᴋ ᴘʀ ʟɪᴛᴀᴋᴇ ᴄʜᴏᴅ ᴅᴜɴɢᴀ 😂😆🤤",
+                    "ᴀʙᴇ ᴛᴇʀɪ ᴍᴀᴀᴋᴀ ʙʜᴏꜱᴅᴀ ᴍᴀᴅᴇʀᴄʜᴏᴏᴅ ᴋʀ ᴘɪʟʟᴇ ᴘᴀᴘᴀ ꜱᴇ ʟᴀᴅᴇɢᴀ ᴛᴜ 😼😂🤤",
+                    "ɢᴀʟɪ ɢᴀʟɪ ɴᴇ ꜱʜᴏʀ ʜᴇ ᴛᴇʀɪ ᴍᴀᴀ ʀᴀɴᴅɪ ᴄʜᴏʀ ʜᴇ 💋💋💦",
+                    "ᴀʙᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅᴜ ʀᴀɴᴅɪᴋᴇ ᴘɪʟʟᴇ ᴋᴜᴛᴛᴇ ᴋᴇ ᴄʜᴏᴅᴇ 😂👻🔥",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴀɪꜱᴇ ᴄʜᴏᴅᴀ ᴀɪꜱᴇ ᴄʜᴏᴅᴀ ᴛᴇʀɪ ᴍᴀᴀᴀ ʙᴇᴅ ᴘᴇʜɪ ᴍᴜᴛʜ ᴅɪᴀ 💦💦💦💦",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴇ ʙʜᴏꜱᴅᴇ ᴍᴇ ᴀᴀᴀɢ ʟᴀɢᴀᴅɪᴀ ᴍᴇʀᴀ ᴍᴏᴛᴀ ʟᴜɴᴅ ᴅᴀʟᴋᴇ 🔥🔥💦😆😆",
+                    "ʀᴀɴᴅɪᴋᴇ ʙᴀᴄʜʜᴇ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴏᴅᴜ ᴄʜᴀʟ ɴɪᴋᴀʟ",
+                    "ᴋɪᴛɴᴀ ᴄʜᴏᴅᴜ ᴛᴇʀɪ ʀᴀɴᴅɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴛʜ ᴀʙʙ ᴀᴘɴɪ ʙᴇʜᴇɴ ᴋᴏ ʙʜᴇᴊ 😆👻🤤",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏᴛᴏ ᴄʜᴏᴅ ᴄʜᴏᴅᴋᴇ ᴘᴜʀᴀ ꜰᴀᴀᴅ ᴅɪᴀ ᴄʜᴜᴛʜ ᴀʙʙ ᴛᴇʀɪ ɢꜰ ᴋᴏ ʙʜᴇᴊ 😆💦🤤",
+                    "ᴛᴇʀɪ ɢꜰ ᴋᴏ ᴇᴛɴᴀ ᴄʜᴏᴅᴀ ʙᴇʜᴇɴ ᴋᴇ ʟᴏᴅᴇ ᴛᴇʀɪ ɢꜰ ᴛᴏ ᴍᴇʀɪ ʀᴀɴᴅɪ ʙᴀɴɢᴀʏɪ ᴀʙʙ ᴄʜᴀʟ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴏᴅᴛᴀ ꜰɪʀꜱᴇ ♥️💦😆😆😆😆",
+                    "ʜᴀʀɪ ʜᴀʀɪ ɢʜᴀᴀꜱ ᴍᴇ ᴊʜᴏᴘᴅᴀ ᴛᴇʀɪ ᴍᴀᴀᴋᴀ ʙʜᴏꜱᴅᴀ 🤣🤣💋💦",
+                    "ᴄʜᴀʟ ᴛᴇʀᴇ ʙᴀᴀᴘ ᴋᴏ ʙʜᴇᴊ ᴛᴇʀᴀ ʙᴀꜱᴋᴀ ɴʜɪ ʜᴇ ᴘᴀᴘᴀ ꜱᴇ ʟᴀᴅᴇɢᴀ ᴛᴜ",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ʙᴏᴍʙ ᴅᴀʟᴋᴇ ᴜᴅᴀ ᴅᴜɴɢᴀ ᴍᴀᴀᴋᴇ ʟᴀᴡᴅᴇ",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴛʀᴀɪɴ ᴍᴇ ʟᴇᴊᴀᴋᴇ ᴛᴏᴘ ʙᴇᴅ ᴘᴇ ʟɪᴛᴀᴋᴇ ᴄʜᴏᴅ ᴅᴜɴɢᴀ ꜱᴜᴀʀ ᴋᴇ ᴘɪʟʟᴇ 🤣🤣💋💋",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴀᴋᴇ ɴᴜᴅᴇꜱ ɢᴏᴏɢʟᴇ ᴘᴇ ᴜᴘʟᴏᴀᴅ ᴋᴀʀᴅᴜɴɢᴀ ʙᴇʜᴇɴ ᴋᴇ ʟᴀᴇᴡᴅᴇ 👻🔥",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴀᴋᴇ ɴᴜᴅᴇꜱ ɢᴏᴏɢʟᴇ ᴘᴇ ᴜᴘʟᴏᴀᴅ ᴋᴀʀᴅᴜɴɢᴀ ʙᴇʜᴇɴ ᴋᴇ ʟᴀᴇᴡᴅᴇ 👻🔥",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅ ᴄʜᴏᴅᴋᴇ ᴠɪᴅᴇᴏ ʙᴀɴᴀᴋᴇ xɴxx ᴘᴇ ɴᴇᴇʟᴀᴍ ᴋᴀʀᴅᴜɴɢᴀ ᴋᴜᴛᴛᴇ ᴋᴇ ᴘɪʟʟᴇ 💦💋",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴀᴋɪ ᴄʜᴜᴅᴀɪ ᴋᴏ ᴘᴏ*ʀɴʜᴜʙ ᴘᴇ ᴜᴘʟᴏᴀᴅ ᴋᴀʀᴅᴜɴɢᴀ ꜱᴜᴀʀ ᴋᴇ ᴄʜᴏᴅᴇ 🤣💋💦",
+                    "ᴀʙᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅᴜ ʀᴀɴᴅɪᴋᴇ ʙᴀᴄʜʜᴇ ᴛᴇʀᴇᴋᴏ ᴄʜᴀᴋᴋᴏ ꜱᴇ ᴘɪʟᴡᴀᴠᴜɴɢᴀ ʀᴀɴᴅɪᴋᴇ ʙᴀᴄʜʜᴇ 🤣🤣",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴛʜ ꜰᴀᴀᴅᴋᴇ ʀᴀᴋᴅɪᴀ ᴍᴀᴀᴋᴇ ʟᴏᴅᴇ ᴊᴀᴀ ᴀʙʙ ꜱɪʟᴡᴀʟᴇ 👄👄",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ᴍᴇʀᴀ ʟᴜɴᴅ ᴋᴀᴀʟᴀ",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ʟᴇᴛɪ ᴍᴇʀɪ ʟᴜɴᴅ ʙᴀᴅᴇ ᴍᴀꜱᴛɪ ꜱᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴍᴇɴᴇ ᴄʜᴏᴅ ᴅᴀʟᴀ ʙᴏʜᴏᴛ ꜱᴀꜱᴛᴇ ꜱᴇ",
+                    "ʙᴇᴛᴇ ᴛᴜ ʙᴀᴀᴘ ꜱᴇ ʟᴇɢᴀ ᴘᴀɴɢᴀ ᴛᴇʀɪ ᴍᴀᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴅᴜɴɢᴀ ᴋᴀʀᴋᴇ ɴᴀɴɢᴀ 💦💋",
+                    "ʜᴀʜᴀʜᴀʜ ᴍᴇʀᴇ ʙᴇᴛᴇ ᴀɢʟɪ ʙᴀᴀʀ ᴀᴘɴɪ ᴍᴀᴀᴋᴏ ʟᴇᴋᴇ ᴀᴀʏᴀ ᴍᴀᴛʜ ᴋᴀᴛ ᴏʀ ᴍᴇʀᴇ ᴍᴏᴛᴇ ʟᴜɴᴅ ꜱᴇ ᴄʜᴜᴅᴡᴀʏᴀ ᴍᴀᴛʜ ᴋᴀʀ",
+                    "ᴄʜᴀʟ ʙᴇᴛᴀ ᴛᴜᴊʜᴇ ᴍᴀᴀꜰ ᴋɪᴀ 🤣ᴛᴜ ᴀʙʙ ᴀᴘɴɪ ᴍᴀᴋᴏ ʙʜᴇᴊ",
+                    "ꜱʜᴀʀᴀᴍ ᴋᴀʀ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴀ ʙʜᴏꜱᴅᴀ ᴋɪᴛɴᴀ ɢᴀᴀʟɪᴀ ꜱᴜɴᴡᴀʏᴇɢᴀ ᴀᴘɴɪ ᴍᴀᴀᴀ ʙᴇʜᴇɴ ᴋᴇ ᴜᴘᴇʀ",
+                    "ᴀʙᴇ ʀᴀɴᴅɪᴋᴇ ʙᴀᴄʜʜᴇ ᴀᴜᴋᴀᴛ ɴʜɪ ʜᴇᴛᴏ ᴀᴘɴɪ ʀᴀɴᴅɪ ᴍᴀᴀᴋᴏ ʟᴇᴋᴇ ᴀᴀʏᴀ ᴍᴀᴛʜ ᴋᴀʀ ʜᴀʜᴀʜᴀʜᴀ",
+                    "ᴋɪᴅᴢ ᴍᴀᴅᴀʀᴄʜᴏᴅ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴏᴅ ᴄʜᴏᴅᴋᴇ ᴛᴇʀʀ ʟɪʏᴇ ʙʜᴀɪ ᴅᴇᴅɪʏᴀ",
+                    "ᴊᴜɴɢʟᴇ ᴍᴇ ɴᴀᴄʜᴛᴀ ʜᴇ ᴍᴏʀᴇ ᴛᴇʀɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴅᴀɪ ᴅᴇᴋᴋᴇ ꜱᴀʙ ʙᴏʟᴛᴇ ᴏɴᴄᴇ ᴍᴏʀᴇ ᴏɴᴄᴇ ᴍᴏʀᴇ 🤣🤣💦💋",
+                    "ɢᴀʟɪ ɢᴀʟɪ ᴍᴇ ʀᴇʜᴛᴀ ʜᴇ ꜱᴀɴᴅ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴏᴅ ᴅᴀʟᴀ ᴏʀ ʙᴀɴᴀ ᴅɪᴀ ʀᴀɴᴅ 🤤🤣",
+                    "ꜱᴀʙ ʙᴏʟᴛᴇ ᴍᴜᴊʜᴋᴏ ᴘᴀᴘᴀ ᴄʏᴜᴋɪ ᴍᴇɴᴇ ᴋʀᴅɪᴀ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴘʀᴇɢɴᴇɴᴛ 🤣🤣",
+                    "ꜱᴜᴀʀ ᴋᴇ ᴘɪʟʟᴇ ᴛᴇʀɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ꜱᴜᴀʀ ᴋᴀ ʟᴏᴜᴅᴀ ᴏʀ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ᴍᴇʀᴀ ʟᴏᴅᴀ",
+                    "ᴄʜᴀʟ ᴄʜᴀʟ ᴛᴜ ᴀᴘɴɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴄʜɪʏᴀ ᴅɪᴋᴀ",
+                    "ʜᴀʜᴀʜᴀʜᴀ ʙᴀᴄʜʜᴇ ᴛᴇʀɪ ᴍᴀᴀᴀᴋᴏ ᴄʜᴏᴅ ᴅɪᴀ ɴᴀɴɢᴀ ᴋᴀʀᴋᴇ",
+                    "ᴛᴇʀɪ ɢꜰ ʜᴇ ʙᴀᴅɪ ꜱᴇxʏ ᴜꜱᴋᴏ ᴘɪʟᴀᴋᴇ ᴄʜᴏᴏᴅᴇɴɢᴇ ᴘᴇᴘꜱɪ",
+                    "2 ʀᴜᴘᴀʏ ᴋɪ ᴘᴇᴘꜱɪ ᴛᴇʀɪ ᴍᴜᴍᴍʏ ꜱᴀʙꜱᴇ ꜱᴇxʏ 💋💦",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴇᴇᴍꜱ ꜱᴇ ᴄʜᴜᴅᴡᴀᴠᴜɴɢᴀ ᴍᴀᴅᴇʀᴄʜᴏᴏᴅ ᴋᴇ ᴘɪʟʟᴇ 💦🤣",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ᴍᴜᴛʜᴋᴇ ꜰᴀʀᴀʀ ʜᴏᴊᴀᴠᴜɴɢᴀ ʜᴜɪ ʜᴜɪ ʜᴜɪ",
+                    "ꜱᴘᴇᴇᴅ ʟᴀᴀᴀ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴄʜᴏᴅᴜ ʀᴀɴᴅɪᴋᴇ ᴘɪʟʟᴇ 💋💦🤣",
+                    "ᴀʀᴇ ʀᴇ ᴍᴇʀᴇ ʙᴇᴛᴇ ᴄʏᴜ ꜱᴘᴇᴇᴅ ᴘᴀᴋᴀᴅ ɴᴀ ᴘᴀᴀᴀ ʀᴀʜᴀ ᴀᴘɴᴇ ʙᴀᴀᴘ ᴋᴀ ʜᴀʜᴀʜᴀ ᴛᴇʀɪ ᴍᴀᴀ ᴄᴜᴅ ɢᴀɪ🤣🤣",
+                    "ꜱᴜɴ ꜱᴜɴ ꜱᴜᴀʀ ᴋᴇ ᴘɪʟʟᴇ ᴊʜᴀɴᴛᴏ ᴋᴇ ꜱᴏᴜᴅᴀɢᴀʀ ᴀᴘɴɪ ᴍᴜᴍᴍʏ ᴋɪ ɴᴜᴅᴇꜱ ʙʜᴇᴊ",
+                    "ᴀʙᴇ ꜱᴜɴ ʟᴏᴅᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴀ ʙʜᴏꜱᴅᴀ ꜰᴀᴀᴅ ᴅᴜɴɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴋʜᴜʟᴇ ʙᴀᴊᴀʀ ᴍᴇ ᴄʜᴏᴅ ᴅᴀʟᴀ 🤣🤣💋",
+                    "ꜱʜʀᴍ ᴋʀ ᴛᴇʀʏ ᴍᴀᴀ ᴄᴜᴅ ɢᴀɪ ʏʜᴀ",
+                    "ᴍᴇʀᴇ ʟᴜɴᴅ ᴋᴇ ʙᴀᴀᴀᴀᴀʟʟʟʟʟ ᴘᴋᴅ ᴊᴀʟᴅɪ sᴇ",
+                    "ᴛᴜ ᴇᴋ ᴋᴀᴀᴍ ᴋʀ ᴀᴘɴɪ ᴍᴀ ʙʜᴇɴ ᴋᴏ ᴄᴜᴅᴡᴀ ʟᴇ ᴍᴇʀᴇ sᴛʜ",
+                    "ʀɴᴅɪ ᴋᴇ ʟᴅᴋᴇᴇᴇᴇᴇᴇᴇᴇᴇ ᴄʜᴜᴘ ᴏʀ ᴄᴜᴅ ʏʜᴀ",
+                    "ᴄʜᴜᴘ ᴛᴍᴋᴄ ᴋɪᴅꜱꜱꜱꜱꜱꜱꜱꜱꜱꜱꜱꜱ",
+                    "ᴀᴘɴɪ ɢᴀᴀɴᴅ ᴍᴇɪɴ ᴍᴜᴛʜɪ ᴅᴀᴀʟ",
+                    "ᴍᴇʀᴀ ʟᴜɴᴅ ᴄʜᴏᴏꜱ ᴊᴀʟᴅɪ sᴇ",
+                    "ᴀᴘɴɪ ᴍᴀ ᴋᴏ ᴄᴜsᴡᴀ ᴍᴇʀᴀ ʟᴜɴᴅ",
+                    "ʙʜᴇɴ ᴋᴇ ʟᴀᴜᴅᴇ ᴛᴍᴄ",
+                    "ʙʜᴇɴ ᴋᴇ ᴛᴀᴋᴋᴇ ᴛᴍʟ",
+                    "ᴀʙʟᴀ ᴛᴇʀᴀ ᴋʜᴀɴ ᴅᴀɴ ᴄʜᴏᴅɴᴇ ᴋɪ ʙᴀʀɪɪɪ",
+                    "ʙᴇᴛᴇ ᴛᴇʀɪ ᴍᴀ ꜱʙꜱᴇ ʙᴅɪ ʀᴀɴᴅ",
+                    "ʟᴜɴᴅ ᴋᴇ ʙᴀᴀᴀʟ ᴊʜᴀᴛ ᴋᴇ ᴘɪꜱꜱꜱᴜᴜᴜᴜᴜᴜᴜ ᴛᴍᴋᴄ",
+                    "ʟᴜɴᴅ ᴘᴇ ʟᴛᴋɪᴛ ᴍᴀᴀᴀʟʟʟʟ ᴋɪ ʙᴏɴᴅ ʜ ᴛᴜᴜᴜ",
+                    "ᴋᴀꜱʜ ᴏꜱ ᴅɪɴ ᴍᴜᴛʜ ᴍʀᴋᴇ ꜱᴏᴊᴛᴀ ᴍ ᴛᴜ ᴘᴀɪᴅᴀ ɴᴀ ʜᴏᴛᴀᴀ",
+                    "ɢʟᴛɪ ᴋʀᴅɪ ᴛᴜᴊᴡ ᴘᴀɪᴅᴀ ᴋʀᴋᴇ ᴛᴇʀʏ ᴍᴀ ɴᴇ ᴀʙ ᴄᴜᴅ ᴛᴜ ʏʜᴀ",
+                    "ꜱᴘᴇᴇᴅ ᴘᴋᴅᴅᴅ",
+                    "ɢᴀᴀɴᴅ ᴍᴀɪɴ ʟᴡᴅᴀ ᴅᴀʟ ʟᴇ ᴀᴘɴɪ ᴍᴇʀᴀᴀᴀ",
+                    "ɢᴀᴀɴᴅ ᴍᴇɪɴ ʙᴀᴍʙᴜ ᴅᴇᴅᴜɴɢᴀᴀᴀᴀᴀᴀ",
+                    "ɢᴀɴᴅ ꜰᴛɪ ᴋᴇ ʙᴀʟᴋᴋᴋ ᴛᴜ ᴄᴜᴅ ʏʜᴀ",
+                    "ɢᴏᴛᴇ ᴋɪᴛɴᴇ ʙʜɪ ʙᴀᴅᴇ ʜᴏ, ʟᴜɴᴅ ᴋᴇ ɴɪᴄʜᴇ ʜɪ ʀᴇʜᴛᴇ ʜᴀɪ",
+                    "ʜᴀᴢᴀᴀʀ ʟᴜɴᴅ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀɪɴ",
+                    "ᴊʜᴀᴀɴᴛ ᴋᴇ ᴘɪꜱꜱᴜ ᴛᴍᴋᴄ sᴜɴ",
+                    "ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴋᴀʟɪ ᴄʜᴜᴛ",
+                    "ᴋʜᴏᴛᴇʏ ᴋɪ ᴀᴜʟᴅᴀ ᴇʏ ᴛᴜ ʀᴀɴᴅʏᴋᴇ",
+                    "ᴋᴜᴛᴛᴇ ᴋᴀ ᴀᴡʟᴀᴛ ᴊᴀɪsᴀ ʟɢ ʀʜᴀ ᴛᴜ",
+                    "ᴋᴜᴛᴛᴇ ᴋɪ ᴊᴀᴛ ᴊᴀɪsᴀ ᴇʏ ᴛᴜ ",
+                    "ᴋᴜᴛᴛᴇ ᴋᴇ ᴛᴀᴛᴛᴀ ᴇʏ ᴛᴜ",
+                    "ᴛᴇᴛɪ ᴍᴀ ᴋɪ.ᴄʜᴜᴛ , ᴛᴇʀɪ ᴍᴀ ʀɴᴅɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪ",
+                    "ʟᴀᴠᴅᴇ ᴋᴇ ʙᴀʟ ᴘᴋᴅ ʟᴇ ᴍᴇʀᴇ",
+                    "ᴍᴜʜ ᴍᴇɪ ʟᴇʟᴇ ᴍᴇʀᴀ ʟᴜɴᴅ",
+                    "ʟᴜɴᴅ ᴋᴇ ᴘᴀꜱɪɴᴇ ᴄʜᴜᴘ ʙᴇᴛʜ ᴏʀ ᴄᴜᴅ",
+                    "ᴍᴇʀᴇ ʟᴡᴅᴇ ᴋᴇ ʙᴀᴀᴀᴀᴀʟʟʟ",
+                    "ʜᴀʜᴀʜᴀᴀᴀᴀᴀᴀ ᴛᴇʀʏ ᴍᴀᴀ ᴄᴜᴅ ɢᴀɪ",
+                    "ᴛᴜ ᴄʜᴜᴅ ɢʏᴀᴀᴀᴀᴀ",
+                    "ʀᴀɴᴅɪ ᴋʜᴀɴᴇ ᴋɪ ᴜʟᴀᴅᴅᴅ",
+                    "ꜱᴀᴅɪ ʜᴜɪ ɢᴀᴀɴᴅ",
+                    "ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀɪɴ ᴋᴜᴛᴇ ᴋᴀ ʟᴜɴᴅ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ",
+                    "ᴛᴇʀᴇ ɢᴀᴀɴᴅ ᴍᴇɪɴ ᴋᴇᴇᴅᴇ ᴘᴀᴅᴀʏ",
+                    "ɴʏ ɴʏ ᴛᴇʀʏ ᴍᴀᴀ ʀᴀɴᴅɪ",
+                    "ꜱᴜɴɴ ᴍᴀᴅᴇʀᴄʜᴏᴅ ᴛᴍʟ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ",
+                    "ʙᴇʜᴇɴ ᴋ ʟᴜɴᴅ ᴄʜᴜᴘᴄʜᴀᴘ ᴄᴜᴅ ʏʜᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ᴄʜᴜᴛ ᴋɪ ᴄʜᴛɴɪɪɪɪ",
+                    "ᴍᴇʀᴀ ʟᴀᴡᴅᴀ ʟᴇʟᴇ ᴛᴜ ᴀɢᴀʀ ᴄʜᴀɪʏᴇ ᴛᴏʜ",
+                    "ᴄʜᴜᴘ ɢᴀᴀɴᴅᴜ",
+                    "ᴄʜᴜᴘ ᴄʜᴜᴛɪʏᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴘᴇ ᴊᴄʙ ᴄʜᴀᴅʜᴀᴀ ᴅᴜɴɢᴀ",
+                    "ꜱᴀᴍᴊʜᴀᴀ ʟᴀᴡᴅᴇ",
+                    "ʏᴀ ᴅᴜ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴇ ᴛᴀᴘᴀᴀ ᴛᴀᴘ��",
+                    "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴍᴇʀᴀ ʀᴏᴢ ʟᴇᴛɪ ʜᴀɪ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴇ ꜱᴀᴀᴛʜ ᴍᴍꜱ ʙᴀɴᴀᴀ ᴄʜᴜᴋᴀ ʜᴜ���不�不",
+                    "ᴛᴜ ᴄʜᴜᴛɪʏᴀ ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀᴀɴ ᴄʜᴜᴛɪʏᴀ",
+                    "ᴀᴜʀ ᴋɪᴛɴᴀ ʙᴏʟᴜ ʙᴇʏ ᴍᴀɴɴ ʙʜᴀʀ ɢᴀʏᴀ ᴍᴇʀᴀ�不",
+                    "ᴛᴇʀɪɪɪɪɪɪ ᴍᴀᴀᴀᴀ ᴋɪ ᴄʜᴜᴛᴛᴛ ᴍᴇ ᴀʙᴄᴅ ʟɪᴋʜ ᴅᴜɴɢᴀ ᴍᴀᴀ ᴋᴇ ʟᴏᴅᴇ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ʟᴇᴋᴀʀ ᴍᴀɪ ꜰᴀʀᴀʀ",
+                    "ᴛᴇʀʏ ᴍᴀᴀ ʀᴀɴɪᴅɪɪɪ",
+                    "ᴄʜᴜᴘ ʙᴀᴄʜᴇᴇ ᴛᴍᴋᴄ",
+                    "ᴛᴇʀʏ ᴍᴀᴋᴏᴄʜᴏᴅᴜ",
+                    "ʀᴀɴᴅɪ ᴍᴀᴀ ᴛᴇʀʏ",
+                    "ᴛᴜ ʀᴀɴᴅɪ ᴋᴇ ᴘɪʟʟᴀ ᴇʏ",
+                    "ᴛᴇʀɪɪɪɪɪ ᴍᴀᴀᴀ ᴋᴏ ʙʜᴇᴊᴊᴊ",
+                    "ᴛᴇʀᴀᴀ ʙᴀᴀᴀᴀᴘ ʜᴜ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʜᴀᴀᴛ ᴅᴀᴀʟʟᴋᴇ ʙʜᴀᴀɢ ᴊᴀᴀɴᴜɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ꜱᴀʀᴀᴋ ᴘᴇ ʟᴇᴛᴀᴀ ᴅᴜɴɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ɢʙ ʀᴏᴀᴅ ᴘᴇ ʟᴇᴊᴀᴋᴇ ʙᴇᴄʜ ᴅᴜɴɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍÉ ᴋᴀᴀʟɪ ᴍɪᴛᴄʜ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ꜱᴀꜱᴛɪ ʀᴀɴᴅɪ ʜᴀɪ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴋᴀʙᴜᴛᴀʀ ᴅᴀᴀʟ ᴋᴇ ꜱᴏᴜᴘ ʙᴀɴᴀᴜɴɢᴀ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴀ ʀᴀɴᴅɪ ʜᴀɪ",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴅᴇᴛᴏʟ ᴅᴀᴀʟ ᴅᴜɴɢᴀ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀᴀᴀ ʙʜᴏꜱᴅᴀᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴀᴘᴛᴏᴘ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ʀᴀɴᴅɪ ʜᴀɪ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ʙɪꜱᴛᴀʀ ᴘᴇ ʟᴇᴛᴀᴀᴋᴇ ᴄʜᴏᴅᴜɴɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴀᴍᴇʀɪᴄᴀ ɢʜᴜᴍᴀᴀᴜɴɢᴀ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ɴᴀᴀʀɪʏᴀʟ ᴘʜᴏʀ ᴅᴜɴɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴇ ɢᴀɴᴅ ᴍᴇ ᴅᴇᴛᴏʟ ᴅᴀᴀʟ ᴅᴜɴɢᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀᴀ ᴋᴏ ʜᴏʀʟɪᴄᴋꜱ ᴘɪʟᴀᴜɴɢᴀ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ꜱᴀʀᴀᴋ ᴘᴇ ʟᴇᴛᴀᴀᴀ ᴅᴜɴɢᴀᴀᴀ",
+                    "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀᴀ ʙʜᴏꜱᴅᴀ",
+                    "ᴍᴇʀᴀᴀᴀ ʟᴜɴᴅ ᴘᴀᴋᴀᴅ ʟᴇ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                    "ᴄʜᴜᴘ ᴛᴇʀɪ ᴍᴀᴀ ᴀᴋᴀᴀ ʙʜᴏꜱᴅᴀᴀ",
+                    "ᴛᴇʀɪɪɪ ᴍᴀᴀ ᴄʜᴜꜰ ɢᴇʏɪɪ ᴋʏᴀᴀᴀ ʟᴀᴡᴅᴇᴇᴇ",
+                    "ᴛᴇʀɪɪɪ ᴍᴀᴀ ᴋᴀᴀ ʙᴊꜱᴏᴅᴀᴀᴀ",
+                    "ᴍᴀᴅᴀʀxʜᴏᴅᴅᴅ",
+                    "ᴛᴇʀɪᴜᴜɪ ᴍᴀᴀᴀ ᴋᴀᴀ ʙʜꜱᴏᴅᴀᴀᴀ",
+                    "ᴛᴇʀɪɪɪɪɪɪ ʙᴇʜᴇɴɴɴɴ ᴋᴏ ᴄʜᴏᴅᴅᴅᴜᴜᴜᴜ ᴍᴀᴅᴀʀxʜᴏᴅᴅᴅᴅ",
+                    "ᴛᴜ ɴɪᴋᴀʟ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                    "ᴄʜᴜᴘ ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜᴇ",
+                    "ᴛᴇʀᴀ ᴍᴀᴀ ᴍᴇʀɪ ᴊᴀᴀɴ ᴇʏ",
+                    "ᴛᴇʀɪ ꜱᴇxʏ ʙᴀʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴏᴘ"
+                    "👩🏿      👩🏻‍🦳        👵🏼         👱🏿‍♀️     \n👖      👖        👖         👖     \n\nतेरी बहन /तेरी माँ /तेरी दादि/ तेरीभुआ.\n\nसब की 𝐂hu𝐃𝐀i hogi",
+                        "तेरी माँ के（ ͜.人 ͜.）दबा दूंगा",
+                        "तेरी मा चुदी हुई थी\nचुदी हुई है\nऔर चुदी हुई रहेगी \n\n\"MARK MY WORD\" 😈",
+                        "𝐊ʏᴀ?\n𝐂ʏᴀ?\n𝐂ᴜᴀ?\n\n𝐌ᴛᴛ 𝐊ʀʀ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴛ 𝐏𝐞 𝐓ʜ𝐀ᴘᴘᴀᴅ 𝐌ᴀ𝐚ʀ 𝐃ᴜɴɢᴀ",
+                        "˚∧＿∧  　+        — ͟͞͞🥛\n(  •‿• )つ  — ͟͞͞ 🥛 \nSpecial attack tery mummy ke chuchiya ka dudu 🐱🎀",
+                        "Aaj Rakshabandhan Ke Avsar Pr तेरी मांँ मेरे लंड पर राखी Bandh Ke चुदेगी 😍🥰",
+                        "Sun दोस्त terko ye तीन चीजे कभी nahi भूलनी chaiye 😁👇🏻🤙🏿\n\n1 :- तेरी औकात\n2 :- तेरी बहन का फटा bhosda\n3 :- तेरी मां के भोसड़े में मेरा मूत",
+                        "Tery Maa Behen Ke Boshde Me Kya Maarun Jaldi Bata 😜🤙",
+                        "Tery Maa\nⓘ Verified Randy // 🦅🔥",
+                        "𝐒ᴀʏ 𝐑ᴀɴᴅɪʙᴀᴀᴢ 𝐃ᴀᴅᴅʏ 𓆩💗𓆪",
+                        "𝐖ᴏ ʙʜɪ ᴋʏᴀ ᴅɪɴ ᴛʜᴇ ᴊᴀʙ ᴛʀʏ ᴍᴀᴀ ᴍᴜᴊʜᴇ 𝐀ᴘɴᴀ 𝐂ʜᴜᴛ 𝐃ᴇᴛɪ ᴛʜɪ ʏᴀᴀʀ 💔🥀👌🏻",
+                        "𝐀ᴡᴀᴢ 𝐍ɪᴄʜᴇ 𝐆ᴜʟᴀᴀᴍ 🤢👇🏻",
+                        "𝐓ʀʏ 𝐌ᴀᴀ ɴᴇ 𝐂ʜᴜᴅɴᴇ 𝐌ᴀɪ ɢᴏʟᴅ 𝐌ᴇᴅᴀʟ 𝐉ᴇᴇᴛᴀ ᴇʏ 𝐃ᴏꜱᴛ 🤩👑",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐌ᴇʀᴀ 𝐋ᴜɴᴅ 🖕🏻😈",
+                        "𝐁ʜᴏꜱᴀᴅɪᴋᴇ 𝐀ᴘɴɪ 𝐁ᴇʜᴇɴ 𝐂ʜᴜᴅᴀ 🖕🏻😈",
+                        "𝐑ᴀɴᴅɪ ᴋᴇ 𝐁ᴀᴄᴄʜᴇ 𝐀ᴜᴋᴀᴛ 𝐌ᴇ 𝐑ᴇʜ 🖕🏻😈",
+                        "𝐌ᴀᴅᴀʀᴄʜᴏᴅ 𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 🖕🏻😈",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋᴀ 𝐁ʜᴏꜱᴅᴀ ᴋʜᴏʟ ᴅᴜɴɢᴀ 🔓😈",
+                        "𝐁ʜᴇɴᴄʜᴏᴅ ??ᴘɴɪ 𝐀ᴜᴋᴀᴛ 𝐌ᴇ 𝐑ᴇʜ 🤡💩",
+                        "𝐓𝐌𝐊𝐂 ᴘᴇ 𝐂ʜᴀᴘᴘᴀʟ 𝐌ᴀᴀʀᴜɴɢᴀ 👟💥",
+                        "𝐁ʜᴏꜱᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐊ʜᴀɴᴅᴀɴ ᴋɪ 𝐁𝐊𝐂 💀🖕🏻",
+                        "𝐑ᴀɴᴅɪ ᴋɪ 𝐀ᴜʟᴀᴅ ᴄʜᴜᴘ ʜᴏ ᴊᴀ 🔇😒",
+                        "𝐑ᴀɴᴅɪʙᴀᴀᴢ ka 𝐆ᴜʟᴀᴀᴍ ey ᴛᴜ ᴀʙ ᴛᴜ ʏʜᴀ ᴄᴜᴅᴋᴇ ᴅɪᴋʜᴀ ᴛᴇʀʏ ᴍᴀᴋᴏ ʟᴇᴋʀ 👑😎",
+                        "𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐌ɪʀᴄʜɪ 🌶️🖕🏻",
+                        "𝐌ᴀᴅᴀʀᴄʜᴏᴅ 𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐏ᴀɪʀ 🦶🏻😈",
+                        "𝐁ʜᴏꜱᴀᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋᴀ 𝐁ʜᴏꜱᴅᴀ 🗑️😏",
+                        "𝐑ᴀɴᴅɪ ᴋᴀ 𝐏ɪʟʟᴀ ʜᴀɪ ᴛᴜ 🐕💩",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋᴏ 𝐁ᴀᴢᴀᴀʀ 𝐌ᴇ 𝐂ʜᴏᴅᴜɴɢᴀ 🌃😈",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐆ᴀʀᴀᴍ 𝐓ᴇʟ 🌡️🖕🏻",
+                        "𝐌ᴀᴅᴀʀᴄʜᴏᴅ 𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴍᴇʀɪ 𝐑ᴀɴᴅɪ 💋👿",
+                        "𝐑ᴀɴᴅɪ ᴋᴇ 𝐁ᴀᴄᴄʜᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 🖕🏻😈",
+                        "𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋᴏ 𝐑ᴀᴀᴛ ʙʜᴀʀ 𝐂ʜᴏᴅᴜɴɢᴀ 🌙😈",
+                        "𝐑ᴀɴᴅɪ ᴋᴀ 𝐁ᴀᴄᴄʜᴀ ʜᴀɪ ᴛᴜ ꜱᴀᴀʟᴇ 🤡💀",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐌ᴇʀᴀ 𝐉ᴏᴏᴛᴀ 👞🖕🏻",
+                        "𝐑ᴀɴᴅɪʙᴀᴀᴢ 𝐃ᴀᴅᴅʏ ᴋᴀ 𝐆ᴜʟᴀᴀᴍ ʜᴀɪ ᴛᴜ 🥀😤",
+                        "ᴊɪꜱ ᴅɪɴ ᴛᴜ ᴘᴀɪᴅᴀ ʜᴜᴀ 𝐓ᴇʀɪ 𝐌ᴀᴀ ɴᴇ ꜱᴏᴄʜᴀ ᴛʜᴀ ᴋᴀꜱʜ ᴀʙᴏʀᴛ ᴋᴀʀ ᴅᴇᴛɪ 💀🥀",
+                        "𝐀ᴘɴɪ 𝐀ᴜᴋᴀᴛ ᴅᴇᴋʜ ᴋᴜᴛᴛᴇ 𝐓ᴇʀʏ 𝐌ᴀ 𝐂ᴜᴅ 𝐑ʜɪ🐕😂",
+                        "𝐓ᴇʀʏ 𝐌ᴀ 𝐂ᴜᴅ 𝐑ʜɪ 𝐆ᴀʟɪ ᴋᴀ 𝐊ᴜᴛᴛᴀ ʜᴀɪ ᴛᴜ 🐕🗑️",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ɴᴇ ᴍᴜᴊʜᴇ ᴅᴇᴋʜ ᴋᴇ ꜱᴏᴄʜᴀ ᴋᴀꜱʜ ʏᴇ ᴍᴇʀᴀ ʙᴇᴛᴀ ʜᴏᴛᴀ 🫦😏",
+                        "𝐂ʜᴜᴘ ᴋᴀʀ 𝐌ᴀᴅᴀʀᴄʜᴏᴅ ᴛᴇʀɪ ᴀᴜᴋᴀᴛ ɴᴀʜɪ ᴍᴇʀᴇ ꜱᴀᴀᴍɴᴇ ʙᴏʟɴᴇ ᴋɪ 🤐💀",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴅᴀɪ ᴍᴇ ᴊᴀʙ ᴍᴀɪ ᴛʜᴀ ᴛᴏ ᴛᴜ ᴘᴀɪᴅᴀ ʜᴜᴀ 💀😂",
+                        "𝐁ʜᴀɢ ʏᴀʜᴀɴ ꜱᴇ ᴋᴜᴛᴛᴇ ᴋᴇ ᴘɪʟʟᴇ 🐕💨",
+                        "𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋɪ ꜱᴀᴅɪ 𝐌ᴇ ᴍᴇʀᴀ ʟᴜɴᴅ 💍😈",
+                        "𝐌ᴀᴅᴀʀᴄʜᴏᴅ ᴀᴘɴɪ 𝐌ᴀᴀ ᴍᴀᴛ ᴄʜᴜᴅᴀ 🖕🏻👹",
+                        "𝐁ʜᴇɴᴄʜᴏᴅ 𝐓ᴇʀɪ 𝐊ʜᴀɴᴅᴀɴ ᴋɪ 𝐁𝐊𝐂 💀🖕🏻",
+                        "tery ma cudke pgl dekh..𝐁𝐊𝐂 🦴🐕",
+                        "𝐊ʏᴀ 𝐑ᴇ 𝐑ᴀɴᴅɪᴋᴇ 𝐂ᴏᴏʟ 𝐁ᴀɴᴇɢᴀ 𝐓ᴜ 𝐂ʜᴀʟ 𝐀ʙ 𝐂ʜᴜᴅ 𝐀ᴘɴᴇ 𝐁ᴀᴀᴘ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 𝐒ᴇ - 🦢💘",
+                        "tery 𝐌ᴀᴀ cudke 𝐌ᴀʀʀ  𝐆ᴀʏɪ 𝐘ᴀᴀʀ - 𝐉ᴀɪ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 ! 🌙",
+                        "acha beta 😂🔥👊🏻 ? coi na me toh HATER codunga tery mako 😹💔🔥😆👊🏻💥",
+                        "chudke bhaga kaise 😂💥🤣🤘🏻",
+                        "ne toh - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 ka lun muh me lelia tune or tery maa ne😂🙏🏻😂🙏🏻",
+                        "try maa सूर्य☀ nikalte hi pel du 😹🔥💔",
+                        "mkl lun te vaj 😂✊🏻💦",
+                        "𝗧ᴍᴋ𝗕 pe - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 ka hamla 😂⚔🔥💥",
+                        "𝐂ʜʟ 𝐇ᴀʀᴍᴢᴀᴅ𝐈 𝐊ᴇ लड़के 💛🤍🩵",
+                        "oi 𝐓ᴇʀɪ 𝐌‌ᴀᴀ गुलाम ₰🖤",
+                        "chl rndyce chud ke dikha 😂💥🤣🔥",
+                        "tery 𝐌ᴀᴀ or bhen 𝐌ᴀʀʀ  𝐆ᴀʏɪ naacho 💃🏻💃🏻🕺🏻🎶😂😆💞🔥 !",
+                        "tera baap bass - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 ey 😂🎀",
+                        "try maa hagte hue paad mari -#😹🔥🥀",
+                        "𝐓ᴇʀɪ 𝐌ᴜᴍᴍʏ 𝐂ʜᴏᴅ 𝐃ɪ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 𝐍ᴇ 𝐁ᴡᴀʜᴀʜᴀʜᴀ ⚜",
+                        "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                        "नहीं नहीं तेरी मां को 𝐒ɪʀғ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                        "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                        "𝑻𝒆𝒓?? 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                        "सोच तेरी बहन को - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 बाप का गुलाम चोद रहा 😎🔥",
+                        "Hello hello?? Oxygen aarahi है? रण्डी पुत्र 🧘🏻",
+                        "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 /~ 👑 बाप से सही chudi 🥵🔥",
+                        "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                        "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके MOAN करती है ! 🛐",
+                        "Tᴇʀɪ Mᴀᴀ Rᴀɴᴅɪ (🩷)—(❤️)—(🧡)—(💛)—(💚)—(🩵)—(💙)—(💜)—(🖤)—(🩶)—(🤍)—(🤎)—(🌸)—(✨)—(🌙)—(⭐)—(🦋)—(💎)—(👑)—(⚡)—(🔥)—(🌌)—(🎀)—(💫)—(🪽)—(🫧)—(🌸)—(💘)—(💓)—(💖)—(💕)—(💞)",
+                        "Teri make hath me chakku se hole karke lund daluga apna 🤢🤢",
+                        "Subha ho ya sham chudte rhena hai teri maaka kaam😂🔥😂🔥😂🔥",
+                        "𝐓ᴜ 𝐒ᴡɪᴘᴇ 𝐊ᴀʀᴛᴀ 𝐑ᴇʜ 𝐌ᴀɪ ᴄʜᴀʟᴀ 𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋᴇ 𝐒ᴀᴛʜ 𝐊ʜᴇʟɴᴇ 😭😭",
+                        "🍑\n🟨  😂\n🟨🟥🟥🟨\n     🟥🟥🟨\n     ⬛⬛ \n     ⬛⬛\nTery ma ki bund hi okhad li.",
+                        "𝘗𝘺𝘢𝘴 𝘭𝘢𝘨 𝘳𝘢𝘩𝘪 𝘵𝘦𝘳𝘪 𝘮𝘢𝘢 𝘬𝘰 𝘤𝘰𝘥 𝘬𝘦 𝘱𝘺𝘢𝘴 𝘣𝘶𝘫𝘩𝘢𝘶𝘯𝘨𝘢 🖕🏿😂🔥🙏🏿",
+                        "▶︎ •၊၊၊|။||။‌‌‌‌‌၊|• 0:60\n𝘋𝘦𝘬𝘩 𝘵𝘦𝘳𝘪 𝘣𝘦𝘩𝘦𝘯 ??𝘪 𝘤𝘩𝘪𝘬𝘩 😂😱🔥🙏🏿",
+                        "      ᴹᴱ:\n👆       🤬 ᴷᴬᴴᴬ ᴮᴴᴬᴳᵀᴵ ᴴᴬᴵ ᴿᴬᴺᴰᴵ\n  🐛💤👔🤳\n            ⛽  👢\n          ⚡👟\n       🎸    🌂\n      👢       👢     ᵀᴱᴿᴵ ᴹᴬᴬ:🏃‍♀‍➡️ᴹᵁᴶᴴᴱ ᴹᴬᵀ ᶜᴴᴼᴰᴼ",
+                        "🙌\n😛 ᴹᴱ:\n  |      👩 ᵀᴱᴿᴵ ᴹᴬᴬ:\n  |   8_/ 👐\n / \\  / \\\n  \"Take a look how i am chodunging your Mummy in ghodi pose 🗿\"",
+                        "../\\_/\\\n  ( • _ •)  \n  /    >🍆 \n\nʏᴇ ᴘᴀᴋᴀᴅᴏ ᴀᴘᴋɪ ᴍᴏᴍ ᴋᴏ ᴀᴘɴᴇ ᴄʜᴜᴛ ᴍᴇ ɢʜᴜssᴀ ɴᴇ ᴍᴇ ᴋᴀᴀᴍ ᴀʏᴇɴɢᴀ 🤗",
+                        "ㅤㅤ😎 ᴹᴱ:\n          |\\👐\n         / \\_\n━━━━━┓ ＼＼\n┓┓┓┓┓┃ᵀᴼᴴᴬᴿ ᴿᴬᴺᴰᴵ ᴹᴬᴬ:\n┓┓┓┓┓┃ ヽ😩ノ\n┓┓┓┓┓┃ 　 /　ᴼᴿᴵᴵ ᴬᴹᴹᴬ\n┓┓┓┓┓┃  ノ)　\n┓┓┓┓┓┃\n\nLE TERI MAA KO CHOD KAR FHEK DIA 🥸",
+                        "😎 ᴍᴀɪ:\nく|)へ\n   〉\n￣┗┓       ヾ😫ｼ ᴛᴇʀɪ ᴍᴀᴀ:\n         ┗┓   ヘ/    \n             ┗┓ノ\n                 ┗┓       ヾ😨ｼ ᴛᴇʀᴀ ʙᴀᴀᴘ:\n                      ┗┓   ヘ/\n                          ┗┓ノ\n                               ┗┓       ヾ😩ｼ ᴛᴇʀᴀ ᴄʜᴀᴄʜᴀ:\n                                   ┗┓   ヘ/    \n                                       ┗┓ノ\nᴅᴇᴋʜ ᴀɪsᴇ ʜɪ ʟᴀᴀᴛ ᴍᴀᴀʀ ᴋᴀʀ ʙʜᴀɢᴀᴜɴɢᴀ ᴛᴇʀᴇ ᴋʜᴀᴀɴᴅᴀɴ ᴋᴏ 🤫🤣",
+                        "╭👇 ͡ ͡° ͜   ͡ ͡°)╭👇 \n      \\   .   .\\\n        \\        \\\n         \\╰[ ]╯\\ \n          /   U   \\\n       👟       👟\n\nᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇʀᴀ ʟᴜɴᴅ ᴍᴜʙᴀʀᴀᴋ ʜᴏ 😝",
+                        "Once a man said: \n\"You deserve all the chudayi and teri maa ki chutt dhulayi, and this text proves it! You should be proud!\" 🕊️",
+                        "😏 ᴍᴀɪ:\n    | 👐💵\n    |//    💵\n    |          💸 ᴛᴇʀɪ ʀᴀɴᴅʏ ᴍᴀᴀ:\n   /\\            👯👯\n👟👟\n\nDᴇᴋʜ Kᴇsᴇ Tᴇʀɪ Mᴀᴀ Kᴏ Aᴘɴᴇ Pᴀɪsᴏ Sᴇ Rᴀɴᴅɪ Nᴀᴄʜ Kᴀʀᴡᴀ Rʜᴀ Hᴜ 🤙😎",
+                        "Loading your maa ki chudai video 😳\n\n■■■■■■■■□\n99%",
+                        "Sun दोस्त terko ye तीन चीजे कभी nahi भूलनी chaiye  😁👇🏻🤙🏿\n\n1 :- तेरी औकात\n2 :- तेरी बहन का फटा bhosda\n3 :- तेरी मां के भोसड़े में मेरा मूत",
+                        "this message could't be display because teri maa randy ey",
+            ]
+
+
+            fun_texts = [
+                "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
+                "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
+                "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
+                "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
+                "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
+                "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
+                "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
+                "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
+                "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
+                "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
+                "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
+                "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
+                "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
+                "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
+                "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
+                "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
+                "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
+                "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭"
+            ]
+
+            flag_texts = [
+                "🇮🇳 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ɴᴅɪᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇳",
+                "🇯🇵 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐉ᴀᴘᴀɴ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇯🇵",
+                "🇺🇸 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐒𝐀 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇺🇸",
+                "🇬🇧 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐊 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇬🇧",
+                "🇰🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐊ᴏʀᴇᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇰🇷",
+                "🇩🇪 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐆ᴇʀᴍᴀɴʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇩🇪",
+                "🇫🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐅ʀᴀɴᴄᴇ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇫🇷",
+                "🇮🇹 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ᴛᴀʟʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇹",
+                "🇧🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐁ʀᴀᴢɪʟ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇧🇷",
+                "🇨🇦 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐂ᴀɴᴀᴅᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇨🇦",
+            ]
+
+            heart_replies = [
+                "𓂃˖˳·˖ ִֶָ ⋆❤️͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚❤️ ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆🧡͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚🧡 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆💛͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💛 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆💚͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💚 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆💙͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💙 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆💜͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💜 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆🖤͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚🖤 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆🤍͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚🤍 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆🤎͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚🤎 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆💖͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💖 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆💗͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💗 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆💓͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💓 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆💞͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💞 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆💕͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💕 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆💘͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💘 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆💝͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💝 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆💟͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💟 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆❣️͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚❣️ ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆❤️‍🔥͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚❤️‍🔥 ݁˖⭑.ᐟ",
+                "𓂃˖˳·˖ ִֶָ ⋆❤️‍🩹͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚❤️‍🩹 ݁˖⭑.ᐟ",
+            ]
+
+            # ─── DEATHGOD REPLIES ────────────────────────────────────────────────────
+            deathgod_replies = [
+                    "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                            "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                            "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                            "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                            "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
+                            "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
+                            "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
+                            "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SHAMBHOG करती है ! 🛐",
+                            "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                            "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                            "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                            "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                            "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
+                            "Hello hello?? saas aarahi है? रण्डी पुत्र 🧘🏻",
+                            "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
+                            "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐",
+                            "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                            "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                            "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                            "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                            "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
+                            "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
+                            "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
+                            "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐",
+                            "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                            "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                            "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                            "𝑻𝒆𝒓𝒚 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                            "सोच तेरी बहन को  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप का गुलाम चोद रहा 😎🔥",
+                            "Hello hello?? SAAS aarahi है? रण्डी पुत्र 🧘🏻",
+                            "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  /\\~ 👑 बाप से सही chudi 🥵🔥",
+                            "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝙃𝙄𝙎 𝙈𝙊𝙈 𝙋𝙍𝙊𝙋𝙀𝙍𝙇𝙔",
+                            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘼𝙎𝙆 𝙃𝙄𝙈 𝙏𝙊 𝘾𝙊𝙑𝙀𝙍 𝙃𝙄𝙎 𝙈𝙊𝙈'𝙎 𝘼𝙎𝙎",
+                            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙄𝙓 𝙈𝙔 𝘼‌𝙋𝙋𝙊𝙄𝙉𝙏𝙈𝙀𝙉𝙏 𝙒𝙄𝙏𝙃 𝙃𝙄𝙎 𝙎𝙄𝙎",
+                            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝙁𝙐𝘾𝙆 𝘼𝙉𝘿 𝙏𝙃𝙍𝙊𝙒 𝙏𝙃𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽 𝙎𝙊𝙉",
+                            "𝙃𝙀𝙔 𝙂𝙊𝙊𝙂𝙇𝙀 𝘿𝙊 𝙉𝙊𝙏 𝙎𝙏𝙊𝙋 𝙁𝙐𝘾𝙆𝙄𝙉𝙂 𝙈𝙔 𝙂𝙐𝙇𝘼‌𝙈",
+                            "𝙂𝙀𝙈𝙄𝙉𝙄 𝙎𝘼𝙄𝘿  𝙄𝙎 𝙍𝙉𝘿𝙔 𝙋𝙐𝙏𝙍𝘼",
+                            "𝙋𝙀𝙍𝙋𝙇𝙀𝙓𝙄𝙏𝙔 𝙎𝘼𝙄𝘿 This 𝙄𝙎 𝙂𝙐𝙇𝘼𝙈",
+                            "𝙂𝙍𝙊𝙆 𝘼𝙄 𝙎𝘼𝙄𝘿 𝙄𝙎 𝙂𝘼𝙍𝙀𝙀𝘽",
+                            "𝘽𝙊𝙏 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝘾𝙃𝙐𝘿𝘼𝙆𝘼𝘿",
+                            "𝙈𝙊𝘿𝙄 𝙎𝘼‌𝙄𝘿  𝙄𝙎 𝙋𝙊𝙇𝙀 𝘿𝘼𝙉𝘾𝙀𝙍",
+                            "𝙏𝙍𝙐𝙈𝙋 𝙎𝘼𝙄𝘿 THis 𝙄𝙎 𝘽𝙇𝙊𝙊𝘿Y 𝙈𝙊𝙏𝙃𝙀𝙍𝙁*\"𝘾𝙆𝙀𝙍",
+                            "𝗧𝗢𝗛𝗔𝗥 𝗠𝗨𝗠𝗠𝗬 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜 𝗣𝗨𝗥𝗜 𝗞𝗜𝗡𝗚𝗙𝗜𝗦𝗛𝗘𝗥 𝗞𝗜 𝗕𝗢𝗧𝗧𝗟𝗘 𝗗𝗔𝗟 𝗞𝗘 𝗧𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗔𝗡𝗗𝗘𝗥 𝗛𝗜 😱😂🤩",
+                            "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄 ✋ 𝐇𝐀𝐓𝐓𝐇 𝐃𝐀𝐋𝐊𝐄 👶 𝐁𝐀𝐂𝐂𝐇𝐄 𝐍𝐈𝐊𝐀𝐋 𝐃𝐔𝐍𝐆𝐀 😍",
+                            "𝐓𝐄𝐑𝐀 𝐏𝐄𝐇𝐋𝐀 𝐁𝐀𝐀𝐏 𝐇𝐔 𝐌𝐀𝐃𝐀𝐑𝐂𝐇𝐎𝐃",
+                            "𝗧𝗘𝗥𝗜 𝗠𝗨𝗠𝗠𝗬 𝗞𝗘 𝗦𝗔𝗔𝗧𝗛 𝗟𝗨𝗗𝗼 𝗞𝗛𝗘𝗟𝗧𝗘 𝗞𝗛𝗘𝗟𝗧𝗘 𝗨𝗦𝗞𝗘 𝗠𝗨𝗛 𝗠𝗘 𝗔𝗣𝗡𝗔 𝗟𝗢𝗗𝗔 𝗗𝗘 𝗗𝗨𝗡𝗚𝗔☝🏻☝🏻😬",
+                            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗦𝗨𝗧𝗟𝗜 𝗕𝗢𝗠𝗕 𝗙𝗢𝗗 𝗗𝗨𝗡𝗚𝗔 𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗝𝗛𝗔𝗔𝗧𝗘 𝗝𝗔𝗟 𝗞𝗘 𝗞𝗛𝗔𝗔𝗞 𝗛𝗢 𝗝𝗔𝗬𝗘𝗚𝗜💣🔥",
+                            "𝐓𝐄𝐑𝐈 𝐕𝐀𝐇𝐄𝐈𝐍 𝐊𝐎 𝐀𝐏𝐍𝐄 𝐋𝐔𝐍𝐃 𝐏𝐑 𝐈𝐓𝐍𝐀 𝐉𝐇𝐔𝐋𝐀𝐀𝐔𝐍𝐆𝐀 𝐊𝐈 𝐉𝐇𝐔𝐋𝐓𝐄 𝐉𝐇𝐔𝐋𝐓𝐄 𝐇𝐈 𝐁𝐀𝐂𝐇𝐀 𝐏𝐀𝐈𝐃𝐀 𝐊𝐑 𝐃𝐄𝐆𝐈 💦💋",
+                            "𝐆𝐀𝐋𝐈 𝐆𝐀𝐋𝐈 𝐌𝐄 𝐑𝐄𝐇𝐓𝐀 𝐇𝐄 𝐒𝐀𝐍𝐃 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐂𝐇𝐎𝐃 𝐃𝐀𝐋𝐀 𝐎𝐑 𝐁𝐀𝐍𝐀 𝐃𝐈𝐀 𝐑𝐀𝐍𝐃 🤤🤣",
+                            "𝐒𝐀𝐁 𝐁𝐎𝐋𝐓𝐄 𝐌𝐔𝐉𝐇𝐊𝐎 𝐏𝐀𝐏𝐀 𝐊𝐘𝐎𝐔𝐍𝐊𝐈 𝐌𝐄𝐍𝐄 𝐁𝐀𝐍𝐀𝐃𝐈𝐀 𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐊𝐎 𝐏𝐑𝐄𝐆𝐍𝐄𝐍𝐓 🤣🤣",
+                            "𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙇𝙀𝙏𝙄 𝙈𝙀𝙍𝙄 𝙇𝙐𝙉𝘿 𝘽𝘼𝘿𝙀 𝙈𝘼𝙎𝙏𝙄 𝙎𝙀 𝙏𝙀𝙍𝙄 𝘽𝙀𝙃𝙀𝙉 𝙆𝙊 𝙈𝙀𝙉𝙀 𝘾𝙃𝙊𝘿 𝘿𝘼𝙇𝘼 𝘽𝙊𝙃𝙊𝙏 𝙎𝘼𝙎𝙏𝙀 𝙎𝙀",
+                            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗠𝗘 𝗖𝗛𝗔𝗡𝗚𝗘𝗦 𝗖𝗢𝗠𝗠𝗜𝗧 𝗞𝗥𝗨𝗚𝗔 𝗙𝗜𝗥 𝗧𝗘𝗥𝗜 𝗕𝗛𝗘𝗘𝗡 𝗞𝗜 𝗖𝗛𝗨𝗨‌𝗧 𝗔𝗨𝗧𝗢𝗠𝗔𝗧𝗜𝗖𝗔𝗟𝗟𝗬 𝗨𝗣𝗗𝗔𝗧𝗘 𝗛𝗢𝗝𝗔𝗔𝗬𝗘𝗚𝗜🤖🙏🤔",
+                            "𝐓𝐄𝐑𝐈 𝐌𝐀𝐀𝐀𝐊𝐈 𝐂𝐇𝐔𝐃𝐀𝐈 𝐊𝐎 𝐏𝐎𝐑𝐍𝐇𝐔𝐁.𝐂𝐎𝐌 𝐏𝐄 𝐔𝐏𝐋𝐎𝐀𝐃 𝐊𝐀𝐑𝐃𝐔𝐍𝐆𝐀 𝐒𝐔𝐀𝐑 𝐊𝐄 𝐂𝐇𝐎𝐃𝐄 🤣💋💦",
+                            "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐆𝐀𝐀𝐍𝐃 𝐌𝐄𝐈 𝐎𝐍𝐄𝐏𝐋𝐔𝐒 𝐊𝐀 𝐖𝐑𝐀𝐏 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 𝟑𝟎𝐖 𝐇𝐈𝐆𝐇 𝐏𝐎𝐖𝐄𝐑 💥😂😎",
+                            "𝐓𝐔𝐉𝐇𝐄 𝐀𝐁 𝐓𝐀𝐊 𝐍𝐀𝐇𝐈 𝐒𝐌𝐉𝐇 𝐀𝐘𝐀 𝐊𝐈 𝐌𝐀𝐈 𝐇𝐈 𝐇𝐔 𝐓𝐔𝐉𝐇𝐄 𝐏𝐀𝐈𝐃𝐀 𝐊𝐀𝐑𝐍𝐄 𝐖𝐀𝐋𝐀 𝐁𝐇𝐎𝐒𝐃𝐈𝐊𝐄𝐄 𝐀𝐏𝐍𝐈 𝐌𝐀𝐀 𝐒𝐄 𝐏𝐔𝐂𝐇 𝐑𝐀𝐍𝐃𝐈 𝐊𝐄 𝐁𝐀𝐂𝐇𝐄𝐄𝐄𝐄 🤩👊👤😍",
+                            "𝐓𝐄𝐑𝐈 𝐁𝐀𝐇𝐄𝐍 𝐊𝐈 𝐂𝐇𝐔𝐓 𝐌𝐄𝐈 𝐀𝐏𝐏𝐋𝐄 𝐊𝐀 𝟏𝟖𝐖 𝐖𝐀𝐋𝐀 𝐂𝐇𝐀𝐑𝐆𝐄𝐑 🔥🤩",
+                            "𝗧𝗘𝗥𝗜 𝗠𝗔‌𝗔‌ 𝗞𝗢 𝗜𝗧𝗡𝗔 𝗖𝗛𝗢𝗗𝗨𝗡𝗚𝗔 𝗞𝗜 𝗦𝗔𝗣𝗡𝗘 𝗠𝗘𝗜 𝗕𝗛𝗜 𝗠𝗘𝗥𝗜 𝗖𝗛𝗨𝗗𝗔𝗜 𝗬𝗔𝗔𝗗 𝗞𝗔𝗥𝗘𝗚𝗜 𝗥Æ𝗡𝗗𝗜 🥳😍👊💥",
+                            "𝙋𝘼𝙋𝘼 𝙆𝙄 𝙎𝙋𝙀𝙀𝘿 𝙈𝙏𝘾𝙃 𝙉𝙃𝙄 𝙃𝙊 𝙍𝙃𝙄 𝙆𝙔𝘼",
+                            "𝙆𝙄𝙏𝙉𝙄 𝘾𝙃𝙊𝘿𝙐 𝙏𝙀𝙍𝙄 𝙈𝘼 𝘼𝘽 𝙊𝙍..",
+                            "𝗧𝗘𝗥𝗜 𝗠𝗔𝗨𝗦𝗜 𝗞𝗘 𝗕𝗛𝗢𝗦𝗗𝗘 𝗠𝗘𝗜 𝗜𝗡𝗗𝗜𝗔𝗡 𝗥𝗔𝗜𝗟𝗪𝗔𝗬 🚂💥😂",
+                            "𝙆𝙄𝙏𝙉𝙄 𝙂𝙇𝙄𝙔𝘼 𝙋𝘿𝙒𝙀𝙂𝘼 𝘼𝙋𝙉𝙄 𝙈𝘼 𝙆𝙊",
+                            "𝗧𝗘𝗥𝗜 𝗜𝗧𝗘𝗠 𝗞𝗜 𝗚𝗔𝗔𝗡𝗗 𝗠𝗘 𝗟𝗨𝗡𝗗 𝗗𝗔𝗔𝗟𝗞𝗘,𝗧𝗘𝗥𝗘 𝗝𝗔𝗜𝗦𝗔 𝗘𝗞 𝗢𝗥 𝗡𝗜𝗞𝗔𝗔𝗟 𝗗𝗨𝗡𝗚𝗔 𝗠𝗔‌𝗔‌𝗗𝗔𝗥𝗖𝗛Ø𝗗🤘🏻🙌🏻☠️",
+                            "2 𝙍𝙐𝙋𝘼𝙔 𝙆𝙄 𝙋𝙀𝙋𝙎𝙄 𝙏𝙀𝙍𝙄 𝙈𝙐𝙈𝙈𝙔 𝙎𝘼𝘽𝙎𝙀 𝙎𝙀𝙓𝙔 💋💦",
+                            "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐"
+                            "Baap bhi bnale muje rndike",
+                            "Tera baap randibaaz ey yaad ey tujhe",
+                            "Tu apni Maa cuda na tympass",
+                            "Oye unfunny swipe mtt kr",
+                            "Oh hello bihari tera baap bihari or tu v bihari aaukat me rha kr.",
+                            "Oyy kinner tujhe gc me aane ki permission kisne di.",
+                            "Cudke dikha",
+                            "Cudke dikha ek baar.",
+                            "Sun sun ma cuda.",
+                            "Teri maca bhosda.",
+                            "Oye choti jati ke tmr.",
+                            "Ky? jldi likh kidde.",
+                            "Bihari com gang ke baap ko tag crega tu",
+                            "Mujhe cya tu bihari ey tmkc bs",
+                            "Jaldi se randibaaz papa bol",
+                            "Side hoja bihari tery maa cud gai ab",
+                            "Hye pgl bhg mat ache se cud",
+                            "bhg ny randyke tu ajj",
+                            "Hye pgl ke bche bhag mat",
+                            "Hye dur hatt madchod ke bache",
+                            "koi bat ny tery maa randy ey esliye maf cr rha hu tujhe",
+                            "koi baat ny maa chudwa apni tu mafi de dunga",
+                            "Ache se maa chudwa apni tu mafi mil jayegi tujhe",
+                            "apni ma mat chuda muje swipe crke",
+                            "Ache se apni ma cudwa tu swipe crke",
+                            "Fr bolna na ki cudwa le apni ma swipe crke",
+                            "Cya hua ma cud gyi tery",
+                            "pr kese cud gyi tery ma",
+                            "mujhe pta tha ma cud gai tery",
+                            "mey ny manta ma cud gyi tery",
+                            "teri ma rndy",
+                            "lode se utr mc",
+                            "lun mt chus mera",
+                            "nikal madarchd",
+                            "chup oye gashti k bache",
+                            "makichut teri",
+                            "chup rndyke",
+                            "ma rndy teri",
+                            "teri ma k hath todh k tere baap k muh me fasadunga randyke",
+                            "leave le tu rndyke pasand nai aya meko",
+                            "leave le tu randyke ider se",
+                            "Leave le jldi se wrna ma chud gai tery",
+                            "Leave ny lega maa randy tery",
+                            "Smjh bat maa randy ey tery leave le",
+                            "fast leave le kamjor randyke",
+                            "tuto chup rndyk",
+                            "oy hijde khana kha ke aa kamzor",
+                            "teri mako ily rey🌚😂",
+                            "chup chap chud tmkc",
+                            "chupchap maa chudwa apni tu",
+                            "shi se maa chudwa apni tu chupchap",
+                            "fr se maa chudwa tu apni chupchap",
+                            "shi se likh wrna ma chud gai tery",
+                            "ma cyu chud gai tery chupchap",
+                            "proof cr maa chud gyi tery",
+                            "proof ey tery maa randy ey",
+                            "proof ho chuka maa randy tery",
+                            "Chup chillar",
+                            "chup chup maa k bosda tery",
+                            "oy hijde khana kha ke aa kamzor",
+                            "chup madarchod ?",
+                            "Ab tk cud gyi hogi tery maa ?",
+                            "ny ny me kuch ny janta bs teri ma rndy ey",
+                            "Sbse phele apni maa ko bol chudna kaam kre",
+                            "Yaha bhi chuda tu rndyce pille",
+                            "terimakabosda",
+                            "teri to bhen cudegi",
+                            "chup rndyke tommy",
+                            "nikal madarchd cudke yha se",
+                            "coz teri ma andhi randi he",
+                            "nyto baap bol mujhe",
+                            "nyny teri maa hogi rndii jo chudwati jogi",
+                            "try ammi ce bhosde me emoji dal mc",
+                            "cya ? chmr chud gya cya ?",
+                            "tm chudri hogi frrto",
+                            "cya ? kb ? pgl ey cya rndkek",
+                            "cya sch mey pgl ey cya tu randyke cudwa li tune apni ma",
+                            "itna sch ny bol ma chud gai tery",
+                            "sch mey pgl ey tu apni ma cudwa lia mere sth",
+                            "mtlb tmr",
+                            "nyto",
+                            "pura likh mc",
+                            "tmr frrto",
+                            "oh ok cudle fir",
+                            "teri maa ka damad",
+                            "cya ? ache se likhe pehle rndikebache",
+                            "nyto teri maa chodne me vyast hu",
+                            "nyto pgl ey cya kuch bi",
+                            "oyee cya ? chud gya ?",
+                            "chud mt hss",
+                            "yur rndii mom",
+                            "are sbki maa rndii or teri bi",
+                            "are idar cudle ek baar",
+                            "tri maa ci trh",
+                            "ek line me tmr",
+                            "Q",
+                            "ocy ab chudle",
+                            "pehele teri maa chodu",
+                            "nyto",
+                            "q ?",
+                            "hyyy chud ke dika ek baar",
+                            "oyee sun dost tmr",
+                            "bhag ja raand maaf crr dunga",
+                            "oyee pgl rndii idar aa",
+                            "cya tmr frrto",
+                            "oyee idar aake chud le chmr",
+                            "nyto aese hi cud",
+                            "oyee hyy aise hi cud lena",
+                            "or chud le",
+                            "chud ke dika or",
+                            "hyy chudo na",
+                            "chudo mt bhag jao",
+                            "byyee hyy cya ?",
+                            "Qchud q rhe ho ?",
+                            "pgl ey cya mc",
+                            "chud mt",
+                            "cya pgl rndii idar aa",
+                            "teri ammi ce bhosde me chappal",
+                            "oyee idar aa mc",
+                            "kmzror ey cya rndiek",
+                            "cya likh rha ?",
+                            "chud tha cya ?",
+                            "oyee slide leke baat crmc",
+                            "idar a teri maa chodu",
+                            "oyee cp mt crr chudle",
+                            "oyee hyy chud ke dika",
+                            "idar aa try ma schofu khachar khachar",
+                            "idar aa ja mc",
+                            "hyy idar aake chudle",
+                            "oyee kmzor mc idar aa",
+                            "ye cya tmr",
+                            "oyee ny cp ny crr",
+                            "oyee pgl mt crr",
+                            "cudle aram se mc",
+                            "pgl ey cya rndiek",
+                            "cp crce chudega !",
+                            "baap ? mc mera coi ma baap ny ey mai upar se rocket pe beth ce bss teri ma chodne aya hu",
+                            "Chota likh rndi k bache",
+                            "Chota likha wrna try ma rndy",
+                            "Try ma baka codega",
+                            "Tmkc main burf",
+                            "Bhikari ki jhat ma cuda le",
+                            "Chodke tery ma marjayegi",
+                            "Tmkc main Mount Everest",
+                            "Muh mey lega lund mera",
+                            "Hijde ki jhat chup wrna try ma rndi",
+                            "Menu ny pta tery ma randy",
+                            "Menu ki pta ma randy tery",
+                            "Menu pta maa cud gai tery",
+                            "Menu sb pta ma randy ey tery",
+                            "Menu pr tery ma randy",
+                            "Randy maa tery menu pta",
+                            "Tenu or menu pta ey maa randy tery",
+                            "Bs bs maa cudwa apni",
+                            "Bs bs ma randy tery thnkss",
+                            "Bs bs chudwa lia tu apni maa",
+                            "Bs bs kamjor maa randy tery",
+                            "Smjh gya apni ma cudwa le ab",
+                            "smjh gya tery maa randy ey",
+                            "smjh gya tu sabit kr maa randy tery",
+                            "Cya hua ma cudwa tu apni",
+                            "Easy maa cudwa le apni tu",
+                            "Easy w8 ma chudwa le apni ab",
+                            "Sans ari ha ky teri maa chudgi ajj",
+                            "Teri maa ko bina sanss lete hue chodunga",
+                            "chup randike kamjor",
+                            "apni ma normie cudwa le tu",
+                            "fr cya normie ma cud gai tery",
+                            "bas thek tery ma randy",
+                            "bas thek tery maa cud gyi",
+                            "kamjor thi tery ma esliye cud gai",
+                            "Mai sb janta ma cud gai tery",
+                            "chl chl ht tery maa cud gyi",
+                            "fr kaise cud gyi maa tery",
+                            "maa tery randy ey",
+                            "bas tery maa randy ey",
+                            "fr randy ma tery ey",
+                            "Kamjor ma ka bcha tu randyke",
+                            "bhot gndi cud gai maa tery",
+                            "pr kaise maa cud gai tery itna gnda",
+                            "mujhe cya bta rha maa randy tery",
+                            "mujhe cya pta ma cud gyi tery",
+                            "fir mujhe ny pta maa cud gai tery",
+                            "pta ny kon cod dia tery maa ko",
+                            "ruk aaya tery ma codke",
+                            "wait cr tery maa cod rha hu",
+                            "wait cr rabdyke maa cud rhi ey tery",
+                            "wait kr smjh rha tery ma codke",
+                            "wait le thoda chodne de tery mako",
+                            "ruk ja aand rkh dunga tery make liye",
+                            "tery maa famous randy ey",
+                            "maan lia mene maa randy sali tery",
+                            "maan lia maa cud gai tery",
+                            "shant beth randyke maa chudwa tu apni",
+                            "shant bethke chudwa le apni mako tu",
+                            "fr se shant Beth tu cud ab randyke yha",
+                            "mere smjh ny aya maa randy tery",
+                            "Le केला Kha tu madarchod",
+                            "Hye tery ma cud gyi cya",
+                            "hye tery maa mar gai cya",
+                            "Hye sch bta com cod dia tery mako",
+                            "Chl chod dia teri maa ko smjhle",
+                            "Baki koi dikkat ny tery maa randy ey",
+                            "baki sb jante ey ki maa chuddkad ey tery",
+                            "mujhe cya pta tha tery maa cudne wli ey",
+                            "pr mei kaise jnta tery ma ko koi chod dia",
+                            "pr mera vi manna shi tha maa chud gai tery",
+                            "pr wo glt ny tery maa randy ey",
+                            "pr wo shi ey tery maa chuddkad ey",
+                            "pr kaise kia maa chud gai tery omfoo",
+                            "bur cheer dunga tri ma ka",
+                            "teri ma ke dil me loda marke uski dhadkan rok dunga",
+                            "lulle kha tri makabhosda",
+                            "tri bhn ki bhosdi beta",
+                            "tri ma rndi baat khtm",
+                            "Sun ek maze ki baat batao kya teri maa randy ey"
+                            "codu codu mako tery",
+                            "aj cud gai tery maa oye",
+                            "sun sun randy make bache tu",
+                            "kilas ny randyke",
+                            "mujhe cya pta tery bhen cud gai",
+                            "pr pr cya hote ey tmkc",
+                            "tmcl sunle",
+                            "moot du tery maki chut mey",
+                            "bhgny cudke dikha fr",
+                            "fr se cudle tu",
+                            "ye vi shi ey tery mkc bs",
+                            "aj kuch ny ma cudwa tu apni",
+                            "try kr mera lund chuske",
+                            "tormakibur sun",
+                            "tor maki fuddi oye",
+                            "Haye Haye tery ma cud gai",
+                            "oye lundke pasine..",
+                            "kutte ke tatte sun",
+                            "kutta jaisa cud rha tu",
+                            "Muh mei le mera..",
+                            "jhaat ke pissu sun tmkc",
+                            "Hahahha ma cud gai tery",
+                            "weak tatte uth",
+                            "weak ey tu cud rha",
+                            "weak ache se cud tu",
+                            "weak tery ma cud rhi dekh",
+                            "week tery ma cud gai ab",
+                            "mujhe ny rok tu weak ey",
+                            "chup hizde",
+                            "okat ny meri ma cudwa tu apni",
+                            "lun lega tery maki gand mei ?",
+                            "tery maki bachi codu..",
+                            "tery bhen ki chut aj fad du",
+                            "speed lekr aa cudke dikha",
+                            "speed ny tere andr weak prosn",
+                            "ugly randyke chup",
+                            "makafuddatery",
+                            "tera baap ko tag kr..?",
+                            "ache se tag kr randibaaz bhagwn ko..",
+                            "cudke pgl ny ho tu",
+                            "cudke pgl ho rha tu kid",
+                            "ma to cud gai tery hawabzi cr..",
+                            "bs ma codni ey tery",
+                            "town mei cud tery mako lekr",
+                            "tery ma sexy ko bej - randibaaz bhgwn pe",
+                            "speed pkd cp ny kr",
+                            "Try ma rendy",
+                            "Bhkk cud",
+                            "tey maa rndi",
+                            "tery behen randi",
+                            "Cud ja",
+                            "tery didi rndi",
+                            "Slow",
+                            "teri Maiya ciodu",
+                            "Bhag?",
+                            "Bhak cud",
+                            "Tma codu",
+                            "Slow",
+                            "Slow firse",
+                            "Cudgrib",
+                            "Try ma dou",
+                            "tbkc codu",
+                            "Net on off wali rndy",
+                            "Oye try ma codu",
+                            "Idhar aake cud chup chaap",
+                            "tbkc mrdu",
+                            "oi maake lodee",
+                            "randyke beej",
+                            "tmkc chodu",
+                            "suar ke beej",
+                            "net off on kr randyke ladke",
+                            "Try ma cudi kese",
+                            "Chup slow madharcod",
+                            "tbkc codu kr msg delete",
+                            "oi suar ke ladke",
+                            "tmkc fufi",
+                            "tery didi chudi",
+                            "tmkc dikha",
+                            "Cud ab",
+                            "randyke cud",
+                            "Bhak cud",
+                            "cudle tbkc mru",
+                            "tmkl cudle grib",
+                            "tery behen vesiyaa rndi",
+                            "Itna gnda chuda tu firse net on off",
+                            "grib ke bete",
+                            "Bhag ja lode tmkc maru dunga",
+                            "tbkc mrdungaa",
+                            "bhag tmkc",
+                            "bhag tbkc",
+                            "tbkc mey cp",
+                            "cp tbkc mehh",
+                            "cp tmkl meh",
+                            "cp bol randyke",
+                            "Abe cp bol randyke",
+                            "double send ko cp tmkc codu",
+                            "tbkc me cp cod dunga Aaj mehh",
+                            "ht tbkc dalal ke bete.",
+                            "Rndy jldi jldi cudq tryma",
+                            "Para likhega..",
+                            "Tra rndhbhak",
+                            "Lagdi ke ladce cp bol",
+                            "cp bol lagdi ke bete..",
+                            "cudke cp bol",
+                            "bhikari lund chus mera.",
+                            "Low level cp cr",
+                            "cp bol low level weak",
+                            "mere lund pe ey tu hijde",
+                            "free cudwa tery mako",
+                            "Free mey cud tu randyke"
+                            "speed ny weak tatte terme",
+                            "kitni br cudwayega terymako",
+                            "lund le randibaaz bapka",
+                            "lun cus jaldi se randibaaz bapka",
+                            "koi ny dekh rha cudle tu",
+                            "cudle betichod ache se",
+                            "maki chut tery bs yehi janta mey",
+                            "cp bolega to tmkc",
+                            "wrna tery ma cud jayegi",
+                            "slow ey tu kid",
+                            "jldi likh..tmkc",
+                            "jldi likh..randce tu",
+                            "tym se phle cudke dikha",
+                            "tym hoga tery maa cudwa",
+                            "ma cud gai tery tym se phle",
+                            "uth randce ke ldke",
+                            "macabosdatery",
+                            "con kb cod dia mako tery",
+                            "koi hoga tml",
+                            "machar cudle tu",
+                            "menu tery mako codna se",
+                            "tery mako bol mujhe cod de",
+                            "bs mey tery ma se cudna chta hu",
+                            "Eww maka lode uth",
+                            "Meow cr tery mako codu",
+                            "lund rkh dia tery make fude pe",
+                            "mera lund ke bal uth",
+                            "kidee Zinda ho",
+                            "mar ny kidde type kr",
+                            "chup bkl",
+                            "bc tery maki chut",
+                            "mc randyke likh fast",
+                            "fast likh randyke",
+                            "fast likh kamzor"
+                            "tery maki chut claim crwa",
+                            "awz niche randce ke bche",
+                            "sawal ny puch tery makabosda",
+                            "fyter bnega lagde madrchod",
+                            "oye kaale ro ke dikha",
+                            "oye kaale roo ny",
+                            "short ny cud tu bina ruke",
+                            "short ny cud tu apni mako lekr",
+                            "tery make sth tery bhen vi cudwa le",
+                            "tery make sth tery didi vi cud gai",
+                            "Chat fyter bnega randce codu tery mako",
+                            "bol randibaaz daddy ey",
+                            "bullyx randyke uth",
+                            "mar marke cud rha tu",
+                            "or tery ma marke cud gai"
+                            "Jaldi likh rndyke bej",
+                            "Or bda likh tmc",
+                            "Or bda 2 line wla likh tmkc",
+                            "Or bda oye likh tml",
+                            "Teri maa ka bur",
+                            "Oye keede",
+                            "Randi ke ladke",
+                            "Jaldi likh teri behen chodu",
+                            "Mkl uth randi ke bacche",
+                            "Teri nani meri maal",
+                            "Tej likh randce",
+                            "Oye maake lode mrenga",
+                            "Teri maa chody",
+                            "Teri Maiya ki gand",
+                            "Tery dadi ka fudda",
+                            "Mkl uth behencod",
+                            "Teri maa ki bur de",
+                            "Tery maa ka fudda me lauda",
+                            "Teri maa chudva",
+                            "Randi ke bete mar gaya",
+                            "Teri maa ki chut mru",
+                            "Jalid kr spam",
+                            "Mc spam rokenga",
+                            "Teri maaki chut spam kr",
+                            "spam kr.maake lode",
+                            "Randyke chode spam kr wrna cud tu",
+                            "Spam kr kid",
+                            "Noob teri maa chodu",
+                            "Rndyke bete mar mat tu",
+                            "Noob jaldi likh wrna tery maa rand",
+                            "cud gai maa tery noob",
+                            "uth randyke noob",
+                            "chl cudke dikha noob",
+                            "jldi typ cr noob halke",
+                            "cud ke pgl ny ho noob",
+                            "cud cud ke rand bnja tu noob",
+                            "makichut tery noob",
+                            "ganda cyu cud rha tu ?",
+                            "itna gnda ny cud ache se cud",
+                            "Maan le cud gya tu sun bat ab",
+                            "makafudda fat gya tery ruk"
+                            "BAAP BHI BNALE MUJE RNDIKE",
+                            "TERA BAAP RANDIBAAZ EY YAAD EY TUJHE",
+                            "TU APNI MAA CUDA NA TYMPASS",
+                            "OYE UNFUNNY SWIPE MTT KR",
+                            "OH HELLO BIHARI TERA BAAP BIHARI OR TU V BIHARI AAUKAT ME RHA KR.",
+                            "OYY KINNER TUJHE GC ME AANE KI PERMISSION KISNE DI.",
+                            "CUDKE DIKHA",
+                            "CUDKE DIKHA EK BAAR.",
+                            "SUN SUN MA CUDA.",
+                            "TERI MACA BHOSDA.",
+                            "OYE CHOTI JATI KE TMR.",
+                            "KY? JLDI LIKH KIDDE.",
+                            "BIHARI COM GANG KE BAAP KO TAG CREGA TU",
+                            "MUJHE CYA TU BIHARI EY TMKC BS",
+                            "JALDI SE RANDIBAAZ PAPA BOL",
+                            "SIDE HOJA BIHARI TERY MAA CUD GAI AB",
+                            "HYE PGL BHG MAT ACHE SE CUD",
+                            "BHG NY RANDYKE TU AJJ",
+                            "HYE PGL KE BCHE BHAG MAT",
+                            "HYE DUR HATT MADCHOD KE BACHE",
+                            "KOI BAT NY TERY MAA RANDY EY ESLIYE MAF CR RHA HU TUJHE",
+                            "KOI BAAT NY MAA CHUDWA APNI TU MAFI DE DUNGA",
+                            "ACHE SE MAA CHUDWA APNI TU MAFI MIL JAYEGI TUJHE",
+                            "APNI MA MAT CHUDA MUJE SWIPE CRKE",
+                            "ACHE SE APNI MA CUDWA TU SWIPE CRKE",
+                            "FR BOLNA NA KI CUDWA LE APNI MA SWIPE CRKE",
+                            "CYA HUA MA CUD GYI TERY",
+                            "PR KESE CUD GYI TERY MA",
+                            "MUJHE PTA THA MA CUD GAI TERY",
+                            "MEY NY MANTA MA CUD GYI TERY",
+                            "TERI MA RNDY",
+                            "LODE SE UTR MC",
+                            "LUN MT CHUS MERA",
+                            "NIKAL MADARCHD",
+                            "CHUP OYE GASHTI K BACHE",
+                            "MAKICHUT TERI",
+                            "CHUP RNDYKE",
+                            "MA RNDY TERI",
+                            "TERI MA K HATH TODH K TERE BAAP K MUH ME FASADUNGA RANDYKE",
+                            "LEAVE LE TU RNDYKE PASAND NAI AYA MEKO",
+                            "LEAVE LE TU RANDYKE IDER SE",
+                            "LEAVE LE JLDI SE WRNA MA CHUD GAI TERY",
+                            "LEAVE NY LEGA MAA RANDY TERY",
+                            "SMJH BAT MAA RANDY EY TERY LEAVE LE",
+                            "FAST LEAVE LE KAMJOR RANDYKE",
+                            "TUTO CHUP RNDYK",
+                            "OY HIJDE KHANA KHA KE AA KAMZOR",
+                            "TERI MAKO ILY REY",
+                            "CHUP CHAP CHUD TMKC",
+                            "CHUPCHAP MAA CHUDWA APNI TU",
+                            "SHI SE MAA CHUDWA APNI TU CHUPCHAP",
+                            "FR SE MAA CHUDWA TU APNI CHUPCHAP",
+                            "SHI SE LIKH WRNA MA CHUD GAI TERY",
+                            "MA CYU CHUD GAI TERY CHUPCHAP",
+                            "PROOF CR MAA CHUD GYI TERY",
+                            "PROOF EY TERY MAA RANDY EY",
+                            "PROOF HO CHUKA MAA RANDY TERY",
+                            "CHUP CHILLAR",
+                            "CHUP CHUP MA K BOSDA TERY",
+                            "OY HIJDE KHANA KHA KE AA KAMZOR",
+                            "CHUP MADARCHOD ?",
+                            "AB TK CUD GYI HOGI TERY MAA ?",
+                            "NY NY ME KUCH NY JANTA BS TERI MA RNDY EY",
+                            "SBSE PHELE APNI MAA KO BOL CHUDNA KAAM KRE",
+                            "YAHA BHI CHUDA TU RNDYCE PILLE",
+                            "TERIMAKABOSDA",
+                            "TERI TO BHEN CUDEGI",
+                            "CHUP RNDYKE TOMMY",
+                            "NIKAL MADARCHD CUDKE YHA SE",
+                            "COZ TERI MA ANDHI RANDI HE",
+                            "NYTO BAAP BOL MUJHE",
+                            "NYNY TERI MAA HOGI RNDII JO CHUDWATI JOGI",
+                            "TRY AMMI CE BHOSDE ME EMOJI DAL MC",
+                            "CYA ? CHMR CHUD GYA CYA ?",
+                            "TM CHUDRI HOGI FRRTO",
+                            "CYA ? KB ? PGL EY CYA RNDKEK",
+                            "CYA SCH MEY PGL EY CYA TU RANDYKE CUDWA LI TUNE APNI MA",
+                            "ITNA SCH NY BOL MA CHUD GAI TERY",
+                            "SCH MEY PGL EY TU APNI MA CUDWA LIA MERE STH",
+                            "MTLB TMR",
+                            "NYTO",
+                            "PURA LIKH MC",
+                            "TMR FRRTO",
+                            "OH OK CUDLE FIR",
+                            "TERI MAA KA DAMAD",
+                            "CYA ? ACHE SE LIKHE PEHLE RNDIKEBACHE",
+                            "NYTO TERI MAA CHODNE ME VYAST HU",
+                            "NYTO PGL EY CYA KUCH BI",
+                            "OYEE CYA ? CHUD GYA ?",
+                            "CHUD MT HSS",
+                            "YUR RNDII MOM",
+                            "ARE SBKI MAA RNDII OR TERI BI",
+                            "ARE IDAR CUDLE EK BAAR",
+                            "TRI MAA CI TRH",
+                            "EK LINE ME TMR",
+                            "Q",
+                            "OCY AB CHUDLE",
+                            "PEHELE TERI MAA CHODU",
+                            "NYTO",
+                            "Q ?",
+                            "HYYY CHUD KE DIKA EK BAAR",
+                            "OYEE SUN DOST TMR",
+                            "BHAG JA RAAND MAAF CRR DUNGA",
+                            "OYEE PGL RNDII IDAR AA",
+                            "CYA TMR FRRTO",
+                            "OYEE IDAR Aake CHUD LE CHMR",
+                            "NYTO AESE HI CUD",
+                            "OYEE HYY AISE HI CUD LENA",
+                            "OR CHUD LE",
+                            "CHUD KE DIKA OR",
+                            "HYY CHUDO NA",
+                            "CHUDO MT BHAG JAO",
+                            "BYYEE HYY CYA ?",
+                            "QCHUD Q RHE HO ?",
+                            "PGL EY CYA MC",
+                            "CHUD MT",
+                            "CYA PGL RNDII IDAR AA",
+                            "TERI AMMI CE BHOSDE ME CHAPPAL",
+                            "OYEE IDAR AA MC",
+                            "KMZROR EY CYA RNDIEK",
+                            "CYA LIKH RHA ?",
+                            "CHUD THA CYA ?",
+                            "OYEE SLIDE LEKE BAAT CRMC",
+                            "IDAR A TERI MAA CHODU",
+                            "OYEE CP MT CRR CHUDLE",
+                            "OYEE HYY CHUD KE DIKA",
+                            "IDAR AA TRY MA SCHOFU KHACHAR KHACHAR",
+                            "IDAR AA JA MC",
+                            "HYY IDAR Aake CHUDLE",
+                            "OYEE KMZOR MC IDAR AA",
+                            "YE CYA TMR",
+                            "OYEE NY CP NY CRR",
+                            "OYEE PGL MT CRR",
+                            "CUDLE ARAM SE MC",
+                            "PGL EY CYA RNDIEK",
+                            "CP CRCE CHUDEGA !",
+                            "BAAP ? MC MERA COI MA BAAP NY EY MAI UPAR SE ROCKET PE BETH CE BSS TERI MA CHODNE AYA HU",
+                            "CHOTA LIKH RNDI K BACHE",
+                            "CHOTA LIKHA WRNA TRY MA RNDY",
+                            "TRY MA BAKA CODEGA",
+                            "TMKC MAIN BURF",
+                            "BHIKARI KI JHAT MA CUDA LE",
+                            "CHODKE TERY MA MARJAYEGI",
+                            "TMKC MAIN MOUNT EVEREST",
+                            "MUH MEY LEGA LUND MERA",
+                            "HIJDE KI JHAT CHUP WRNA TRY MA RNDI",
+                            "MENU NY PTA TERY MA RANDY",
+                            "MENU KI PTA MA RANDY TERY",
+                            "MENU PTA MAA CUD GAI TERY",
+                            "MENU SB PTA MA RANDY EY TERY",
+                            "MENU PR TERY MA RANDY",
+                            "RANDY MAA TERY MENU PTA",
+                            "TENU OR MENU PTA EY MAA RANDY TERY",
+                            "BS BS MAA CUDWA APNI",
+                            "BS BS MA RANDY TERY THNKSS",
+                            "BS BS CHUDWA LIA TU APNI MAA",
+                            "BS BS KAMJOR MAA RANDY TERY",
+                            "SMJH GYA APNI MA CUDWA LE AB",
+                            "SMJH GYA TERY MAA RANDY EY",
+                            "SMJH GYA TU SABIT KR MAA RANDY TERY",
+                            "CYA HUA MA CUDWA TU APNI",
+                            "EASY MAA CUDWA LE APNI TU",
+                            "EASY W8 MA CHUDWA LE APNI AB",
+                            "SANS ARI HA KY TERI MAA CHUDGI AJJ",
+                            "TERI MAA KO BINA SANSS LETE HUE CHODUNGA",
+                            "CHUP RANDIKE KAMJOR",
+                            "APNI MA NORMIE CUDWA LE TU",
+                            "FR CYA NORMIE MA CUD GAI TERY",
+                            "BAS THEK TERY MA RANDY",
+                            "BAS THEK TERY MAA CUD GYI",
+                            "KAMJOR THI TERY MA ESLIYE CUD GAI",
+                            "MAI SB JANTA MA CUD GAI TERY",
+                            "CHL CHL HT TERY MAA CUD GYI",
+                            "FR KAISE CUD GYI MAA TERY",
+                            "MAA TERY RANDY EY",
+                            "BAS TERY MAA RANDY EY",
+                            "FR RANDY MA TERY EY",
+                            "KAMJOR MA KA BCHA TU RANDYKE",
+                            "BHOT GNDI CUD GAI MAA TERY",
+                            "PR KAISE MAA CUD GAI TERY ITNA GNDA",
+                            "MUJHE CYA BTA RHA MAA RANDY TERY",
+                            "MUJHE CYA PTA MA CUD GYI TERY",
+                            "FIR MUJHE NY PTA MAA CUD GAI TERY",
+                            "PTA NY KON COD DIA TERY MAA KO",
+                            "RUK AAYA TERY MA CODKE",
+                            "WAIT CR TERY MAA COD RHA HU",
+                            "WAIT CR RABDYKE MAA CUD RHI EY TERY",
+                            "WAIT KR SMJH RHA TERY MA CODKE",
+                            "WAIT LE THODA CHODNE DE TERY MAKO",
+                            "RUK JA AAND RKH DUNGA TERY MAKE LIYE",
+                            "TERY MAA FAMOUS RANDY EY",
+                            "MAAN LIA MENE MAA RANDY SALI TERY",
+                            "MAAN LIA MAA CUD GAI TERY",
+                            "SHANT BETH RANDYKE MAA CHUDWA TU APNI",
+                            "SHANT BETHKE CHUDWA LE APNI MAKO TU",
+                            "FR SE SHANT BETH TU CUD AB RANDYKE YHA",
+                            "MERE SMJH NY AYA MAA RANDY TERY",
+                            "LE KELA KHA TU MADARCHOD",
+                            "HYE TERY MA CUD GYI CYA",
+                            "HYE TERY MAA MAR GAI CYA",
+                            "HYE SCH BTA COM COD DIA TERY MAKO",
+                            "CHL CHOD DIA TERI MAA KO SMJHLE",
+                            "BAKI KOI DIKKAT NY TERY MAA RANDY EY",
+                            "BAKI SB JANTE EY KI MAA CHUDDKAD EY TERY",
+                            "MUJHE CYA PTA THA TERY MAA CUDNE WLI EY",
+                            "PR MEI KAISE JNTA TERY MA KO KOI CHOD DIA",
+                            "PR MERA VI MANNA SHI THA MAA CHUD GAI TERY",
+                            "PR WO GLT NY TERY MAA RANDY EY",
+                            "PR WO SHI EY TERY MAA CHUDDKAD EY",
+                            "PR KAISE KIA MAA CHUD GAI TERY OMFOO",
+                            "BUR CHEER DUNGA TRI MA KA",
+                            "TERI MA KE DIL ME LODA MARKE USKI DHADKAN ROK DUNGA",
+                            "LULLE KHA TRI MAKABHOSDA",
+                            "TRI BHN KI BHOSDI BETA",
+                            "TRI MA RNDI BAAT KHTM",
+                            "SUN EK MAZE KI BAAT BATAO KYA TERI MAA RANDY EY",
+                            "CODU CODU MAKO TERY",
+                            "AJ CUD GAI TERY MAA OYE",
+                            "SUN SUN RANDY MAKE BACHE TU",
+                            "KILAS NY RANDYKE",
+                            "MUJHE CYA PTA TERY BHEN CUD GAI",
+                            "PR PR CYA HOTE EY TMKC",
+                            "TMCL SUNLE",
+                            "MOOT DU TERY MAKI CHUT MEY",
+                            "BHGNY CUDKE DIKHA FR",
+                            "FR SE CUDLE TU",
+                            "YE VI SHI EY TERY MKC BS",
+                            "AJ KUCH NY MA CUDWA TU APNI",
+                            "TRY KR MERA LUND CHUSKE",
+                            "TORMAKIBUR SUN",
+                            "TOR MAKI FUDDI OYE",
+                            "HAYE HAYE TERY MA CUD GAI",
+                            "OYE LUNDKE PASINE..",
+                            "KUTTE KE TATTE SUN",
+                            "KUTTA JAISA CUD RHA TU",
+                            "MUH MEI LE MERA..",
+                            "JHAAT KE PISSU SUN TMKC",
+                            "HAHAHHA MA CUD GAI TERY",
+                            "WEAK TATTE UTH",
+                            "WEAK EY TU CUD RHA",
+                            "WEAK ACHE SE CUD TU",
+                            "WEAK TERY MA CUD RHI DEKH",
+                            "WEEK TERY MA CUD GAI AB",
+                            "MUJHE NY ROK TU WEAK EY",
+                            "CHUP HIZDE",
+                            "OKAT NY MERI MA CUDWA TU APNI",
+                            "LUN LEGA TERY MAKI GAND MEI ?",
+                            "TERY MAKI BACHI CODU..",
+                            "TERY BHEN KI CHUT AJ FAD DU",
+                            "SPEED LEKR AA CUDKE DIKHA",
+                            "SPEED NY TERE ANDR WEAK PROSN",
+                            "UGLY RANDYKE CHUP",
+                            "MAKAFUDDATERY",
+                            "TERA BAAP KO TAG KR..?",
+                            "ACHE SE TAG KR RANDIBAAZ BHAGWN KO..",
+                            "CUDKE PGL NY HO TU",
+                            "CUDKE PGL HO RHA TU KID",
+                            "MA TO CUD GAI TERY HAWABZI CR..",
+                            "BS MA CODNI EY TERY",
+                            "TOWN MEI CUD TERY MAKO LEKR",
+                            "TERY MA SEXY KO BEJ - RANDIBAAZ BHGWN PE",
+                            "SPEED PKD CP NY KR",
+                            "TRY MA RENDY",
+                            "BHKK CUD",
+                            "TEY MAA RNDI",
+                            "TERY BEHEN RANDI",
+                            "CUD JA TMC",
+                            "TERY DIDI RNDI",
+                            "SLOW",
+                            "TERI MAIYA CIODU",
+                            "BHAG?TMC ",
+                            "BHAK CUD TML",
+                            "TMA CODU",
+                            "SLOW TMKC ",
+                            "SLOW FIRSE TMKC ",
+                            "CUDGRIB TML",
+                            "TRY MA DOU",
+                            "TBKC CODU",
+                            "NET ON OFF WALI RNDY",
+                            "OYE TRY MA CODU",
+                            "IDHAR AAKE CUD CHUP CHAAP",
+                            "TBKC MRDU",
+                            "OI MAAKE LODEE",
+                            "RANDYKE BEEJ",
+                            "TMKC CHODU",
+                            "SUAR KE BEEJ",
+                            "NET OFF ON KR RANDYKE LADKE",
+                            "TRY MA CUDI KESE",
+                            "CHUP SLOW MADHARCOD",
+                            "TBKC CODU KR MSG DELETE",
+                            "OI SUAR KE LADKE",
+                            "TMKC FUFI",
+                            "TERY DIDI CHUDI",
+                            "TMKC DIKHA",
+                            "CUD AB",
+                            "RANDYKE CUD",
+                            "BHAK CUD",
+                            "CUDLE TBKC MRU",
+                            "TMKL CUDLE GRIB",
+                            "TERY BEHEN VESITYA RNDI",
+                            "ITNA GNDA CHUDA TU FIRSE NET ON OFF",
+                            "GRIB KE BETE",
+                            "BHAG JA LODE TMKC MARU DUNGA",
+                            "TBKC MRDUNGAA",
+                            "BHAG TMKC",
+                            "BHAG TBKC",
+                            "TBKC MEY CP",
+                            "CP TBKC MEHH",
+                            "CP TMKL MEH",
+                            "CP BOL RANDYKE",
+                            "ABE CP BOL RANDYKE",
+                            "DOUBLE SEND KO CP TMKC CODU",
+                            "TBKC ME CP COD DUNGA AAJ MEHH",
+                            "HT TBKC DALAL KE BETE.",
+                            "RNDY JLDI JLDI CUDQ TRYMA",
+                            "PARA LIKHEGA..",
+                            "TRA RNDHBHAK",
+                            "LAGDI KE LADCE CP BOL",
+                            "CP BOL LAGDI KE BETE..",
+                            "CUDKE CP BOL",
+                            "BHIKARI LUND CHUS MERA.",
+                            "LOW LEVEL CP CR",
+                            "CP BOL LOW LEVEL WEAK",
+                            "MERE LUND PE EY TU HIJDE",
+                            "FREE CUDWA TERY MAKO",
+                            "FREE MEY CUD TU RANDYKE",
+                            "SPEED NY WEAK TATTE TERME",
+                            "KITNI BR CUDWAYEGA TERYMAKO",
+                            "LUND LE RANDIBAAZ BAPKA",
+                            "LUN CUS JALDI SE RANDIBAAZ BAPKA",
+                            "KOI NY DEKH RHA CUDLE TU",
+                            "CUDLE BETICHOD ACHE SE",
+                            "MAKI CHUT TERY BS YEHI JANTA MEY",
+                            "CP BOLEGA TO TMKC",
+                            "WRNA TERY MA CUD JAYEGI",
+                            "SLOW EY TU KID",
+                            "JLDI LIKH..TMKC",
+                            "JLDI LIKH..RANDCE TU",
+                            "TYM SE PHLE CUDKE DIKHA",
+                            "TYM HOGA TERY MAA CUDWA",
+                            "MA CUD GAI TERY TYM SE PHLE",
+                            "UTH RANDCE KE LDKE",
+                            "MACABOSDATERY",
+                            "CON KB COD DIA MAKO TERY",
+                            "KOI HOGA TML",
+                            "MACHAR CUDLE TU",
+                            "MENU TERY MAKO CODNA SE",
+                            "TERY MAKO BOL MUJHE COD DE",
+                            "BS MEY TERY MA SE CUDNA CHTA HU",
+                            "EWW MAKA LODE UTH",
+                            "MEOW CR TERY MAKO CODU",
+                            "LUND RKH DIA TERY MAKE FUDE PE",
+                            "MERA LUND KE BAL UTH",
+                            "KIDEE ZINDA HO",
+                            "MAR NY KIDDE TYPE KR",
+                            "CHUP BKL",
+                            "BC TERY MAKI CHUT",
+                            "MC RANDYKE LIKH FAST",
+                            "FAST LIKH RANDYKE",
+                            "FAST LIKH KAMZOR",
+                            "TERY MAKI CHUT CLAIM CRWA",
+                            "AWZ NICHE RANDCE KE BCHE",
+                            "SAWAL NY PUCH TERY MAKABOSDA",
+                            "FYTER BNEGA LAGDE MADRCHOD",
+                            "OYE KAALE RO KE DIKHA",
+                            "OYE KAALE ROO NY",
+                            "SHORT NY CUD TU BINA RUKE",
+                            "SHORT NY CUD TU APNI MAKO LEKR",
+                            "TERY MAKE STH TERY BHEN VI CUDWA LE",
+                            "TERY MAKE STH TERY DIDI VI CUD GAI",
+                            "CHAT FYTER BNEGA RANDCE CODU TERY MAKO",
+                            "BOL RANDIBAAZ DADDY EY",
+                            "BULLYX RANDYKE UTH",
+                            "MAR MARKE CUD RHA TU",
+                            "OR TERY MA MARKE CUD GAI",
+                            "JALDI LIKH RNDYKE BEJ",
+                            "OR BDA LIKH TMC",
+                            "OR BDA 2 LINE WLA LIKH TMKC",
+                            "OR BDA OYE LIKH TML",
+                            "TERI MAA KA BUR",
+                            "OYE KEEDE",
+                            "RANDI KE LADKE",
+                            "JALDI LIKH TERI BEHEN CHODU",
+                            "MKL UTH RANDI KE BACCHE",
+                            "TERI NANI MERI MAAL",
+                            "TEJ LIKH RANDCE",
+                            "OYE MAAKE LODE MRENGA",
+                            "TERI MAA CHODY",
+                            "TERI MAIYA KI GAND",
+                            "TERY DADI KA FUDDA",
+                            "MKL UTH BEHENCOD",
+                            "TERI MAA KI BUR DE",
+                            "TERY MAA KA FUDDA ME LAUDA",
+                            "TERI MAA CHUDVA",
+                            "RANDI KE BETE MAR GAYA",
+                            "TERI MAA KI CHUT MRU",
+                            "JALID KR SPAM",
+                            "MC SPAM ROKENGA",
+                            "TERI MAAKI CHUT SPAM KR",
+                            "SPAM KR.MAAKE LODE",
+                            "RANDYKE CHODE SPAM KR WRNA CUD TU",
+                            "SPAM KR KID",
+                            "NOOB TERI MAA CHODU",
+                            "RNDYKE BETE MAR MAT TU",
+                            "NOOB JALDI LIKH WRNA TERY MAA RAND",
+                            "CUD GAI MAA TERY NOOB",
+                            "UTH RANDYKE NOOB",
+                            "CHL CUDKE DIKHA NOOB",
+                            "JLDI TYP CR NOOB HALKE",
+                            "CUD KE PGL NY HO NOOB",
+                            "CUD CUD KE RAND BNJA TU NOOB",
+                            "MAKICHUT TERY NOOB",
+                            "GANDA CYU CUD RHA TU ?",
+                            "ITNA GNDA NY CUD ACHE SE CUD",
+                            "MAAN LE CUD GYA TU SUN BAT AB",
+                            "MAKAFUDDA FAT GYA TERY RUK",
+                        "sʜᴀɴᴛ ʙᴇᴛʜ ᴍᴀᴅʀᴄʜᴏᴅ ᴡʀɴᴀ ᴍᴀᴋᴀʙᴏsᴅᴀ ᴛᴇᴇʏ.",
+                        "ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴄʜᴜᴛ..",
+                        "ʟᴡᴅᴇ ᴋᴇ ʙᴀᴀᴀʟʟʟ ᴛᴇʀʏ ᴍᴀᴀ ᴄᴜᴅᴋᴇ ᴘɢʟ ᴅᴇᴋʜ.",
+                        "ᴍᴀᴄʜᴀʀ ᴋɪ ᴊʜᴀᴀᴛ ᴋᴇ ʙᴀᴀᴀʟʟʟʟ ᴄᴜᴅ ᴀᴄʜᴇ sᴇ ʏʜᴀᴘᴇ ᴛᴜ",
+                        "ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴄʜᴜᴛ ᴍ ᴅᴜ ᴛᴀᴘᴀ ᴛᴀᴘ?",
+                        "ᴛᴇʀɪ ᴍᴀ ᴋᴀ ʙʜᴏꜱᴅᴀᴀ",
+                        "ᴛᴇʀɪ ʙʜɴ ꜱʙꜱʙᴇ ʙᴅɪ ʀᴀɴᴅɪ.",
+                        "ᴛᴇʀɪ ᴍᴀ ᴏꜱꜱᴇ ʙᴀᴅɪ ʀᴀɴᴅᴅᴅᴅᴅ",
+                        "ᴛᴇʀᴀ ʙᴀᴀᴘ ʀᴀɴᴅɪʙᴀᴀᴢ ᴇʏ ᴅᴇᴋʜ",
+                        "ᴋɪᴛɴɪ ᴄʜᴏᴅᴜ ᴛᴇʀɪ ᴍᴀ ᴀʙ ᴏʀ..",
+                        "ᴛᴇʀɪ ᴍᴀ ᴄʜᴏᴅ ᴅɪ ʜᴍ ɴᴇ",
+                        "ᴛᴇʀɪ ᴍᴀ ᴋᴇ ꜱᴛʜ ʀᴇᴇʟꜱ ʙɴᴇɢᴀ ʀᴏᴀᴅ ᴘᴇᴇ",
+                        "ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴄʜᴜᴛ ᴇᴋ ᴅᴀᴍ ᴛᴏᴘ ꜱᴇxʏ",
+                        "ᴍᴀʟᴜᴍ ɴᴀ ᴘʜʀ ᴋᴇꜱᴇ ʟᴇᴛᴀ ʜᴜ ᴍ ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴄʜᴜᴛ ᴛᴀᴘᴀ ᴛᴀᴘᴘᴘᴘᴘ",
+                        "ʟᴜɴᴅ ᴋᴇ ᴄʜᴏᴅᴇ ᴛᴜ ᴋᴇʀᴇɢᴀ ᴛʏᴘɪɴɢ ᴋʀᴇɢᴀ ᴛᴍᴋᴄ",
+                        "ꜱᴘᴇᴇᴅ ᴘᴋᴅ ʟᴡᴅᴇᴇᴇᴇ ᴡʀɴᴀ ᴍᴇʀᴀ ʟᴜɴᴅ ᴘᴋᴅ",
+                        "ʙᴀᴀᴘ ᴋɪ ꜱᴘᴇᴇᴅ ᴍᴛᴄʜ ᴋʀʀʀ",
+                        "ʟᴡᴅᴀ ʟᴇ ᴍᴇʀᴀ ᴊᴀʟᴅɪ sᴇ ᴛᴜ",
+                        "ᴘᴀᴘᴀ ᴋɪ ꜱᴘᴇᴇᴅ ᴍᴛᴄʜ ɴʜɪ ʜᴏ ʀʜɪ ᴋʏᴀ ᴛᴇʀᴇsᴇ",
+                        "ᴀʟᴇ ᴀʟᴇ ᴍᴇʟᴀ ʙᴄʜᴀᴀᴀᴀ ᴛᴇʀʏ ᴍᴀᴋᴀ ʙᴏsᴅᴀ sᴜɴ",
+                        "ᴄʜᴜᴅ ɢʏᴀ ʀᴀɴᴅɪʙᴀᴀᴢ ᴘᴀᴘᴀ ꜱᴇᴇᴇ ᴛᴜ",
+                        "ᴍᴇɴᴜ ᴋɪ ᴘᴛᴀ ᴛᴇʀʏ ᴍᴀ ᴄᴜᴅ ɢᴀɪ",
+                        "ᴋᴏɪ ʙᴀᴀᴛ ɴʏ ᴍᴀᴀ ʀᴀɴᴅʏ ᴛᴇʀʏ",
+                        "ʜᴀʜᴀʜᴀᴀᴀᴀᴀ ᴍᴀᴋᴀʙᴏsᴅᴀ ᴛᴇʀʏ",
+                        "xʜᴜᴅ ɢᴀɪ ᴍᴀᴀ ᴛᴇʀʏ ᴋɪᴅꜱꜱꜱꜱ",
+                        "ᴛᴇʀɪ ᴍᴀ ᴄʜᴜᴅ ɢʏɪ ᴀʙ ꜰʀᴀʀ ᴍᴛ ʜᴏɴᴀ",
+                        "ʏᴇ ʟᴜɴᴅ ʟᴇ ᴍᴇʀᴀ ᴄʜʟ ᴊᴀʟᴅɪ sᴇ",
+                        "ᴋɪᴅꜱꜱꜱ ꜰʀᴀʀ ɴᴀ ʜᴏ ᴛᴜ ʜᴀʜᴀʜʜ",
+                        "ʙʜᴇɴ ᴋᴇ ʟᴡᴅᴇ ꜱʜʀᴍ ᴋʀ",
+                        "ᴋɪᴛɴɪ ɢʟɪʏᴀ ᴘᴅᴡᴇɢᴀ ᴀᴘɴɪ ᴍᴀ ᴋᴏ",
+                        "ᴄʜᴜᴘ ɴᴀʟʟɪɪ ʀᴀɴᴅʏᴋᴇ ʟᴀᴅᴋᴇ",
+                        "ꜱᴜᴀʀ ᴋᴇ ᴘɪʟʟᴇ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ꜱᴀᴅᴀᴋ ᴘʀ ʟɪᴛᴀᴋᴇ ᴄʜᴏᴅ ᴅᴜɴɢᴀ 😂😆🤤",
+                        "ᴀʙᴇ ᴛᴇʀɪ ᴍᴀᴀᴋᴀ ʙʜᴏꜱᴅᴀ ᴍᴀᴅᴇʀᴄʜᴏᴏᴅ ᴋʀ ᴘɪʟʟᴇ ᴘᴀᴘᴀ ꜱᴇ ʟᴀᴅᴇɢᴀ ᴛᴜ 😼😂🤤",
+                        "ɢᴀʟɪ ɢᴀʟɪ ɴᴇ ꜱʜᴏʀ ʜᴇ ᴛᴇʀɪ ᴍᴀᴀ ʀᴀɴᴅɪ ᴄʜᴏʀ ʜᴇ 💋💋💦",
+                        "ᴀʙᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅᴜ ʀᴀɴᴅɪᴋᴇ ᴘɪʟʟᴇ ᴋᴜᴛᴛᴇ ᴋᴇ ᴄʜᴏᴅᴇ 😂👻🔥",
+                        "ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴀɪꜱᴇ ᴄʜᴏᴅᴀ ᴀɪꜱᴇ ᴄʜᴏᴅᴀ ᴛᴇʀɪ ᴍᴀᴀᴀ ʙᴇᴅ ᴘᴇʜɪ ᴍᴜᴛʜ ᴅɪᴀ 💦💦💦💦",
+                        "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴇ ʙʜᴏꜱᴅᴇ ᴍᴇ ᴀᴀᴀɢ ʟᴀɢᴀᴅɪᴀ ᴍᴇʀᴀ ᴍᴏᴛᴀ ʟᴜɴᴅ ᴅᴀʟᴋᴇ 🔥🔥💦😆😆",
+                        "ʀᴀɴᴅɪᴋᴇ ʙᴀᴄʜʜᴇ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴏᴅᴜ ᴄʜᴀʟ ɴɪᴋᴀʟ",
+                        "ᴋɪᴛɴᴀ ᴄʜᴏᴅᴜ ᴛᴇʀɪ ʀᴀɴᴅɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴛʜ ᴀʙʙ ᴀᴘɴɪ ʙᴇʜᴇɴ ᴋᴏ ʙʜᴇᴊ 😆👻🤤",
+                        "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏᴛᴏ ᴄʜᴏᴅ ᴄʜᴏᴅᴋᴇ ᴘᴜʀᴀ ꜰᴀᴀᴅ ᴅɪᴀ ᴄʜᴜᴛʜ ᴀʙʙ ᴛᴇʀɪ ɢꜰ ᴋᴏ ʙʜᴇᴊ 😆💦🤤",
+                        "ᴛᴇʀɪ ɢꜰ ᴋᴏ ᴇᴛɴᴀ ᴄʜᴏᴅᴀ ʙᴇʜᴇɴ ᴋᴇ ʟᴏᴅᴇ ᴛᴇʀɪ ɢꜰ ᴛᴏ ᴍᴇʀɪ ʀᴀɴᴅɪ ʙᴀɴɢᴀʏɪ ᴀʙʙ ᴄʜᴀʟ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴏᴅᴛᴀ ꜰɪʀꜱᴇ ♥️💦😆😆😆😆",
+                        "ʜᴀʀɪ ʜᴀʀɪ ɢʜᴀᴀꜱ ᴍᴇ ᴊʜᴏᴘᴅᴀ ᴛᴇʀɪ ᴍᴀᴀᴋᴀ ʙʜᴏꜱᴅᴀ 🤣🤣💋💦",
+                        "ᴄʜᴀʟ ᴛᴇʀᴇ ʙᴀᴀᴘ ᴋᴏ ʙʜᴇᴊ ᴛᴇʀᴀ ʙᴀꜱᴋᴀ ɴʜɪ ʜᴇ ᴘᴀᴘᴀ ꜱᴇ ʟᴀᴅᴇɢᴀ ᴛᴜ",
+                        "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ʙᴏᴍʙ ᴅᴀʟᴋᴇ ᴜᴅᴀ ᴅᴜɴɢᴀ ᴍᴀᴀᴋᴇ ʟᴀᴡᴅᴇ",
+                        "ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴛʀᴀɪɴ ᴍᴇ ʟᴇᴊᴀᴋᴇ ᴛᴏᴘ ʙᴇᴅ ᴘᴇ ʟɪᴛᴀᴋᴇ ᴄʜᴏᴅ ᴅᴜɴɢᴀ ꜱᴜᴀʀ ᴋᴇ ᴘɪʟʟᴇ 🤣🤣💋💋",
+                        "ᴛᴇʀɪ ᴍᴀᴀᴀᴋᴇ ɴᴜᴅᴇꜱ ɢᴏᴏɢʟᴇ ᴘᴇ ᴜᴘʟᴏᴀᴅ ᴋᴀʀᴅᴜɴɢᴀ ʙᴇʜᴇɴ ᴋᴇ ʟᴀᴇᴡᴅᴇ 👻🔥",
+                        "ᴛᴇʀɪ ᴍᴀᴀᴀᴋᴇ ɴᴜᴅᴇꜱ ɢᴏᴏɢʟᴇ ᴘᴇ ᴜᴘʟᴏᴀᴅ ᴋᴀʀᴅᴜɴɢᴀ ʙᴇʜᴇɴ ᴋᴇ ʟᴀᴇᴡᴅᴇ 👻🔥",
+                        "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅ ᴄʜᴏᴅᴋᴇ ᴠɪᴅᴇᴏ ʙᴀɴᴀᴋᴇ xɴxx ᴘᴇ ɴᴇᴇʟᴀᴍ ᴋᴀʀᴅᴜɴɢᴀ ᴋᴜᴛᴛᴇ ᴋᴇ ᴘɪʟʟᴇ 💦💋",
+                        "ᴛᴇʀɪ ᴍᴀᴀᴀᴋɪ ᴄʜᴜᴅᴀɪ ᴋᴏ ᴘᴏ*ʀɴʜᴜʙ ᴘᴇ ᴜᴘʟᴏᴀᴅ ᴋᴀʀᴅᴜɴɢᴀ ꜱᴜᴀʀ ᴋᴇ ᴄʜᴏᴅᴇ 🤣💋💦",
+                        "ᴀʙᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴄʜᴏᴅᴜ ʀᴀɴᴅɪᴋᴇ ʙᴀᴄʜʜᴇ ᴛᴇʀᴇᴋᴏ ᴄʜᴀᴋᴋᴏ ꜱᴇ ᴘɪʟᴡᴀᴠᴜɴɢᴀ ʀᴀɴᴅɪᴋᴇ ʙᴀᴄʜʜᴇ 🤣🤣",
+                        "ᴛᴇʀɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴛʜ ꜰᴀᴀᴅᴋᴇ ʀᴀᴋᴅɪᴀ ᴍᴀᴀᴋᴇ ʟᴏᴅᴇ ᴊᴀᴀ ᴀʙʙ ꜱɪʟᴡᴀʟᴇ 👄👄",
+                        "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ᴍᴇʀᴀ ʟᴜɴᴅ ᴋᴀᴀʟᴀ",
+                        "ᴛᴇʀɪ ʙᴇʜᴇɴ ʟᴇᴛɪ ᴍᴇʀɪ ʟᴜɴᴅ ʙᴀᴅᴇ ᴍᴀꜱᴛɪ ꜱᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴏ ᴍᴇɴᴇ ᴄʜᴏᴅ ᴅᴀʟᴀ ʙᴏʜᴏᴛ ꜱᴀꜱᴛᴇ ꜱᴇ",
+                        "ʙᴇᴛᴇ ᴛᴜ ʙᴀᴀᴘ ꜱᴇ ʟᴇɢᴀ ᴘᴀɴɢᴀ ᴛᴇʀɪ ᴍᴀᴀᴀ ᴋᴏ ᴄʜᴏᴅ ᴅᴜɴɢᴀ ᴋᴀʀᴋᴇ ɴᴀɴɢᴀ 💦💋",
+                        "ʜᴀʜᴀʜᴀʜ ᴍᴇʀᴇ ʙᴇᴛᴇ ᴀɢʟɪ ʙᴀᴀʀ ᴀᴘɴɪ ᴍᴀᴀᴋᴏ ʟᴇᴋᴇ ᴀᴀʏᴀ ᴍᴀᴛʜ ᴋᴀᴛ ᴏʀ ᴍᴇʀᴇ ᴍᴏᴛᴇ ʟᴜɴᴅ ꜱᴇ ᴄʜᴜᴅᴡᴀʏᴀ ᴍᴀᴛʜ ᴋᴀʀ",
+                        "ᴄʜᴀʟ ʙᴇᴛᴀ ᴛᴜᴊʜᴇ ᴍᴀᴀꜰ ᴋɪᴀ 🤣ᴛᴜ ᴀʙʙ ᴀᴘɴɪ ᴍᴀᴋᴏ ʙʜᴇᴊ",
+                        "ꜱʜᴀʀᴀᴍ ᴋᴀʀ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴀ ʙʜᴏꜱᴅᴀ ᴋɪᴛɴᴀ ɢᴀᴀʟɪᴀ ꜱᴜɴᴡᴀʏᴇɢᴀ ᴀᴘɴɪ ᴍᴀᴀᴀ ʙᴇʜᴇɴ ᴋᴇ ᴜᴘᴇʀ",
+                        "ᴀʙᴇ ʀᴀɴᴅɪᴋᴇ ʙᴀᴄʜʜᴇ ᴀᴜᴋᴀᴛ ɴʜɪ ʜᴇᴛᴏ ᴀᴘɴɪ ʀᴀɴᴅɪ ᴍᴀᴀᴋᴏ ʟᴇᴋᴇ ᴀᴀʏᴀ ᴍᴀᴛʜ ᴋᴀʀ ʜᴀʜᴀʜᴀʜᴀ",
+                        "ᴋɪᴅᴢ ᴍᴀᴅᴀʀᴄʜᴏᴅ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴏᴅ ᴄʜᴏᴅᴋᴇ ᴛᴇʀʀ ʟɪʏᴇ ʙʜᴀɪ ᴅᴇᴅɪʏᴀ",
+                        "ᴊᴜɴɢʟᴇ ᴍᴇ ɴᴀᴄʜᴛᴀ ʜᴇ ᴍᴏʀᴇ ᴛᴇʀɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴅᴀɪ ᴅᴇᴋᴋᴇ ꜱᴀʙ ʙᴏʟᴛᴇ ᴏɴᴄᴇ ᴍᴏʀᴇ ᴏɴᴄᴇ ᴍᴏʀᴇ 🤣🤣💦💋",
+                        "ɢᴀʟɪ ɢᴀʟɪ ᴍᴇ ʀᴇʜᴛᴀ ʜᴇ ꜱᴀɴᴅ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴏᴅ ᴅᴀʟᴀ ᴏʀ ʙᴀɴᴀ ᴅɪᴀ ʀᴀɴᴅ 🤤🤣",
+                        "ꜱᴀʙ ʙᴏʟᴛᴇ ᴍᴜᴊʜᴋᴏ ᴘᴀᴘᴀ ᴄʏᴜᴋɪ ᴍᴇɴᴇ ᴋʀᴅɪᴀ ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴘʀᴇɢɴᴇɴᴛ 🤣🤣",
+                        "ꜱᴜᴀʀ ᴋᴇ ᴘɪʟʟᴇ ᴛᴇʀɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ꜱᴜᴀʀ ᴋᴀ ʟᴏᴜᴅᴀ ᴏʀ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ᴍᴇʀᴀ ʟᴏᴅᴀ",
+                        "ᴄʜᴀʟ ᴄʜᴀʟ ᴛᴜ ᴀᴘɴɪ ᴍᴀᴀᴋɪ ᴄʜᴜᴄʜɪʏᴀ ᴅɪᴋᴀ",
+                        "ʜᴀʜᴀʜᴀʜᴀ ʙᴀᴄʜʜᴇ ᴛᴇʀɪ ᴍᴀᴀᴀᴋᴏ ᴄʜᴏᴅ ᴅɪᴀ ɴᴀɴɢᴀ ᴋᴀʀᴋᴇ",
+                        "ᴛᴇʀɪ ɢꜰ ʜᴇ ʙᴀᴅɪ ꜱᴇxʏ ᴜꜱᴋᴏ ᴘɪʟᴀᴋᴇ ᴄʜᴏᴏᴅᴇɴɢᴇ ᴘᴇᴘꜱɪ",
+                        "2 ʀᴜᴘᴀʏ ᴋɪ ᴘᴇᴘꜱɪ ᴛᴇʀɪ ᴍᴜᴍᴍʏ ꜱᴀʙꜱᴇ ꜱᴇxʏ 💋💦",
+                        "ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴄʜᴇᴇᴍꜱ ꜱᴇ ᴄʜᴜᴅᴡᴀᴠᴜɴɢᴀ ᴍᴀᴅᴇʀᴄʜᴏᴏᴅ ᴋᴇ ᴘɪʟʟᴇ 💦🤣",
+                        "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋɪ ᴄʜᴜᴛʜ ᴍᴇ ᴍᴜᴛʜᴋᴇ ꜰᴀʀᴀʀ ʜᴏᴊᴀᴠᴜɴɢᴀ ʜᴜɪ ʜᴜɪ ʜᴜɪ",
+                        "ꜱᴘᴇᴇᴅ ʟᴀᴀᴀ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴄʜᴏᴅᴜ ʀᴀɴᴅɪᴋᴇ ᴘɪʟʟᴇ 💋💦🤣",
+                        "ᴀʀᴇ ʀᴇ ᴍᴇʀᴇ ʙᴇᴛᴇ ᴄʏᴜ ꜱᴘᴇᴇᴅ ᴘᴀᴋᴀᴅ ɴᴀ ᴘᴀᴀᴀ ʀᴀʜᴀ ᴀᴘɴᴇ ʙᴀᴀᴘ ᴋᴀ ʜᴀʜᴀʜᴀ ᴛᴇʀɪ ᴍᴀᴀ ᴄᴜᴅ ɢᴀɪ🤣🤣",
+                        "ꜱᴜɴ ꜱᴜɴ ꜱᴜᴀʀ ᴋᴇ ᴘɪʟʟᴇ ᴊʜᴀɴᴛᴏ ᴋᴇ ꜱᴏᴜᴅᴀɢᴀʀ ᴀᴘɴɪ ᴍᴜᴍᴍʏ ᴋɪ ɴᴜᴅᴇꜱ ʙʜᴇᴊ",
+                        "ᴀʙᴇ ꜱᴜɴ ʟᴏᴅᴇ ᴛᴇʀɪ ʙᴇʜᴇɴ ᴋᴀ ʙʜᴏꜱᴅᴀ ꜰᴀᴀᴅ ᴅᴜɴɢᴀ",
+                        "ᴛᴇʀɪ ᴍᴀᴀᴋᴏ ᴋʜᴜʟᴇ ʙᴀᴊᴀʀ ᴍᴇ ᴄʜᴏᴅ ᴅᴀʟᴀ 🤣🤣💋",
+                        "ꜱʜʀᴍ ᴋʀ ᴛᴇʀʏ ᴍᴀᴀ ᴄᴜᴅ ɢᴀɪ ʏʜᴀ",
+                        "ᴍᴇʀᴇ ʟᴜɴᴅ ᴋᴇ ʙᴀᴀᴀᴀᴀʟʟʟʟʟ ᴘᴋᴅ ᴊᴀʟᴅɪ sᴇ",
+                        "ᴛᴜ ᴇᴋ ᴋᴀᴀᴍ ᴋʀ ᴀᴘɴɪ ᴍᴀ ʙʜᴇɴ ᴋᴏ ᴄᴜᴅᴡᴀ ʟᴇ ᴍᴇʀᴇ sᴛʜ",
+                        "ʀɴᴅɪ ᴋᴇ ʟᴅᴋᴇᴇᴇᴇᴇᴇᴇᴇᴇ ᴄʜᴜᴘ ᴏʀ ᴄᴜᴅ ʏʜᴀ",
+                        "ᴄʜᴜᴘ ᴛᴍᴋᴄ ᴋɪᴅꜱꜱꜱꜱꜱꜱꜱꜱꜱꜱꜱꜱ",
+                        "ᴀᴘɴɪ ɢᴀᴀɴᴅ ᴍᴇɪɴ ᴍᴜᴛʜɪ ᴅᴀᴀʟ",
+                        "ᴍᴇʀᴀ ʟᴜɴᴅ ᴄʜᴏᴏꜱ ᴊᴀʟᴅɪ sᴇ",
+                        "ᴀᴘɴɪ ᴍᴀ ᴋᴏ ᴄᴜsᴡᴀ ᴍᴇʀᴀ ʟᴜɴᴅ",
+                        "ʙʜᴇɴ ᴋᴇ ʟᴀᴜᴅᴇ ᴛᴍᴄ",
+                        "ʙʜᴇɴ ᴋᴇ ᴛᴀᴋᴋᴇ ᴛᴍʟ",
+                        "ᴀʙʟᴀ ᴛᴇʀᴀ ᴋʜᴀɴ ᴅᴀɴ ᴄʜᴏᴅɴᴇ ᴋɪ ʙᴀʀɪɪɪ",
+                        "ʙᴇᴛᴇ ᴛᴇʀɪ ᴍᴀ ꜱʙꜱᴇ ʙᴅɪ ʀᴀɴᴅ",
+                        "ʟᴜɴᴅ ᴋᴇ ʙᴀᴀᴀʟ ᴊʜᴀᴛ ᴋᴇ ᴘɪꜱꜱꜱᴜᴜᴜᴜᴜᴜᴜ ᴛᴍᴋᴄ",
+                        "ʟᴜɴᴅ ᴘᴇ ʟᴛᴋɪᴛ ᴍᴀᴀᴀʟʟʟʟ ᴋɪ ʙᴏɴᴅ ʜ ᴛᴜᴜᴜ",
+                        "ᴋᴀꜱʜ ᴏꜱ ᴅɪɴ ᴍᴜᴛʜ ᴍʀᴋᴇ ꜱᴏᴊᴛᴀ ᴍ ᴛᴜ ᴘᴀɪᴅᴀ ɴᴀ ʜᴏᴛᴀᴀ",
+                        "ɢʟᴛɪ ᴋʀᴅɪ ᴛᴜᴊᴡ ᴘᴀɪᴅᴀ ᴋʀᴋᴇ ᴛᴇʀʏ ᴍᴀ ɴᴇ ᴀʙ ᴄᴜᴅ ᴛᴜ ʏʜᴀ",
+                        "ꜱᴘᴇᴇᴅ ᴘᴋᴅᴅᴅ",
+                        "ɢᴀᴀɴᴅ ᴍᴀɪɴ ʟᴡᴅᴀ ᴅᴀʟ ʟᴇ ᴀᴘɴɪ ᴍᴇʀᴀᴀᴀ",
+                        "ɢᴀᴀɴᴅ ᴍᴇɪɴ ʙᴀᴍʙᴜ ᴅᴇᴅᴜɴɢᴀᴀᴀᴀᴀᴀ",
+                        "ɢᴀɴᴅ ꜰᴛɪ ᴋᴇ ʙᴀʟᴋᴋᴋ ᴛᴜ ᴄᴜᴅ ʏʜᴀ",
+                        "ɢᴏᴛᴇ ᴋɪᴛɴᴇ ʙʜɪ ʙᴀᴅᴇ ʜᴏ, ʟᴜɴᴅ ᴋᴇ ɴɪᴄʜᴇ ʜɪ ʀᴇʜᴛᴇ ʜᴀɪ",
+                        "ʜᴀᴢᴀᴀʀ ʟᴜɴᴅ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀɪɴ",
+                        "ᴊʜᴀᴀɴᴛ ᴋᴇ ᴘɪꜱꜱᴜ ᴛᴍᴋᴄ sᴜɴ",
+                        "ᴛᴇʀɪ ᴍᴀ ᴋɪ ᴋᴀʟɪ ᴄʜᴜᴛ",
+                        "ᴋʜᴏᴛᴇʏ ᴋɪ ᴀᴜʟᴅᴀ ᴇʏ ᴛᴜ ʀᴀɴᴅʏᴋᴇ",
+                        "ᴋᴜᴛᴛᴇ ᴋᴀ ᴀᴡʟᴀᴛ ᴊᴀɪsᴀ ʟɢ ʀʜᴀ ᴛᴜ",
+                        "ᴋᴜᴛᴛᴇ ᴋɪ ᴊᴀᴛ ᴊᴀɪsᴀ ᴇʏ ᴛᴜ ",
+                        "ᴋᴜᴛᴛᴇ ᴋᴇ ᴛᴀᴛᴛᴀ ᴇʏ ᴛᴜ",
+                        "ᴛᴇᴛɪ ᴍᴀ ᴋɪ.ᴄʜᴜᴛ , ᴛᴇʀɪ ᴍᴀ ʀɴᴅɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪɪ",
+                        "ʟᴀᴠᴅᴇ ᴋᴇ ʙᴀʟ ᴘᴋᴅ ʟᴇ ᴍᴇʀᴇ",
+                        "ᴍᴜʜ ᴍᴇɪ ʟᴇʟᴇ ᴍᴇʀᴀ ʟᴜɴᴅ",
+                        "ʟᴜɴᴅ ᴋᴇ ᴘᴀꜱɪɴᴇ ᴄʜᴜᴘ ʙᴇᴛʜ ᴏʀ ᴄᴜᴅ",
+                        "ᴍᴇʀᴇ ʟᴡᴅᴇ ᴋᴇ ʙᴀᴀᴀᴀᴀʟʟʟ",
+                        "ʜᴀʜᴀʜᴀᴀᴀᴀᴀᴀ ᴛᴇʀʏ ᴍᴀᴀ ᴄᴜᴅ ɢᴀɪ",
+                        "ᴛᴜ ᴄʜᴜᴅ ɢʏᴀᴀᴀᴀᴀ",
+                        "ʀᴀɴᴅɪ ᴋʜᴀɴᴇ ᴋɪ ᴜʟᴀᴅᴅᴅ",
+                        "ꜱᴀᴅɪ ʜᴜɪ ɢᴀᴀɴᴅ",
+                        "ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴀɪɴ ᴋᴜᴛᴇ ᴋᴀ ʟᴜɴᴅ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ",
+                        "ᴛᴇʀᴇ ɢᴀᴀɴᴅ ᴍᴇɪɴ ᴋᴇᴇᴅᴇ ᴘᴀᴅᴀʏ",
+                        "ɴʏ ɴʏ ᴛᴇʀʏ ᴍᴀᴀ ʀᴀɴᴅɪ",
+                        "ꜱᴜɴɴ ᴍᴀᴅᴇʀᴄʜᴏᴅ ᴛᴍʟ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ʙʜᴏꜱᴅᴀ",
+                        "ʙᴇʜᴇɴ ᴋ ʟᴜɴᴅ ᴄʜᴜᴘᴄʜᴀᴘ ᴄᴜᴅ ʏʜᴀ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀ ᴄʜᴜᴛ ᴋɪ ᴄʜᴛɴɪɪɪɪ",
+                        "ᴍᴇʀᴀ ʟᴀᴡᴅᴀ ʟᴇʟᴇ ᴛᴜ ᴀɢᴀʀ ᴄʜᴀɪʏᴇ ᴛᴏʜ",
+                        "ᴄʜᴜᴘ ɢᴀᴀɴᴅᴜ",
+                        "ᴄʜᴜᴘ ᴄʜᴜᴛɪʏᴀ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴘᴇ ᴊᴄʙ ᴄʜᴀᴅʜᴀᴀ ᴅᴜɴɢᴀ",
+                        "ꜱᴀᴍᴊʜᴀᴀ ʟᴀᴡᴅᴇ",
+                        "ʏᴀ ᴅᴜ ᴛᴇʀɪ ɢᴀᴀɴᴅ ᴍᴇ ᴛᴀᴘᴀᴀ ᴛᴀᴘ��",
+                        "ᴛᴇʀɪ ʙᴇʜᴇɴ ᴍᴇʀᴀ ʀᴏᴢ ʟᴇᴛɪ ʜᴀɪ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴇ ꜱᴀᴀᴛʜ ᴍᴍꜱ ʙᴀɴᴀᴀ ᴄʜᴜᴋᴀ ʜᴜ���不�不",
+                        "ᴛᴜ ᴄʜᴜᴛɪʏᴀ ᴛᴇʀᴀ ᴋʜᴀɴᴅᴀᴀɴ ᴄʜᴜᴛɪʏᴀ",
+                        "ᴀᴜʀ ᴋɪᴛɴᴀ ʙᴏʟᴜ ʙᴇʏ ᴍᴀɴɴ ʙʜᴀʀ ɢᴀʏᴀ ᴍᴇʀᴀ�不",
+                        "ᴛᴇʀɪɪɪɪɪɪ ᴍᴀᴀᴀᴀ ᴋɪ ᴄʜᴜᴛᴛᴛ ᴍᴇ ᴀʙᴄᴅ ʟɪᴋʜ ᴅᴜɴɢᴀ ᴍᴀᴀ ᴋᴇ ʟᴏᴅᴇ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ʟᴇᴋᴀʀ ᴍᴀɪ ꜰᴀʀᴀʀ",
+                        "ᴛᴇʀʏ ᴍᴀᴀ ʀᴀɴɪᴅɪɪɪ",
+                        "ᴄʜᴜᴘ ʙᴀᴄʜᴇᴇ ᴛᴍᴋᴄ",
+                        "ᴛᴇʀʏ ᴍᴀᴋᴏᴄʜᴏᴅᴜ",
+                        "ʀᴀɴᴅɪ ᴍᴀᴀ ᴛᴇʀʏ",
+                        "ᴛᴜ ʀᴀɴᴅɪ ᴋᴇ ᴘɪʟʟᴀ ᴇʏ",
+                        "ᴛᴇʀɪɪɪɪɪ ᴍᴀᴀᴀ ᴋᴏ ʙʜᴇᴊᴊᴊ",
+                        "ᴛᴇʀᴀᴀ ʙᴀᴀᴀᴀᴘ ʜᴜ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʜᴀᴀᴛ ᴅᴀᴀʟʟᴋᴇ ʙʜᴀᴀɢ ᴊᴀᴀɴᴜɢᴀ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ꜱᴀʀᴀᴋ ᴘᴇ ʟᴇᴛᴀᴀ ᴅᴜɴɢᴀ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ɢʙ ʀᴏᴀᴅ ᴘᴇ ʟᴇᴊᴀᴋᴇ ʙᴇᴄʜ ᴅᴜɴɢᴀ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍÉ ᴋᴀᴀʟɪ ᴍɪᴛᴄʜ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ꜱᴀꜱᴛɪ ʀᴀɴᴅɪ ʜᴀɪ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴋᴀʙᴜᴛᴀʀ ᴅᴀᴀʟ ᴋᴇ ꜱᴏᴜᴘ ʙᴀɴᴀᴜɴɢᴀ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                        "ᴛᴇʀɪ ᴍᴀᴀᴀ ʀᴀɴᴅɪ ʜᴀɪ",
+                        "ᴛᴇʀɪ ᴍᴀᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ᴅᴇᴛᴏʟ ᴅᴀᴀʟ ᴅᴜɴɢᴀ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀᴀᴀ ʙʜᴏꜱᴅᴀᴀ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ʟᴀᴘᴛᴏᴘ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ʀᴀɴᴅɪ ʜᴀɪ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ʙɪꜱᴛᴀʀ ᴘᴇ ʟᴇᴛᴀᴀᴋᴇ ᴄʜᴏᴅᴜɴɢᴀ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴀᴍᴇʀɪᴄᴀ ɢʜᴜᴍᴀᴀᴜɴɢᴀ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋɪ ᴄʜᴜᴛ ᴍᴇ ɴᴀᴀʀɪʏᴀʟ ᴘʜᴏʀ ᴅᴜɴɢᴀ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴇ ɢᴀɴᴅ ᴍᴇ ᴅᴇᴛᴏʟ ᴅᴀᴀʟ ᴅᴜɴɢᴀ",
+                        "ᴛᴇʀɪ ᴍᴀᴀᴀ ᴋᴏ ʜᴏʀʟɪᴄᴋꜱ ᴘɪʟᴀᴜɴɢᴀ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ꜱᴀʀᴀᴋ ᴘᴇ ʟᴇᴛᴀᴀᴀ ᴅᴜɴɢᴀᴀᴀ",
+                        "ᴛᴇʀɪ ᴍᴀᴀ ᴋᴀᴀ ʙʜᴏꜱᴅᴀ",
+                        "ᴍᴇʀᴀᴀᴀ ʟᴜɴᴅ ᴘᴀᴋᴀᴅ ʟᴇ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                        "ᴄʜᴜᴘ ᴛᴇʀɪ ᴍᴀᴀ ᴀᴋᴀᴀ ʙʜᴏꜱᴅᴀᴀ",
+                        "ᴛᴇʀɪɪɪ ᴍᴀᴀ ᴄʜᴜꜰ ɢᴇʏɪɪ ᴋʏᴀᴀᴀ ʟᴀᴡᴅᴇᴇᴇ",
+                        "ᴛᴇʀɪɪɪ ᴍᴀᴀ ᴋᴀᴀ ʙᴊꜱᴏᴅᴀᴀᴀ",
+                        "ᴍᴀᴅᴀʀxʜᴏᴅᴅᴅ",
+                        "ᴛᴇʀɪᴜᴜɪ ᴍᴀᴀᴀ ᴋᴀᴀ ʙʜꜱᴏᴅᴀᴀᴀ",
+                        "ᴛᴇʀɪɪɪɪɪɪ ʙᴇʜᴇɴɴɴɴ ᴋᴏ ᴄʜᴏᴅᴅᴅᴜᴜᴜᴜ ᴍᴀᴅᴀʀxʜᴏᴅᴅᴅᴅ",
+                        "ᴛᴜ ɴɪᴋᴀʟ ᴍᴀᴅᴀʀᴄʜᴏᴅ",
+                        "ᴄʜᴜᴘ ʀᴀɴᴅɪ ᴋᴇ ʙᴀᴄʜᴇ",
+                        "ᴛᴇʀᴀ ᴍᴀᴀ ᴍᴇʀɪ ᴊᴀᴀɴ ᴇʏ",
+                        "ᴛᴇʀɪ ꜱᴇxʏ ʙᴀʜᴇɴ ᴋɪ ᴄʜᴜᴛ ᴏᴘ"
+                        "👩🏿      👩🏻‍🦳        👵🏼         👱🏿‍♀️     \n👖      👖        👖         👖     \n\nतेरी बहन /तेरी माँ /तेरी दादि/ तेरीभुआ.\n\nसब की 𝐂hu𝐃𝐀i hogi",
+                        "तेरी माँ के（ ͜.人 ͜.）दबा दूंगा",
+                        "तेरी मा चुदी हुई थी\nचुदी हुई है\nऔर चुदी हुई रहेगी \n\n\"MARK MY WORD\" 😈",
+                        "𝐊ʏᴀ?\n𝐂ʏᴀ?\n𝐂ᴜᴀ?\n\n𝐌ᴛᴛ 𝐊ʀʀ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴛ 𝐏𝐞 𝐓ʜ𝐀ᴘᴘᴀᴅ 𝐌ᴀ𝐚ʀ 𝐃ᴜɴɢᴀ",
+                        "˚∧＿∧  　+        — ͟͞͞🥛\n(  •‿• )つ  — ͟͞͞ 🥛 \nSpecial attack tery mummy ke chuchiya ka dudu 🐱🎀",
+                        "Aaj Rakshabandhan Ke Avsar Pr तेरी मांँ मेरे लंड पर राखी Bandh Ke चुदेगी 😍🥰",
+                        "Sun दोस्त terko ye तीन चीजे कभी nahi भूलनी chaiye 😁👇🏻🤙🏿\n\n1 :- तेरी औकात\n2 :- तेरी बहन का फटा bhosda\n3 :- तेरी मां के भोसड़े में मेरा मूत",
+                        "Tery Maa Behen Ke Boshde Me Kya Maarun Jaldi Bata 😜🤙",
+                        "Tery Maa\nⓘ Verified Randy // 🦅🔥",
+                        "𝐒ᴀʏ 𝐑ᴀɴᴅɪʙᴀᴀᴢ 𝐃ᴀᴅᴅʏ 𓆩💗𓆪",
+                        "𝐖ᴏ ʙʜɪ ᴋʏᴀ ᴅɪɴ ᴛʜᴇ ᴊᴀʙ ᴛʀʏ ᴍᴀᴀ ᴍᴜᴊʜᴇ 𝐀ᴘɴᴀ 𝐂ʜᴜᴛ 𝐃ᴇᴛɪ ᴛʜɪ ʏᴀᴀʀ 💔🥀👌🏻",
+                        "𝐀ᴡᴀᴢ 𝐍ɪᴄʜᴇ 𝐆ᴜʟᴀᴀᴍ 🤢👇🏻",
+                        "𝐓ʀʏ 𝐌ᴀᴀ ɴᴇ 𝐂ʜᴜᴅɴᴇ 𝐌ᴀɪ ɢᴏʟᴅ 𝐌ᴇᴅᴀʟ 𝐉ᴇᴇᴛᴀ ᴇʏ 𝐃ᴏꜱᴛ 🤩👑",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐌ᴇʀᴀ 𝐋ᴜɴᴅ 🖕🏻😈",
+                        "𝐁ʜᴏꜱᴀᴅɪᴋᴇ 𝐀ᴘɴɪ 𝐁ᴇʜᴇɴ 𝐂ʜᴜᴅᴀ 🖕🏻😈",
+                        "𝐑ᴀɴᴅɪ ᴋᴇ 𝐁ᴀᴄᴄʜᴇ 𝐀ᴜᴋᴀᴛ 𝐌ᴇ 𝐑ᴇʜ 🖕🏻😈",
+                        "𝐌ᴀᴅᴀʀᴄʜᴏᴅ 𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 🖕🏻😈",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋᴀ 𝐁ʜᴏꜱᴅᴀ ᴋʜᴏʟ ᴅᴜɴɢᴀ 🔓😈",
+                        "𝐁ʜᴇɴᴄʜᴏᴅ ??ᴘɴɪ 𝐀ᴜᴋᴀᴛ 𝐌ᴇ 𝐑ᴇʜ 🤡💩",
+                        "𝐓𝐌𝐊𝐂 ᴘᴇ 𝐂ʜᴀᴘᴘᴀʟ 𝐌ᴀᴀʀᴜɴɢᴀ 👟💥",
+                        "𝐁ʜᴏꜱᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐊ʜᴀɴᴅᴀɴ ᴋɪ 𝐁𝐊𝐂 💀🖕🏻",
+                        "𝐑ᴀɴᴅɪ ᴋɪ 𝐀ᴜʟᴀᴅ ᴄʜᴜᴘ ʜᴏ ᴊᴀ 🔇😒",
+                        "𝐑ᴀɴᴅɪʙᴀᴀᴢ ka 𝐆ᴜʟᴀᴀᴍ ey ᴛᴜ ᴀʙ ᴛᴜ ʏʜᴀ ᴄᴜᴅᴋᴇ ᴅɪᴋʜᴀ ᴛᴇʀʏ ᴍᴀᴋᴏ ʟᴇᴋʀ 👑😎",
+                        "𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐌ɪʀᴄʜɪ 🌶️🖕🏻",
+                        "𝐌ᴀᴅᴀʀᴄʜᴏᴅ 𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐏ᴀɪʀ 🦶🏻😈",
+                        "𝐁ʜᴏꜱᴀᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋᴀ 𝐁ʜᴏꜱᴅᴀ 🗑️😏",
+                        "𝐑ᴀɴᴅɪ ᴋᴀ 𝐏ɪʟʟᴀ ʜᴀɪ ᴛᴜ 🐕💩",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋᴏ 𝐁ᴀᴢᴀᴀʀ 𝐌ᴇ 𝐂ʜᴏᴅᴜɴɢᴀ 🌃😈",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐆ᴀʀᴀᴍ 𝐓ᴇʟ 🌡️🖕🏻",
+                        "𝐌ᴀᴅᴀʀᴄʜᴏᴅ 𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴍᴇʀɪ 𝐑ᴀɴᴅɪ 💋👿",
+                        "𝐑ᴀɴᴅɪ ᴋᴇ 𝐁ᴀᴄᴄʜᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 🖕🏻😈",
+                        "𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋᴏ 𝐑ᴀᴀᴛ ʙʜᴀʀ 𝐂ʜᴏᴅᴜɴɢᴀ 🌙😈",
+                        "𝐑ᴀɴᴅɪ ᴋᴀ 𝐁ᴀᴄᴄʜᴀ ʜᴀɪ ᴛᴜ ꜱᴀᴀʟᴇ 🤡💀",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴛ 𝐌ᴇ 𝐌ᴇʀᴀ 𝐉ᴏᴏᴛᴀ 👞🖕🏻",
+                        "𝐑ᴀɴᴅɪʙᴀᴀᴢ 𝐃ᴀᴅᴅʏ ᴋᴀ 𝐆ᴜʟᴀᴀᴍ ʜᴀɪ ᴛᴜ 🥀😤",
+                        "ᴊɪꜱ ᴅɪɴ ᴛᴜ ᴘᴀɪᴅᴀ ʜᴜᴀ 𝐓ᴇʀɪ 𝐌ᴀᴀ ɴᴇ ꜱᴏᴄʜᴀ ᴛʜᴀ ᴋᴀꜱʜ ᴀʙᴏʀᴛ ᴋᴀʀ ᴅᴇᴛɪ 💀🥀",
+                        "𝐀ᴘɴɪ 𝐀ᴜᴋᴀᴛ ᴅᴇᴋʜ ᴋᴜᴛᴛᴇ 𝐓ᴇʀʏ 𝐌ᴀ 𝐂ᴜᴅ 𝐑ʜɪ🐕😂",
+                        "𝐓ᴇʀʏ 𝐌ᴀ 𝐂ᴜᴅ 𝐑ʜɪ 𝐆ᴀʟɪ ᴋᴀ 𝐊ᴜᴛᴛᴀ ʜᴀɪ ᴛᴜ 🐕🗑️",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ɴᴇ ᴍᴜᴊʜᴇ ᴅᴇᴋʜ ᴋᴇ ꜱᴏᴄʜᴀ ᴋᴀꜱʜ ʏᴇ ᴍᴇʀᴀ ʙᴇᴛᴀ ʜᴏᴛᴀ 🫦😏",
+                        "𝐂ʜᴜᴘ ᴋᴀʀ 𝐌ᴀᴅᴀʀᴄʜᴏᴅ ᴛᴇʀɪ ᴀᴜᴋᴀᴛ ɴᴀʜɪ ᴍᴇʀᴇ ꜱᴀᴀᴍɴᴇ ʙᴏʟɴᴇ ᴋɪ 🤐💀",
+                        "𝐓ᴇʀɪ 𝐌ᴀᴀ ᴋɪ 𝐂ʜᴜᴅᴀɪ ᴍᴇ ᴊᴀʙ ᴍᴀɪ ᴛʜᴀ ᴛᴏ ᴛᴜ ᴘᴀɪᴅᴀ ʜᴜᴀ 💀😂",
+                        "𝐁ʜᴀɢ ʏᴀʜᴀɴ ꜱᴇ ᴋᴜᴛᴛᴇ ᴋᴇ ᴘɪʟʟᴇ 🐕💨",
+                        "𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋɪ ꜱᴀᴅɪ 𝐌ᴇ ᴍᴇʀᴀ ʟᴜɴᴅ 💍😈",
+                        "𝐌ᴀᴅᴀʀᴄʜᴏᴅ ᴀᴘɴɪ 𝐌ᴀᴀ ᴍᴀᴛ ᴄʜᴜᴅᴀ 🖕🏻👹",
+                        "𝐁ʜᴇɴᴄʜᴏᴅ 𝐓ᴇʀɪ 𝐊ʜᴀɴᴅᴀɴ ᴋɪ 𝐁𝐊𝐂 💀🖕🏻",
+                        "tery ma cudke pgl dekh..𝐁𝐊𝐂 🦴🐕",
+                        "𝐊ʏᴀ 𝐑ᴇ 𝐑ᴀɴᴅɪᴋᴇ 𝐂ᴏᴏʟ 𝐁ᴀɴᴇɢᴀ 𝐓ᴜ 𝐂ʜᴀʟ 𝐀ʙ 𝐂ʜᴜᴅ 𝐀ᴘɴᴇ 𝐁ᴀᴀᴘ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 𝐒ᴇ - 🦢💘",
+                        "tery 𝐌ᴀᴀ cudke 𝐌ᴀʀʀ  𝐆ᴀʏɪ 𝐘ᴀᴀʀ - 𝐉ᴀɪ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 ! 🌙",
+                        "acha beta 😂🔥👊🏻 ? coi na me toh HATER codunga tery mako 😹💔🔥😆👊🏻💥",
+                        "chudke bhaga kaise 😂💥🤣🤘🏻",
+                        "ne toh - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 ka lun muh me lelia tune or tery maa ne😂🙏🏻😂🙏🏻",
+                        "try maa सूर्य☀ nikalte hi pel du 😹🔥💔",
+                        "mkl lun te vaj 😂✊🏻💦",
+                        "𝗧ᴍᴋ𝗕 pe - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 ka hamla 😂⚔🔥💥",
+                        "𝐂ʜʟ 𝐇ᴀʀᴍᴢᴀᴅ𝐈 𝐊ᴇ लड़के 💛🤍🩵",
+                        "oi 𝐓ᴇʀɪ 𝐌‌ᴀᴀ गुलाम ₰🖤",
+                        "chl rndyce chud ke dikha 😂💥🤣🔥",
+                        "tery 𝐌ᴀᴀ or bhen 𝐌ᴀʀʀ  𝐆ᴀʏɪ naacho 💃🏻💃🏻🕺🏻🎶😂😆💞🔥 !",
+                        "tera baap bass - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 ey 😂🎀",
+                        "try maa hagte hue paad mari -#😹🔥🥀",
+                        "𝐓ᴇʀɪ 𝐌ᴜᴍᴍʏ 𝐂ʜᴏᴅ 𝐃ɪ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 𝐍ᴇ 𝐁ᴡᴀʜᴀʜᴀʜᴀ ⚜",
+                        "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
+                        "नहीं नहीं तेरी मां को 𝐒ɪʀғ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
+                        "तेरी मां का 𝐒ᴛʏʟɪsʜ भोसड़ा 😱",
+                        "𝑻𝒆𝒓?? 𝒎𝒂𝒂 𝒓𝒂𝒏𝒅𝒂𝒍 𝒉 𝒃𝒂𝒔 𝒃𝒂𝒂𝒕 𝒌𝒉𝒂𝒕𝒂𝒎 😡🔥",
+                        "सोच तेरी बहन को - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 बाप का गुलाम चोद रहा 😎🔥",
+                        "Hello hello?? Oxygen aarahi है? रण्डी पुत्र 🧘🏻",
+                        "Shut up रंडीके वरना दुनिया यही बोलेगी तेरी बहन - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 /~ 👑 बाप से सही chudi 🥵🔥",
+                        "ᴛᴜ ᴏʀ ᴛᴇʀɪ ᴍᴀᴀ ᴅᴏɴᴏ - 𝐑𝐀𝐍𝐃𝐈𝐁𝐀𝐀𝐙 बाप के ʟɴᴅ sᴇ ᴋᴀʙʜɪ ᴜᴛʜ ɴʜɪ ᴘᴀʏᴇ 😂🔥",
+                        "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके MOAN करती है ! 🛐",
+                        "Tᴇʀɪ Mᴀᴀ Rᴀɴᴅɪ (🩷)—(❤️)—(🧡)—(💛)—(💚)—(🩵)—(💙)—(💜)—(🖤)—(🩶)—(🤍)—(🤎)—(🌸)—(✨)—(🌙)—(⭐)—(🦋)—(💎)—(👑)—(⚡)—(🔥)—(🌌)—(🎀)—(💫)—(🪽)—(🫧)—(🌸)—(💘)—(💓)—(💖)—(💕)—(💞)",
+                        "Teri make hath me chakku se hole karke lund daluga apna 🤢🤢",
+                        "Subha ho ya sham chudte rhena hai teri maaka kaam😂🔥😂🔥😂🔥",
+                        "𝐓ᴜ 𝐒ᴡɪᴘᴇ 𝐊ᴀʀᴛᴀ 𝐑ᴇʜ 𝐌ᴀɪ ᴄʜᴀʟᴀ 𝐓ᴇʀɪ 𝐁ᴇʜᴇɴ ᴋᴇ 𝐒ᴀᴛʜ 𝐊ʜᴇʟɴᴇ 😭😭",
+                        "🍑\n🟨  😂\n🟨🟥🟥🟨\n     🟥🟥🟨\n     ⬛⬛ \n     ⬛⬛\nTery ma ki bund hi okhad li.",
+                        "𝘗𝘺𝘢𝘴 𝘭𝘢𝘨 𝘳𝘢𝘩𝘪 𝘵𝘦𝘳𝘪 𝘮𝘢𝘢 𝘬𝘰 𝘤𝘰𝘥 𝘬𝘦 𝘱𝘺𝘢𝘴 𝘣𝘶𝘫𝘩𝘢𝘶𝘯𝘨𝘢 🖕🏿😂🔥🙏🏿",
+                        "▶︎ •၊၊၊|။||။‌‌‌‌‌၊|• 0:60\n𝘋𝘦𝘬𝘩 𝘵𝘦𝘳𝘪 𝘣𝘦𝘩𝘦𝘯 ??𝘪 𝘤𝘩𝘪𝘬𝘩 😂😱🔥🙏🏿",
+                        "      ᴹᴱ:\n👆       🤬 ᴷᴬᴴᴬ ᴮᴴᴬᴳᵀᴵ ᴴᴬᴵ ᴿᴬᴺᴰᴵ\n  🐛💤👔🤳\n            ⛽  👢\n          ⚡👟\n       🎸    🌂\n      👢       👢     ᵀᴱᴿᴵ ᴹᴬᴬ:🏃‍♀‍➡️ᴹᵁᴶᴴᴱ ᴹᴬᵀ ᶜᴴᴼᴰᴼ",
+                        "🙌\n😛 ᴹᴱ:\n  |      👩 ᵀᴱᴿᴵ ᴹᴬᴬ:\n  |   8_/ 👐\n / \\  / \\\n  \"Take a look how i am chodunging your Mummy in ghodi pose 🗿\"",
+                        "../\\_/\\\n  ( • _ •)  \n  /    >🍆 \n\nʏᴇ ᴘᴀᴋᴀᴅᴏ ᴀᴘᴋɪ ᴍᴏᴍ ᴋᴏ ᴀᴘɴᴇ ᴄʜᴜᴛ ᴍᴇ ɢʜᴜssᴀ ɴᴇ ᴍᴇ ᴋᴀᴀᴍ ᴀʏᴇɴɢᴀ 🤗",
+                        "ㅤㅤ😎 ᴹᴱ:\n          |\\👐\n         / \\_\n━━━━━┓ ＼＼\n┓┓┓┓┓┃ᵀᴼᴴᴬᴿ ᴿᴬᴺᴰᴵ ᴹᴬᴬ:\n┓┓┓┓┓┃ ヽ😩ノ\n┓┓┓┓┓┃ 　 /　ᴼᴿᴵᴵ ᴬᴹᴹᴬ\n┓┓┓┓┓┃  ノ)　\n┓┓┓┓┓┃\n\nLE TERI MAA KO CHOD KAR FHEK DIA 🥸",
+                        "😎 ᴍᴀɪ:\nく|)へ\n   〉\n￣┗┓       ヾ😫ｼ ᴛᴇʀɪ ᴍᴀᴀ:\n         ┗┓   ヘ/    \n             ┗┓ノ\n                 ┗┓       ヾ😨ｼ ᴛᴇʀᴀ ʙᴀᴀᴘ:\n                      ┗┓   ヘ/\n                          ┗┓ノ\n                               ┗┓       ヾ😩ｼ ᴛᴇʀᴀ ᴄʜᴀᴄʜᴀ:\n                                   ┗┓   ヘ/    \n                                       ┗┓ノ\nᴅᴇᴋʜ ᴀɪsᴇ ʜɪ ʟᴀᴀᴛ ᴍᴀᴀʀ ᴋᴀʀ ʙʜᴀɢᴀᴜɴɢᴀ ᴛᴇʀᴇ ᴋʜᴀᴀɴᴅᴀɴ ᴋᴏ 🤫🤣",
+                        "╭👇 ͡ ͡° ͜   ͡ ͡°)╭👇 \n      \\   .   .\\\n        \\        \\\n         \\╰[ ]╯\\ \n          /   U   \\\n       👟       👟\n\nᴛᴇʀɪ ᴍᴀᴀ ᴋᴏ ᴍᴇʀᴀ ʟᴜɴᴅ ᴍᴜʙᴀʀᴀᴋ ʜᴏ 😝",
+                        "Once a man said: \n\"You deserve all the chudayi and teri maa ki chutt dhulayi, and this text proves it! You should be proud!\" 🕊️",
+                        "😏 ᴍᴀɪ:\n    | 👐💵\n    |//    💵\n    |          💸 ᴛᴇʀɪ ʀᴀɴᴅʏ ᴍᴀᴀ:\n   /\\            👯👯\n👟👟\n\nDᴇᴋʜ Kᴇsᴇ Tᴇʀɪ Mᴀᴀ Kᴏ Aᴘɴᴇ Pᴀɪsᴏ Sᴇ Rᴀɴᴅɪ Nᴀᴄʜ Kᴀʀᴡᴀ Rʜᴀ Hᴜ 🤙😎",
+                        "Loading your maa ki chudai video 😳\n\n■■■■■■■■□\n99%",
+                        "Sun दोस्त terko ye तीन चीजे कभी nahi भूलनी chaiye  😁👇🏻🤙🏿\n\n1 :- तेरी औकात\n2 :- तेरी बहन का फटा bhosda\n3 :- तेरी मां के भोसड़े में मेरा मूत",
+                        "this message could't be display because teri maa randy ey",
+                        "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
+                        "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
+                        "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
+                        "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
+                        "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
+                        "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
+                        "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
+                        "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
+                        "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
+                        "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
+                        "तेरे मां के दूदू के बीच मेरा lund fas gaya oops 🤪（ ͜.🍆 ͜.）",
+                        "𝐓ᴇʀʏ 𝐁ʜᴇ𝐍 𝐊ᴇ ( ͜. ㅅ ͜. )🥛 ʏᴜᴍᴍʏ ",
+                        "𓂃☁︎ 𓂃𝐒ɪᴅᴇ 𝐇ᴀᴛ 𝐆ᴜʟᴀᴍ 𝐓ᴇʀʏ 𝐌ᴀᴀ 𝐊ᴏ 𝐂ʜᴏᴅɴᴇ  मेरी रेलगाड़ी आ रही .-‘🚂-‘.ᯓᡣ𐭩______ 𓂃☁︎ 𓂃",
+                        "˙✧˖°📷༘ ⋆｡° 𝐓ᴇʀʏ 𝐌ᴀ  𝐊ᴀ 𝐂ʜɪʟᴅ 𝐏ᴏʀɴ 𝐑ᴇᴄᴏʀᴅ 𝐇ᴏɢʏᴀ 𝐀ʙ 𝐓ᴏ 𝐒ɪᴅʜᴀ 𝐕ɪʀᴀʟ 𝐇ᴏɢᴀ 𝐘ᴇ ˙✧˖°📷༘ ⋆｡°",
+                        "𓂃✍︎ 𝑵ʏ 𝑵ʏ 𝑨ʙ 𝑲ᴜᴄʜ 𝑵ʏ 𝑯ᴏ 𝑺ᴋᴛᴀ 𝑻ᴇʀɪ  𝑪ᴜᴅᴀɪ 𝑲ɪ 𝑺ᴄʀɪᴘᴛ 𝑨ʙ 𝑳ᴇᴀᴋ 𝑯ᴏᴋᴇ 𝑯ʏ 𝑴ᴀɴᴇɢɪ 𓂃✍︎",
+                        "⋆⭒˚.⋆🔭 𝐒ʜᴜᴛ 𝐔ᴘ 𝐑ᴀɴᴅɪᴋᴇ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ɪ 𝐂ʜᴜᴅᴀɪ 𝐄ɴᴊᴏʏ 𝐊ʀ 𝐑ᴀʜᴀ 𝐓ᴇʟᴇ𝐒ᴄᴏᴘᴇ 𝐒ᴇ⋆⭒˚.⋆🔭",
+                        "🇮🇳 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ɴᴅɪᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇳",
+                        "🇯🇵 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐉ᴀᴘᴀɴ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇯🇵",
+                        "🇺🇸 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐒𝐀 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇺🇸",
+                        "🇬🇧 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐔𝐊 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇬🇧",
+                        "🇰🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐊ᴏʀᴇᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇰🇷",
+                        "🇩🇪 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐆ᴇʀᴍᴀɴʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇩🇪",
+                        "🇫🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐅ʀᴀɴᴄᴇ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇫🇷",
+                        "🇮🇹 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐈ᴛᴀʟʏ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇮🇹",
+                        "🇧🇷 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐁ʀᴀᴢɪʟ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇧🇷",
+                        "🇨🇦 ✦ 𝐓ᴇʀɪ 𝐌ᴀᴀ 𝐊ᴇ 𝐒ᴀᴛʜ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐁ᴀᴀᴘ 𝐀ᴜʀ  𝐂ᴀɴᴀᴅᴀ 𝐖ᴀʟᴇ 𝐁ʜɪ 𝐂ʜɪʟʟ 𝐊ᴀʀ 𝐑ʜᴇ ✦ 🇨🇦",
+                        "𓂃˖˳·˖ ִֶָ ⋆🧡͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚🧡 ݁˖⭑.ᐟ",
+                        "𓂃˖˳·˖ ִֶָ ⋆💛͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💛 ݁˖⭑.ᐟ",
+                        "𓂃˖˳·˖ ִֶָ ⋆💚͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💚 ݁˖⭑.ᐟ",
+                        "𓂃˖˳·˖ ִֶָ ⋆💙͙⋆ ִֶָ˖·˳˖𓂃 ִֶָ⁀➴༯ 𝐒𝐋𝐀𝐕𝐄 ִֶָ. ..𓂃 ࣪ ִֶָ🌈་༘࿐ 𝐓𝐌𝐊𝐂 -/- ⋆˚💙 ݁˖⭑.ᐟ",
+            ]
+
+            # ─── FUN RAIDS TEXT LISTS (Menu8) ──────────────────────────────────────
+
+            shayari_texts = [
+                "तेरी आँखों में खोया रहूँ, तू मिले तो ये जहाँ भूल जाऊँ। 💕",
+                "प्यार में क्या रखा है, बस तेरे बिना लगता है जीना भी सज़ा नहीं। 💔",
+                "चाँद से खूबसूरत है तेरा चेहरा, तू है तो दुनिया लगती है मेरी। 🌙",
+                "तेरी यादों में खोया रहूँ, हर सांस में तू बसी है। 💭",
+                "हर दिन तुझसे प्यार बढ़े, हर सांस तुझसे निभे। 💗",
+                "तेरी हँसी में जान है, तेरी बातों में पहचान है। 😊",
+                "तेरी बाहों में मिली राहत, तेरी आँखों में मिला सुकून। 🌹",
+                "तू है तो हर ग़म भूला, तू है तो ये दिल झूला। 🎠",
+                "हर रोज़ तुझसे प्यार हो, हर शाम तुझपे निसार हो। 🌅",
+                "तेरी मुस्कान है जादू, जो बिखेरे हर दिन बहार। 🌺",
+                "Your love is the poetry my heart always wanted to write. 📝💖",
+                "In a world full of trends, I want to remain your timeless classic. 🌟",
+                "You are the missing piece of my soul, the calm in my chaos. 🧩",
+                "Every love story is beautiful, but ours is my favorite chapter. 📖",
+                "You are the sun in my day, the moon in my night, and the stars in my dreams. 🌞🌙",
+                "Meeting you was fate, becoming your friend was a choice, but falling in love with you was beyond my control. 💫",
+                "I didn't choose you, my heart did. And it doesn't know how to unchoose. ❤️‍🔥",
+                "You are not just my love; you are my home. 🏠",
+                "Your smile is the best part of my day, and your laugh is my favorite sound. 😄🎶",
+                "You are my today and all of my tomorrows. 📅❤️",
+                "Teri smile dekh ke lagta hai, jaise mera wifi full signal pe aa gaya. 📶😄",
+                "Pyaar kya hai? Maine tujhse jaana, tera naam sunke hi dil ho jaata hai deewana. 🫀",
+                "Tu hai toh din hai, warna toh har pal hai night shift. 🌃",
+                "Dil ki baat kehni thi, bas yahi socha, tujhse milke samjha, pyaar kya hai bhai! 🥰",
+                "Teri ek smile pe, main de doon jaan bhi, par tu maange toh, de doon duniya bhi. 😄🌎",
+                "Chand se chura ke laaya hoon, teri muskaan, rakh lo dil mein, yeh hai meri jaan. 🌙💖",
+                "Tere bina dil hai veeran, tu aaja ve, dil ki yeh raah, hai bas teri hi ore. 🛤️💔",
+                "Pyaar ka sabak mila, tujhse hi yaar, ab toh bas tera hi hai, yeh dil bekarar. 🫀",
+                "Kya baat hai tujh mein, hai koi jaadu, dekhta hi rahu, na ho mera wajood. 👀✨",
+                "Tu hi meri subah, tu hi mera sukoon, tere bina toh jaise, khaali hai yeh khwabon ka jahoon. ☁️"
+            ]
+
+            rizz_texts = [
+                "क्या तुम सड़क हो? क्योंकि मैं हर दिन तुम्हें क्रॉस करना चाहता हूँ। 😏",
+                "तुम्हारी हँसी सुनकर लगता है जैसे मेरा दिन बन गया। 😄",
+                "तुम्हारी आँखों में खो जाऊँ तो वापस न आऊँ। 👀",
+                "क्या तुम्हारे पास कोई मैप है? क्योंकि मैं तुम्हारे दिल में खो गया हूँ। 🗺️",
+                "तुम बिना makeup के भी परफेक्ट हो – लेकिन मैं तो तुम्हें हर तरह से चाहता हूँ। 💋",
+                "मैं तुमसे प्यार नहीं करता – मैं तो तुम्हें worship करता हूँ। 🙌",
+                "तुम मेरे दिन की सबसे अच्छी notification हो। 🔔",
+                "तुम मेरे सबसे पसंदीदा गाने की धुन हो। 🎶",
+                "मैं तुम्हें चाँद से भी ऊपर रखता हूँ – क्योंकि तुम तो सूरज हो। ☀️",
+                "तुम मेरी रूह की तसल्ली हो – बस साथ रहो। 🕊️",
+                "Are you a magician? Because whenever I look at you, everyone else disappears. 🎩✨",
+                "Do you have a map? I keep getting lost in your eyes. 🗺️👀",
+                "Is your name Google? Because you have everything I'm searching for. 🔍💕",
+                "Are you a camera? Because every time I look at you, I smile. 📸😊",
+                "If beauty were a crime, you'd be serving a life sentence. ⛓️🔥",
+                "Do you believe in love at first sight, or should I walk by again? 🚶‍♂️🔄",
+                "Excuse me, but I think you dropped something – my jaw. 👇😮",
+                "Are you Wi-Fi? Because I'm feeling a connection. 📶❤️",
+                "If you were a vegetable, you'd be a cute-cumber! 🥒😉",
+                "You must be a 10 because you've got me feeling like a 1 with you. 1️⃣0️⃣",
+                "Tera naam kya hai? Kyunki mera plan hai tera baap banana! 😎👀",
+                "Kya tum Google ho? Kyunki mujhe tum mein woh sab milta hai jo main dhundh raha tha. 🔍💕",
+                "Tum toh mere WiFi jaisi ho, bina tumhare connection hi nahi aata. 📶😏",
+                "Kya tum chocolate ho? Kyunki main toh din raat tumhe kha sakta hoon. 🍫😋",
+                "Tumhari smile dekh ke lagta hai, mera din set aur raat forget. 🌞",
+                "Main driver nahi hoon, par tumhare dil ki steering le sakta hoon? 🚗💨",
+                "Kya tum Starbucks ho? Kyunki main har din tumhara naam pukaarna chahta hoon. ☕😄",
+                "Meri battery low hai, kya tum mere charger ban sakte ho? 🔋❤️",
+                "Kya tum doctor ho? Kyunki mera dil dekh ke toh tumne dhadkana sikha diya. 👨‍⚕️💓",
+                "Tumhari height kya hai? Kyunki lagta hai tum heaven se chhidi hui ho. 📏👼"
+            ]
+
+            pickup_texts = [
+                "क्या तुम्हारा नाम Google है? क्योंकि तुममें वो सब है जो मैं ढूंढ रहा हूँ। 🔍",
+                "तुम्हारी आँखें तारे हैं और मैं उनमें खो जाना चाहता हूँ। ✨",
+                "क्या तुम WiFi हो? क्योंकि मुझे तुमसे कनेक्शन महसूस हो रहा है। 📶",
+                "तुम्हारी मुस्कान देखकर मेरा दिन बन जाता है। 😊",
+                "क्या तुम चॉकलेट हो? क्योंकि मैं तुम्हें हर वक़्त खाना चाहता हूँ। 🍫",
+                "तुम्हारे बिना मेरी ज़िंदगी अधूरी है। 💔",
+                "तुम मेरे सपनों की रानी हो। 👑",
+                "तुम्हारी बातें सुनकर दिल खुश हो जाता है। 💕",
+                "क्या तुम मेरे साथ चलोगी? 🚶‍♀️",
+                "तुम मेरी दुनिया हो। 🌍",
+                "Are you a time traveler? Because I see you in my future. ⏳",
+                "Is your name Angel? Because you fell from heaven. 👼",
+                "Do you have a Band-Aid? Because I just scraped my knee falling for you. 🩹",
+                "Are you a magician? Because whenever I look at you, everyone else disappears. 🎩",
+                "Can I follow you home? Because my parents always told me to follow my dreams. 🏠",
+                "Are you French? Because Eiffel for you. 🗼",
+                "Is your name Google? Because you have everything I'm searching for. 🔍",
+                "You must be a 10 because you've got me feeling like a 1 with you. 1️⃣0️⃣",
+                "Roses are red, violets are blue, sugar is sweet, and so are you. 🌹",
+                "I must be a snowflake because I've fallen for you. ❄️",
+                "Tum toh mere WiFi jaisi ho, bina tumhare connection hi nahi aata. 📶",
+                "Kya tum chocolate ho? Kyunki main toh din raat tumhe kha sakta hoon. 🍫",
+                "Tumhari smile dekh ke lagta hai, mera din set aur raat forget. 🌞",
+                "Meri battery low hai, kya tum mere charger ban sakte ho? 🔋",
+                "Kya tum doctor ho? Kyunki mera dil dekh ke toh tumne dhadkana sikha diya. 👨‍⚕️",
+                "Tumhari aankhon mein pyaar hai ya paani, maine toh dooba marne ka plan banaya. 🏊",
+                "Mera DNA toh tumse match karta hai, kyunki main toh tumhara hi bana hoon. 🧬",
+                "Tumse milke lagta hai jaise, sach mein pyaar hota hai. 😅",
+                "Tum toh mere sapno ki rani ho. 👑",
+                "Tumhari baatein sunke lagta hai, jaise koi khwab ho. 💭"
+            ]
+
+            romance_texts = [
+                "तेरी आँखों की गहराई में मेरी दुनिया बसी है। 💕",
+                "हर सांस में तू बसी है, तू ही मेरी हँसी है। 😊",
+                "चाँद से खूबसूरत है तेरा चेहरा। 🌙",
+                "तेरी यादों में खोया रहूँ। 💭",
+                "प्यार का हर लम्हा तेरे साथ जीया। 🥀",
+                "तेरे बिना ये दिल है बेक़रार। ❤️",
+                "हर दिन तुझसे प्यार बढ़े। 💗",
+                "तेरी हँसी में जान है। 😊",
+                "तेरी बाहों में मिली राहत। 🌹",
+                "तू है तो हर ग़म भूला। 🎠",
+                "You are the poetry my heart always wanted to write. 📝",
+                "In a world full of trends, I want to be your classic. 🌟",
+                "You are the missing piece of my soul. 🧩",
+                "Our love story is my favorite chapter. 📖",
+                "You are the sun in my day, the moon in my night. 🌞🌙",
+                "Falling in love with you was beyond my control. 💫",
+                "I didn't choose you, my heart did. ❤️‍🔥",
+                "You are not just my love; you are my home. 🏠",
+                "Your smile is the best part of my day. 😄",
+                "You are my today and all of my tomorrows. 📅",
+                "Teri smile dekh ke lagta hai, wifi full signal pe aa gaya. 📶",
+                "Pyaar kya hai? Maine tujhse jaana. 🫀",
+                "Tu hai toh din hai, warna toh har pal hai night shift. 🌃",
+                "Tujhse milke samjha, pyaar kya hai bhai! 🥰",
+                "Teri ek smile pe, de doon jaan bhi. 😄",
+                "Chand se chura ke laaya hoon, teri muskaan. 🌙",
+                "Tere bina dil hai veeran. 💔",
+                "Pyaar ka sabak mila, tujhse hi yaar. 🫀",
+                "Kya baat hai tujh mein, hai koi jaadu. 👀",
+                "Tu hi meri subah, tu hi mera sukoon. ☁️"
+            ]
+
+            troll_texts = [
+                "Bhai tujhe dekh ke lagta hai troll ka mascot tu hai 😂",
+                "Ter personality ek sada hua pyaz jaisi hai — khole toh aansu aaye 🧅",
+                "Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟",
+                "Teri maa ne bhi socha hoga — yaar galti ho gayi 😹",
+                "Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂",
+                "Teri iq level calculator mein error aata hai 🧮",
+                "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
+                "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
+                "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
+                "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂",
+                "Your life is like a bad web series — flop in season 1 📺",
+                "Your personality is like a blank meme template — nothing 😂",
+                "You're so boring that even sleep runs away from you 😴",
+                "Your existence is proof that anyone can use the internet 📶",
+                "Your thinking is 2G speed in a 5G world 📡",
+                "Your life is a loading screen that never loads ⏳",
+                "You're the reason 'error' exists in the dictionary 📖",
+                "Your vibe check: FAILED 😂",
+                "You're irrelevant — even Google doesn't know you 🔍",
+                "You're a hero whose movie flopped in 3 minutes 🎬",
+                "Bhai tera swag Excel mein error hai — #NAME? 📊",
+                "Tu itna dheema hai ke kachhua bhi race jeet gaya 🐢",
+                "Teri thinking 2G speed pe chal rahi hai 📡",
+                "Beta tera ek message dekh ke aasman bhi sharma gaya ☁️",
+                "Bhai teri life ek loading screen hai — jo kabhi load nahi hoti ⏳",
+                "Ter maa ne tujhe chhoda nahi chhodni chahiye thi 😂",
+                "Beta tera existence proof hai ke koi bhi internet use kar sakta hai 📶",
+                "Bhai teri personality ek blank page hai — aur blank hi rahega 📄",
+                "Tu sirf chat mein hero hai real duniya mein zero 💻",
+                "Beta teri soch itni outdated hai ke floppy disk bhi reject kar de 💾",
+                "🤡 Bhai tujhe dekh ke lagta hai troll ka mascot tu hai 😂🔥",
+                "😹 Tu itna troll hai ke khud ko pata nahi 💀🤡",
+                "🤡 Teri baatein sun ke log seriously nahi lete — aur le bhi nahi chahiye 😂😹",
+                "😹 Beta tu internet ka troll #1 candidate hai 💀🤡",
+                "🤡 Tujhe real life mein bhi ignore karte honge log 😂🔥",
+                "😹 Bhai teri comments section mein sabne dislike diya 👎🤡",
+                "🤡 Tu troll karne ki koshish karta hai — khud troll bana rehta hai 😂💀",
+                "😹 Teri troll game weak hai — aur weak troll game bhi troll hai 🤡🔥",
+                "🤡 Beta jo tu sochta hai funny hai woh boring hai 😂😹",
+                "😹 Bhai tera troll skill level: tutorial mode pe stuck 🤡💀",
+                "🤡 Tu troll hai par original nahi — copy-paste troll 😂🔥",
+                "😹 Teri trolling se logon ko secondhand embarrassment hoti hai 🤡😂",
+                "🤡 Beta tujhe seriously lena — woh troll hoga apne aap pe 😹💀",
+                "😹 Bhai tera meme quality — delete worthy 🤡😂",
+                "🤡 Tu troll karta hai online — real duniya mein kaanta nahi milta 😹🔥",
+                "😹 Beta teri har post pe raat ko cry karta hai 🤡💀",
+                "🤡 Tujhe dekh ke pata chalta hai — internet access free nahi honi chahiye 😂😹",
+                "😹 Bhai teri troll attempt genuine cringe hai 🤡🔥",
+                "🤡 Tu troll ka wannabe version hai 😂💀",
+                "😹 Beta asli troll woh hota hai jise pata nahi woh troll hai — tu wahi hai 🤡😂",
+                "🤡 Bhai teri comments log copy karke dusron ko dikhate hain — example ke liye kya nahi karna chahiye 😹🔥",
+                "😹 Tu troll karta hai par khud hi jal jaata hai 🤡💀",
+                "🤡 Beta teri troll attempts fail hoti hain kyunki tujhe original hona chahiye 😂😹",
+                "😹 Bhai seriously — apni energy sahi jagah lagao 🤡🔥",
+                "🤡 Teri trolling mein timing nahi content nahi creativity nahi 😂💀",
+                "😹 Beta tu woh insaan hai jo khud ko troll king samjhta hai — aur paida hota hai troll ke neeche 🤡😂",
+                "🤡 Bhai tera troll fail isliye hota hai — genuine nahi hai 😹🔥",
+                "😹 Tu troll karta hai aur end mein rota hai — classic 🤡💀",
+                "🤡 Beta tujhe sun ke logon ko stress nahi hoti — pity hoti hai 😂😹",
+                "😹 Bhai teri troll quality inspect hua — returned as defective 🤡🔥",
+                "🤡 Tu original troll nahi — fan-made version hai 😂💀",
+                "😹 Beta teri trolling attempt mein best cheez — mujhe engage nahi karta 🤡😂",
+                "🤡 Bhai teri presence troll community ke liye embarrassment hai 😹🔥",
+                "😹 Tu troll karta hai aur log silent ho jaate hain — cringe se 🤡💀",
+                "🤡 Beta teri troll ka response — ignore — kyunki deserve nahi karta 😂😹",
+                "😹 Bhai tera troll skill tree mein sirf ek node hai — aur woh bhi locked hai 🤡🔥",
+                "🤡 Tu troll ka demo version hai — full version nahi aaya 😂💀",
+                "😹 Beta trolling seekh pehle phir aa — abhi tu syllabus mein nahi hai 🤡😂",
+                "🤡 Bhai teri baatein sun ke log empathy feel karte hain — tere liye 😹🔥",
+                "😹 Tu troll nahi — annoying hai — alag concept hai 🤡💀",
+                "🤡 Beta tera troll game 0/10 — ek baar apni chat history padh 😂😹",
+                "😹 Bhai tu sirf apna time barbad kar raha hai — mera nahi 🤡🔥",
+                "🤡 Teri troll attempt ek baar bhi hit nahi hui — streak: 0 😂💀",
+                "😹 Beta tera troll unprovoked aur uninspired tha 🤡😂",
+                "🤡 Bhai tu troll ke bhi standards neeche hai 😹🔥",
+                "😹 Teri trolling see aur feel karna — dono experience kharab hain 🤡💀",
+                "🤡 Beta teri troll ne sirf yeh prove kiya — tujhe better kaam dhundhna chahiye 😂😹",
+                "😹 Bhai troll mein skill hoti hai — teri mein nahi 🤡🔥",
+                "🤡 Tu troll hai aur tera troll bhi troll hai — recursion 😂💀",
+                "😹 Beta ek advice — yeh mat kar — seriously apni life mein focus kar 🤡😎",
+                "Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟",
+                "Teri maa ne bhi socha hoga — yaar galti ho gayi 😹",
+                "Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂",
+                "Teri iq level calculator mein error aata hai 🧮",
+                "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
+                "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
+                "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
+                "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂",
+                "Your life is like a bad web series — flop in season 1 📺",
+                "Your personality is like a blank meme template — nothing 😂",
+                "You're so boring that even sleep runs away from you 😴",
+                "Your existence is proof that anyone can use the internet 📶",
+                "Your thinking is 2G speed in a 5G world 📡",
+                "Your life is a loading screen that never loads ⏳",
+                "You're the reason 'error' exists in the dictionary 📖",
+                "Your vibe check: FAILED 😂",
+                "You're irrelevant — even Google doesn't know you 🔍",
+                "You're a hero whose movie flopped in 3 minutes 🎬",
+                "Bhai tera swag Excel mein error hai — #NAME? 📊",
+                "Tu itna dheema hai ke kachhua bhi race jeet gaya 🐢",
+                "Teri thinking 2G speed pe chal rahi hai 📡",
+                "Beta tera ek message dekh ke aasman bhi sharma gaya ☁️",
+                "Bhai teri life ek loading screen hai — jo kabhi load nahi hoti ⏳",
+                "Ter maa ne tujhe chhoda nahi chhodni chahiye thi 😂",
+                "Beta tera existence proof hai ke koi bhi internet use kar sakta hai 📶",
+                "Bhai teri personality ek blank page hai — aur blank hi rahega 📄",
+                "Tu sirf chat mein hero hai real duniya mein zero 💻",
+                "Beta teri soch itni outdated hai ke floppy disk bhi reject kar de 💾"
+            ]
+
+            ragebait_texts = [
+                "Bhai tera reaction dekh ke mujhe hasi aa rahi hai 😂",
+                "Tu itna triggered ho gaya, jaise meri baat teri maa ne sun li ho 😹",
+                "Rage bait pe itna emotional mat ho, beta 😂",
+                "Tu toh aisa gussa ho raha hai jaise teri team world cup haar gayi 🏏",
+                "Bhai shant ho ja, tera BP high ho jayega 😂",
+                "Teri gaali sun ke mujhe neend aa rahi hai 😴",
+                "Tu rage karta hai aur main popcorn kha raha hoon 🍿",
+                "Beta tu toh aisa hai jaise bina phone ke reh gaya ho 📱",
+                "Teri rage dekh ke lagta hai, teri gf ne break up kar diya 💔",
+                "Tu toh aisa hai jaise internet slow ho gaya ho 😂",
+                "Your rage is entertaining, please continue 😂",
+                "Getting triggered over this? That's cute 🥺",
+                "You're so angry, did someone steal your Wi-Fi? 📶",
+                "Rage bait level: professional 😂",
+                "Your anger is my daily dose of comedy 🤡",
+                "Calm down, it's just a message 📩",
+                "You're acting like I insulted your whole bloodline 😂",
+                "The rage is real, and it's hilarious 😭",
+                "You need a therapist for that anger issues 🧠",
+                "I love how easy it is to get you triggered 😈",
+                "Bhai tera reaction dekh ke mujhe hasi aa rahi hai 😂",
+                "Tu itna triggered ho gaya, jaise maine teri game delete kar di ho 🎮",
+                "Rage bait pe itna emotional mat ho, beta 😂",
+                "Tu toh aisa gussa ho raha hai jaise teri team haar gayi 🏏",
+                "Bhai shant ho ja, tera BP high ho jayega 😂",
+                "Teri gaali sun ke mujhe neend aa rahi hai 😴",
+                "Tu rage karta hai aur main popcorn kha raha hoon 🍿",
+                "Beta tu toh aisa hai jaise bina phone ke reh gaya ho 📱",
+                "Teri rage dekh ke lagta hai, teri gf ne break up kar diya 💔",
+                "Tu toh aisa hai jaise internet slow ho gaya ho 😂"
+            ]
+
+            roast_texts = [
+                "Ter life ek bakwas webseries ki tarah hai — 1 season mein flop 😂",
+                "Bhai teri personality ek sada hua pyaz jaisi hai 🧅",
+                "Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟",
+                "Teri maa ne bhi socha hoga — yaar galti ho gayi 😹",
+                "Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂",
+                "Teri iq level calculator mein error aata hai 🧮",
+                "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
+                "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
+                "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
+                "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂",
+                "Your life is a joke, and not even a funny one 😂",
+                "You're so irrelevant, even your shadow leaves you 🏃",
+                "Ter life ek bakwas webseries ki tarah hai — 1 season mein flop 😂",
+                "Bhai teri personality ek sada hua pyaz jaisi hai 🧅",
+                "Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟",
+                "Teri maa ne bhi socha hoga — yaar galti ho gayi 😹",
+                "Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂",
+                "Teri iq level calculator mein error aata hai 🧮",
+                "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
+                "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
+                "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
+                "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂",
+                "Your life is a joke, and not even a funny one 😂",
+                "You're so irrelevant, even your shadow leaves you 🏃",
+                "Your existence is a notification I always swipe away 📱",
+                "You're like a software update — always annoying and never useful 💻",
+                "Your brain is like a browser with 100 tabs open — all useless 🌐",
+                "You're the human equivalent of a loading screen ⏳",
+                "Your personality is like a broken pencil — pointless ✏️",
+                "You're not stupid, you just have bad luck thinking 🤔",
+                "You're the reason God created jokes 😂",
+                "Your life is a meme, and not a good one 🗿",
+                "Bhai teri zindagi ek bakwas webseries jaisi hai 📺",
+                "Teri personality ek sada hua pyaz jaisi hai — khole toh aansu aaye 🧅",
+                "Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟",
+                "Teri maa ne bhi socha hoga — yaar galti ho gayi 😹",
+                "Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂",
+                "Teri iq level calculator mein error aata hai 🧮",
+                "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
+                "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
+                "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
+                "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂",
+                "🔥 Teri zindagi ek bakwas webseries ki tarah hai — 1 season mein flop 😂📺",
+                "🤣 Bhai teri personality ek sada hua pyaz jaisi hai — khole toh aansu aaye 🧅💀",
+                "😹 Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟😂",
+                "🔥 Teri maa ne bhi socha hoga — yaar galti ho gayi 😹👶",
+                "🤣 Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂💀",
+                "😹 Beta tu Google Maps pe search kare toh bhi worthless aayega 🗺️😈",
+                "🔥 Teri iq level negative hai — calculator mein error aata hai 🧮😂",
+                "🤣 Tu chhata hua papad hai — touch karte hi toot gaya 😹🔥",
+                "😹 Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞😂",
+                "🔥 Teri personality dekh ke AI bhi depressed ho gaya hoga 🤖😹",
+                "🤣 Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂💀",
+                "😹 Bhai teri soch utni hi purani hai jitna tera Nokia phone 📱😂",
+                "🔥 Tera existence mere life mein irrelevant hai — bilkul sarkari kaam jaisa 📋😹",
+                "🤣 Tu itna boring hai ke neend khud aa jaaye tujhe dekh ke 😴😂",
+                "😹 Teri profile pic dekh ke emoji wale bhi sue kar sakte hain 😱🔥",
+                "🔥 Bhai tu aisa player hai jo kabhi goal nahi kar sakta apni hi team ke khilaf 😂⚽",
+                "🤣 Teri advice sunna waisa hai jaise sade kele se rasta poochna 🍌😹",
+                "😹 Tu garib nahi hai — but tujhe dekh ke gareebi ko takleef hoti hai 💰😂",
+                "🔥 Teri kismat itni kharab hai ke lottery ticket bhi teri traf nahi dekhti 🎫😹",
+                "🤣 Bhai tera sense of humor graveyard se udhaara liya hai kya 🪦😂",
+                "😹 Tu itna irrelevant hai ke khud Google bhi nahi jaanta tera naam 🔍🔥",
+                "🔥 Teri body language bolta hai — main hara hua insaan hoon 😂💀",
+                "🤣 Tu ek hi baar funny tha — jab tune mujhe seriously liya 😹⚡",
+                "😹 Bhai teri achievements list mein sirf ek cheez hai — exist karna 😂🔥",
+                "🔥 Tujhe dekh ke lagta hai — nature ne mistake ki thi 🌿😹",
+                "🤣 Teri skills dekh ke Thanos bhi bola hoga — yeh toh automatically wipe ho jaayega 💀😂",
+                "😹 Beta tera future itna dark hai ke sunglasses pehenne ki zaroorat nahi 🕶️🔥",
+                "🔥 Teri batting dekh ke khud pitch ne sorry bola 🏏😂",
+                "🤣 Bhai tu aisa idea hai jo meeting mein sab ignore karte hain 📊😹",
+                "😹 Teri zubaan aur dimag mein kabhi meetup nahi hota 🧠💬😂",
+                "🔥 Tu aisa hero hai jiska movie 3 minutes mein flop ho gayi 🎬😹",
+                "🤣 Teri gaali sunne ke baad dushmano ne mafi maang li 😂⚔️",
+                "😹 Bhai tera swag level Excel mein error hai — #NAME? 📊🔥",
+                "🔥 Tu itna dheema hai ke kachhua bhi race jeet gaya 🐢😂",
+                "🤣 Teri thinking 2G speed pe chal rahi hai duniya 5G mein hai 📡😹",
+                "😹 Beta tera ek message dekh ke aasman bhi sharma gaya ☁️😂",
+                "🔥 Bhai teri life ek loading screen hai — jo kabhi load nahi hoti ⏳😹",
+                "🤣 Tu aisa mirror hai jo galat reflection dikhata hai 🪞😂",
+                "😹 Teri maa ne tujhe chhoda nahi chhodni chahiye thi 😂🔥",
+                "🔥 Beta tera existence proof hai ke koi bhi internet use kar sakta hai 📶😹",
+                "🤣 Tujhe dekh ke lagta hai — maa baap ne education mein invest nahi kiya 📚😂",
+                "😹 Teri personality ek blank page hai — aur blank hi rahega 📄🔥",
+                "🔥 Tu sirf chat mein hero hai real duniya mein zero 💻😂",
+                "🤣 Bhai teri jawab dene ki speed se tortoise bhi impress nahi 🐢😹",
+                "😹 Teri soch itni outdated hai ke floppy disk bhi reject kar de 💾😂",
+                "🔥 Tu aisa WiFi password hai jo koi yaad nahi rakhta 🔑😹",
+                "🤣 Beta teri awaaz sunne ke baad mujhe silence zyada priceless laga 🤫😂",
+                "😹 Bhai tera roast karna waisa hai jaise sadi hui vegetable ko season karna 🥦🔥",
+                "🔥 Teri social skills dekh ke chatbot bhi impress ho ga",
+                "Your existence is a notification I always swipe away 📱",
+                "You're like a software update — always annoying and never useful 💻",
+                "Your brain is like a browser with 100 tabs open — all useless 🌐",
+                "You're the human equivalent of a loading screen ⏳",
+                "Your personality is like a broken pencil — pointless ✏️",
+                "You're not stupid, you just have bad luck thinking 🤔",
+                "You're the reason God created jokes 😂",
+                "Your life is a meme, and not a good one 🗿",
+                "Bhai teri zindagi ek bakwas webseries jaisi hai 📺",
+                "Teri personality ek sada hua pyaz jaisi hai — khole toh aansu aaye 🧅",
+                "Tu itna bura lagta hai ke teri photo dekh ke mosquito bhi bhaag jata hai 🦟",
+                "Teri maa ne bhi socha hoga — yaar galti ho gayi 😹",
+                "Tujhe dekh ke pata chalta hai — darr darr ke jeena kya hota hai 😂",
+                "Teri iq level calculator mein error aata hai 🧮",
+                "Tu chhata hua papad hai — touch karte hi toot gaya 😹",
+                "Bhai teri aukat itni hai ke mirror bhi muh fer leta hai 🪞",
+                "Teri personality dekh ke AI bhi depressed ho gaya 🤖",
+                "Tu aisa dost hai jo aaye na aaye — fark nahi padta 😂"
+            ]
+
+            # ─── NON-ABUSIVE RAID TEXTS (Menu9) ────────────────────────────────────
+
+            attack_texts = [
+                "🗡️ Tera baap aaya hai sunta nahi kya 👑😈",
+                "⚡ Mere saamne aake dikhao himmat hai toh 😎💪",
+                "🔥 Attack mode on — teri khair nahi aaj 😡⚔️",
+                "💀 Tujhe itna marunga ke teri maa bhi nahi pehchanegi 😂🔥",
+                "💥 Beta ye territory meri hai nikal yahan se 🏴‍☠️⚡",
+                "🗡️ Aukaat hai toh saamne aa nahi toh chup baith 😈💀",
+                "⚡ Tu keyboard warrior hai asli mard nahi 😂👊",
+                "🔥 Teri maa ne bhi bola tera baap chahiye 😹💔",
+                "💥 Chal hat yahan se chota baccha 🤣👋",
+                "⚔️ Mujhe gaali de ke dekh kya hoga teri life mein 😈⚡",
+                "💀 Bhai seedha bol de surrender karega ya maar khayega 😎🔥",
+                "🗡️ Attack karta hoon toh block nahi hoga tera 😡⚔️",
+                "⚡ Yeh game mein nahi real life mein bhi kaatenge tujhe 💪😤",
+                "🔥 Tera confidence dekh ke hansi aati hai yaar 😂💥",
+                "💥 Andha hai ya dikhta nahi kaun boss hai yahan 👑⚔️",
+                "⚔️ Teri har gaali pe 10 gaaliyan waapis aayengi 😈🔥",
+                "💀 Beta peeth nahi dikhana mujhe — coward 🏃‍♂️😂",
+                "🗡️ Lad le ek baar — guarantee hai rota hoga tu 😹⚡",
+                "⚡ Keyboard tod ke aa toh baat karte hain 💥👊",
+                "🔥 Teri bhasha se pata chalta hai ghar mein parhe nahi 😂🤣",
+                "⚔️ Main yahan hoon — tu kahan chhupta hai aaja 😎💀",
+                "💀 Teri har move ka jawab taiyaar hai mere paas 🎯🔥",
+                "🗡️ Tu sirf darta hai asli attack nahi kar sakta 😂⚡",
+                "⚡ Baahubali nahi hai tu yahan — chal nikal 👋💥",
+                "🔥 Teri aukaat utni hai jitni do takke ki 😹🗡️",
+                "💥 Attack aur reaction — dono mein haar jayega tu ⚔️😎",
+                "⚔️ Ek baar aake dekh kya hota hai tere saath 💀🔥",
+                "💀 Sher ke saamne bakra nahi ban — phir bhi ban raha 😂⚡",
+                "🗡️ Yeh teri territory nahi bhai — haath jod ke ja 🙏😈",
+                "⚡ Tu attack karega aur main finish karunga 💥⚔️",
+                "🔥 Teri himmat hai toh mujhse seedha baat kar 😤💀",
+                "💥 Keyboard pe hero ban raha hai — asli duniya mein zero 😂🗡️",
+                "⚔️ Maar kha aur phir rota mat — warning hai 😈⚡",
+                "💀 Teri speed se faster hoon main — bhaag nahi sakta 🔥💥",
+                "🗡️ Yaar teri life mein koi nahi kya isliye yahan ata hai 😂⚔️",
+                "⚡ Hero mat ban — yahan real khiladi baithe hain 👑💀",
+                "🔥 Attack kiya — ab lash uthane ki taiyaari kar 😹⚡",
+                "⚔️ Teri har galti ka hisaab hoga — ruk 😈🔥",
+                "💀 Bhai attack se pehle 1% dimag use kar 🧠💥",
+                "🗡️ Chal hat nahi toh main khud hataunga isko 😤⚡",
+                "⚡ Yeh war hai — aur tu already haar gaya 😎🔥",
+                "🔥 Teri maa bhi tera lecture sunke bore ho gayi hogi 😹💥",
+                "💥 Main attack mein vishwas nahi karta — main finish mein karta hoon ⚔️😈",
+                "⚔️ Chal randike ek baar try kar le — rona mat baad mein 😂💀",
+                "💀 Ab samjha kya hua? No? Toh phir ek aur attack 🔥⚡",
+            ]
+
+            war_texts = [
+                "⚔️ War shuru ho gayi — aur tu pehle hi haar gaya 😂🔥",
+                "💣 Bhai main war mein nahi aata — main war khatam karne aata hoon 😈⚡",
+                "🏴‍☠️ Tera jhanda uraya — apna wala lehraya 😎💀",
+                "⚔️ Tu lad raha hai mujhse — yeh teri sabse badi galti hai 🔥😂",
+                "💣 Main war nahi khelta — main result deliver karta hoon 👑⚡",
+                "🏴‍☠️ Battlefield pe aake to dekh — tera rank kya hai 😈⚔️",
+                "⚔️ Randike war declare kiya toh surrender ka option bhi rakh 😂💣",
+                "💣 Tu soldier nahi hai — tu sirf noise hai 🔊😂",
+                "🏴‍☠️ War mein strategy chahiye — tu sirf emotion se ladta hai 😹⚔️",
+                "⚔️ Beta yeh teri territory nahi — nikalja 👋💣",
+                "💣 Tera war cry sunke mujhe neend aati hai 😴😂",
+                "🏴‍☠️ Main akela kaafi hoon — teri poori army ke liye ⚔️😈",
+                "⚔️ War ghoshit kiya — white flag kahan hai tera 🏳️😂",
+                "💣 Bhai tu pehle khud ko toh jeet — phir mujhse lad 😎💀",
+                "🏴‍☠️ Tera war tactic: bolna aur bhaagna 😹⚔️",
+                "⚔️ Main chhoda nahi — tu chhoda baad mein roega 😂💣",
+                "💣 Battle field pe aate waqt socha — main jeet sakta hoon? Nahi 😈🏴‍☠️",
+                "⚔️ Tu ek round bhi nahi jeeta — aur war ki baat karta hai 😂💀",
+                "💣 Bhai surrender kar le — dignity bachegi thodi 🙏😹",
+                "🏴‍☠️ War mein aaye — aur pehli line mein fail ho gaye ⚔️😂",
+                "⚔️ Tera morale zero hai — teri army teri khud ki dushman hai 😂💣",
+                "💣 Main war expert hoon — tu war ka victim hai 😎🏴‍☠️",
+                "🏴‍☠️ Beta teri strategy ek broken compass jaisi hai ⚔️😂",
+                "⚔️ War mein seena taan ke aa — peeth dikha ke nahi 😹💣",
+                "💣 Bhai teri army mein sirf tu hai — aur tu kaafi nahi 😈🏴‍☠️",
+                "🏴‍☠️ Teri war cry sun ke dushman khud aa gaye — rescue karne ⚔️😂",
+                "⚔️ Beta teri territory war se pehle hi haari thi 💣😹",
+                "💣 Main war mein nahi — main tujhe personally destroy karne mein hoon 😈🏴‍☠️",
+                "🏴‍☠️ Tera war plan sunke GPS bhi confused hai ⚔️😂",
+                "⚔️ Tu war mein aaya — par weapons lana bhool gaya 💣😹",
+                "💣 Bhai yeh war nahi tujhe sirf reality check tha 😂🏴‍☠️",
+                "🏴‍☠️ Teri army tujhse zyada samajhdaar hai — unhone bandh kiya ⚔️😈",
+                "⚔️ War mein bhi excuse karta hai — aur life mein bhi 😂💣",
+                "💣 Tu jo war soch raha hai — woh meri morning routine hai 😎🏴‍☠️",
+                "🏴‍☠️ Bhai teri war itni slow hai ke climate change pehle ho jaayega ⚔️😹",
+                "⚔️ Main tujhse war karta hoon — aur tujhe pata bhi nahi chalta 💣😂",
+                "💣 War ghoshit kar ke tu pehla tha — haar ke bhi pehla hai 😹🏴‍☠️",
+                "🏴‍☠️ Teri war mein consistency hai — consistently losing ⚔️😂",
+                "⚔️ Bhai war mein bhagna galat hai — tu phir bhi karta hai 💣😈",
+                "💣 Tu war mein aaya — main pehle se tere base par tha 🏴‍☠️😂",
+                "🏴‍☠️ Teri war strategy mein sirf ek problem hai — sab kuch ⚔️😹",
+                "⚔️ Beta war ka matalab samjha nahi tujhe — sikhaunga abhi 💣😂",
+                "💣 War mein hero nahi bante — survivors bante hain — aur tu nahi banega 🏴‍☠️😈",
+                "🏴‍☠️ Teri war mein dum nahi — sirf dhool hai ⚔️😂",
+                "⚔️ Bhai war declare karna alag baat hai — jeetan alag 💣😹",
+                "💣 Tu war mein aaya sirf lose karne ke liye — congratulations 🏴‍☠️😂",
+                "🏴‍☠️ Main akele teri sab pe bhaari hoon — aur tujhe pata hai ⚔️😈",
+                "⚔️ Teri war ka sabse bura part — tu khud tha 💣😂",
+                "💣 War mein aaye — teri team ne hi tujhe chhod diya 🏴‍☠️😹",
+                "🏴‍☠️ Beta war khatam — teri taraf se surrender accepted ⚔️😎",
+            ]
+
+            savage_texts = [
+                "😈 Confidence is silent, insecurity is loud! 🔥",
+                "💀 You're not as important as you think! 🌪️",
+                "🔥 Reality check — you're not that special! 💥",
+                "😏 Your opinion is noted, but not needed! 📝",
+                "💀 Let's be honest — you're overrated! 🎭",
+                "🔥 The truth hurts, but it sets you free! 💪",
+                "😈 You're not the main character, sorry! 📺",
+                "💀 Your ego is writing checks your skills can't cash! 💰",
+                "🔥 Stay humble or get humbled! ⚡",
+                "😏 You're a classic example of overconfidence! 🎯",
+                "💀 Let your actions speak, not your mouth! 🔥",
+                "😈 Your presence is as useful as a screen door on a submarine! 🚪",
+                "🔥 Let's be real — you're not that impressive! 💥",
+                "💀 You're the CEO of overestimating yourself! 🏢",
+                "😏 Stay in your lane, champ! 🏎️",
+                "🔥 You're not as hot as you think! ❄️",
+                "💀 Confidence without skill is just delusion! 🎭",
+                "😈 Your reputation precedes you — and it's not good! 📉",
+                "🔥 Let's keep it real — you're average at best! ⭐",
+                "💀 You're a cautionary tale for others! ⚠️",
+                "😈 Main savage hoon — tujhe explanation nahi deta 🔥💀",
+                "💀 Teri feelings mere liye statistics hain — irrelevant 😂😈",
+                "🔥 Main woh nahi hoon jo tujhe comfortable feel karaaye 😎💀",
+                "😈 Beta teri baatein mujhe bore karti hain — next 😂🔥",
+                "💀 Teri opinion meri life mein footnote bhi nahi hai 😈😹",
+                "🔥 Main tujhe explain nahi karta — tujhse better logon ke paas time deta hoon 😎💀",
+                "😈 Tera attitude dekh ke mujhe apni nails file karni chahiye 💅😂",
+                "💀 Bhai tujhe reject karna meri hobby hai 🔥😈",
+                "🔥 Teri presence mujhe remind karaati hai — kuch logon ko mute karna chahiye 🔇😂",
+                "😈 Main bad vibes nahi leta — teri taraf bhi nahi 💀🔥",
+                "💀 Tu mere standard se neeche hai — elevator laga le 🛗😂",
+                "🔥 Teri baat sunna — option nahi habit nahi aur interest bhi nahi 😈💀",
+                "😈 Main ghanta samjhata hoon — samajh nahi aaya toh teri problem 😂🔥",
+                "💀 Teri ego itni badi hai — uske liye alag zip code chahiye 📮😂",
+                "🔥 Beta mujhe tujhse jealousy feel nahi hoti — pity hoti hai 😈💀",
+                "😈 Main woh insaan nahi hoon jis par tu waqt barbad kare — ya main karta hoon 😂🔥",
+                "💀 Teri life choices dekh ke main grateful hoon main tujhsa nahi hoon 😹😈",
+                "🔥 Bhai teri smartness ka level: WiFi password ignore karna 📶😂",
+                "😈 Teri mastiyan mujhe entertain nahi karti — bore karti hain 💀🔥",
+                "💀 Main savage nahi — main simply tujhse better hoon 😎😂",
+                "🔥 Teri personality ek blank meme format jaisi hai — kuch nahi 😈💀",
+                "😈 Beta apni journey pe focus kar — meri disturb mat kar 😂🔥",
+                "💀 Teri hard work ka result tera hi face hai — kaafi bura 😹😈",
+                "🔥 Main tujhe miss nahi karta — mujhe tujhse better cheezein miss hoti hain 😂💀",
+                "😈 Teri baatein sun ke laga — yeh real person hai ya chatbot glitch 🤖😂",
+                "💀 Bhai teri intelligence ke liye sorry feel hoti hai 🔥😈",
+                "🔥 Main tujhe block isliye nahi karta — kyunki tujhe exist karna pata hai 😂💀",
+                "😈 Teri struggles dekh ke mujhe motivation milti hai — teri tarah mat banna 😹🔥",
+                "💀 Tu jo effort lagate ho mujhpe — woh apni growth mein lagao 😎😂",
+                "🔥 Teri vibes mujhe 2G network se bhi slow lagti hain 📡😈",
+                "😈 Main tujhe pehle judge nahi karta — par tujhe pehle judge hota hoon 💀😂",
+                "💀 Bhai tera shadow bhi tujhse zyada interesting hai 🔥😂",
+                "🔥 Teri logic sun ke Albert Einstein ne resign kar diya hoga 🧪😈",
+                "😈 Tu mere jaisa ban sakta hai — agar try karta 10 saal toh bhi nahi 💀😂",
+                "💀 Teri taraf se koi bhi reaction — mujhe bored karta hai 🔥😹",
+                "🔥 Main respectful hoon — tere sath nahi 😈💀",
+                "😈 Beta teri vibe check: FAILED 😂🔥",
+                "💀 Teri har move predicted thi — boring player 😹😈",
+                "🔥 Main tujhe second chance nahi deta — teri pehli impression kafi thi 😂💀",
+                "😈 Teri friendship ke offer ko professionally decline karta hoon 😎😂",
+                "💀 Beta tu mujhe feel nahi karaata — tu sirf annoy karta hai 🔥😈",
+                "🔥 Teri dimagi capacity dekh ke solar calculator bhi sorry bol de 🔋😂",
+                "😈 Main uun logon mein nahi hoon jo tere liye time waste karein 💀🔥",
+                "💀 Teri life ka GPS tujhe wrong direction mein le ja raha hai 🗺️😂",
+                "🔥 Bhai teri alag identity bana — copier mat ban 😈💀",
+                "😈 Tu mere radar par bhi nahi aata — itna irrelevant hai 😂🔥",
+                "💀 Teri maa ne bhi socha hoga — yaar isko kuch aur karna chahiye tha 😹😈",
+                "🔥 Main woh hoon jo teri nightmares mein aata hai — as a reminder 😎💀",
+                "😈 Beta teri bakaiti mujhe filter nahi karti — automatically skip ho jaati hai 😂🔥",
+                "💀 Tu savage hone ki koshish karta hai — mujhe dekh savage ka example 😈😹",
+            ]
+
+            ultra_texts = [
+                "🔥 ULTRA mode activated — time to dominate! 👑",
+                "🌪️ ULTRA MODE ACTIVATED — teri poori existence question mein hai 😈🔥",
+                "⚡ Ultra attack — pehle gaali sunna phir rona — sequence yaad kar 😂💀",
+                "🌪️ Beta ultra level pe aake dekh — yahan teri category nahi hai 👑🔥",
+                "⚡ ULTRA BLOW — teri soch se lekar attitude tak sab destroy 💥😈",
+                "🌪️ Yeh ultra mode hai — blocking nahi help karega 😂⚡",
+                "⚡ Ultra raid engaged — ab teri poori chat history history hai 📜😹",
+                "🌪️ Beta ultra speed mein aa — par seedha home le jaata hoon 💀🔥",
+                "⚡ Ultra fire — teri har defensive move kaam nahi karegi 😈🌪️",
+                "🌪️ Yeh ultra level fight hai — tu still bronze mein hai 😂⚡",
+                "⚡ ULTRA DAMAGE — teri reputation, teri aukaat, teri everything 💥😹",
+                "🌪️ Ultra mode mein poori teri army bhi kaafi nahi 😈🔥",
+                "⚡ Beta ultra attack sunne ke baad sun raha hai kya? Normal hai 😂🌪️",
+                "🌪️ ULTRA RANT incoming — tune jo kiya uska hisaab hoga 💀⚡",
+                "⚡ Yeh ultra version hai — tujhe pata bhi nahi kya aaya 😹🔥",
+                "🌪️ Ultra mode ON — timer chal raha hai teri destruction ka 😈⚡",
+                "⚡ Beta ultra strike pe tujhe sirf ek option hai — disappear 😂💀",
+                "🌪️ ULTRA COMBO — reply + react + roast + raid all at once 🔥⚡",
+                "⚡ Yeh ultra level rage hai — aur tujhe taste hoga 😈🌪️",
+                "🌪️ Ultra activated — pehle bol sorry phir ja 😹😂",
+                "⚡ Beta ULTRA message ka matlab — tu mere liye mission ban gaya 💀🔥",
+                "🌪️ ULTRA STORM — har cheez destroy ho rahi hai teri side pe 😈⚡",
+                "⚡ Yeh ultra nahi — tujhe sirf samjhane ki koshish thi 😂🌪️",
+                "🌪️ Ultra mode finish — teri team ne tera saath chhoda 💀🔥",
+                "⚡ Beta ULTRA = mera minimum effort on you 😈😂",
+                "🌪️ ULTRA RAIN — tune invite kiya tha — enjoy karna tha na? 😹⚡",
+                "⚡ Ultra mode mein ek hi rule — no mercy 💀🔥",
+                "🌪️ Beta ULTRA sabse pehle yeh — teri galti ka hisaab 😈⚡",
+                "⚡ Yeh ultra speed se aaya — aur teri samajh mein ultra slow aayega 😹🌪️",
+                "🌪️ ULTRA LOCK — ab yahan se nahi jayega tu 💀🔥",
+                "⚡ Beta ultra strike mein teri saari strategy fail hai 😂😈",
+                "🌪️ Ultra level pe chal — toh teri duniya hi badal jaayegi 🔥⚡",
+                "⚡ ULTRA — yeh word hi teri aukat se bada hai 😹💀",
+                "🌪️ Beta ultra mein main hoon — tujhe pata nahi tha kya 😈🔥",
+                "⚡ Yeh ultra raid hai — har message teri ek problem hai 😂🌪️",
+                "🌪️ ULTRA DONE — tu done kar le pehle 💀⚡",
+                "⚡ Beta ultra mein welcome — pehle bol kya karna hai 😹🔥",
+                "🌪️ Ultra mode — ab seedha point pe aata hoon — tu fail hai 😂😈",
+                "⚡ ULTRA BLAST — teri timeline pe aaya — nahi ruk sakta 💥🌪️",
+                "🌪️ Beta ultra mein aake teri baat karo — nahi aata toh seedha ja 💀🔥",
+                "⚡ Yeh ultra war hai — aur teri taraf se koi nahi 😂😈",
+                "🌪️ ULTRA FINAL — bas yahi hoga — accept kar 💀⚡",
+                "⚡ Beta ultra strike complete — check teri status 😹🔥",
+                "🌪️ Ultra mode mein log surrender karte hain — tujhe bhi karna hoga 😈⚡",
+                "⚡ Yeh ultra punishment nahi — tutorial hai teri life ka 😂💀",
+                "🌪️ ULTRA JUDGEMENT — teri har move judged ho rahi hai 🔥⚡",
+                "⚡ Beta ultra mein ek cheez — main hoon aur tu nahi rahe 😈🌪️",
+                "🌪️ Ultra mode completed — teri side destroyed 💀😂",
+                "⚡ Yeh ultra attack ka last wave hai — teri koi repair nahi 😹🔥",
+                "🌪️ ULTRA END — teri war khatam teri taraf se flag gira 😈⚡",
+                "⚡ Beta ultra mein aana tha — rona nahi tha — par dono kiye 😂💀",
+            ]
+
+            # ─── NEW MENU9 RAID TEXTS ───────────────────────────────────────────────
+
+            shame_texts = [
+                "😤 Sharam kar — itna gira hua kaam karte kaise hain tum log 🔥💀",
+                "🙅 Bhai teri harkat dekh ke pura group sharam se doob gaya 😂😤",
+                "😤 Yeh sab karke tujhe pride feel hoti hai? Really? 💀🔥",
+                "🙅 Beta teri harkaten dekh ke maa baap sharmayenge 😂😤",
+                "😤 Sharam nahi hai tujhe bilkul — clearly 💀😹",
+                "🙅 Bhai itna gira hua kaam dekh ke log muh fer lete hain 😤🔥",
+                "😤 Tu itna neeche gira — zameen bhi neeche ho gayi 💀😂",
+                "🙅 Beta sharam bhi nahi aata aisa karte hue 😤😹",
+                "😤 Yeh harkat dekh ke lagta hai — tujhe value kisi ne nahi sikhaya 💀🔥",
+                "🙅 Bhai log tujhe dekh ke aankhein pher lete hain — soch kya kar raha hai 😤😂",
+                "😤 Teri galti nahi — environment ki galti — par ab waqt hai change ka 💀😹",
+                "🙅 Beta sharam isliye nahi aati kyunki sharam feel karna seekha nahi 😤🔥",
+                "😤 Yeh kaam karke tujhe khushi mili? Toh mujhe tujhse zyada chinta hai 💀😂",
+                "🙅 Bhai teri harkat pura record hai — aur yeh record kharab hai 😤😹",
+                "😤 Tu sochta hai koi dekh nahi raha — sab dekh rahe hain 💀🔥",
+                "🙅 Beta aisa behave karta hai — khud se bhi embarrassing lagta hai tu 😤😂",
+                "😤 Yeh sab dekh ke lagta hai — teri parwarish kahan gayi 💀😹",
+                "🙅 Bhai teri harkaton ka hisaab hoga — aaj nahi toh kal 😤🔥",
+                "😤 Tu sharminda nahi hai — woh most shameful cheez hai 💀😂",
+                "🙅 Beta logo ne tujhe judge kiya — kyunki tune judge hone wala kaam kiya 😤😹",
+                "😤 Yeh bura kaam karke tujhe kya mila — kuch nahi — bas naam barbad 💀🔥",
+                "🙅 Bhai sharam karo — itna toh haq hai tumhara 😤😂",
+                "😤 Tu yahan cool lagne ki koshish mein sharminda ho gaya 💀😹",
+                "🙅 Beta ghalat rasta chhod — vapas aa 😤🔥",
+                "😤 Yeh sab karke teri image bani hai — worst category mein 💀😂",
+                "🙅 Bhai teri harkat ka review — 0 stars — do not recommend 😤😹",
+                "😤 Tu itna neeche gira — recovery mushkil lagti hai 💀🔥",
+                "🙅 Beta tujhe samjhana waqt waste hai — par try kar raha hoon 😤😂",
+                "😤 Yeh sab dekh ke mujhe tujhse zyada tujhpe gussa nahi — hairaani hai 💀😹",
+                "🙅 Bhai sharam se doob — par us mein bhi tujhe help chahiye shayad 😤🔥",
+                "😤 Teri harkat ek lesson hai — dusron ke liye kya nahi karna chahiye 💀😂",
+                "🙅 Beta teri yeh sab dekh ke khud bhi tujhse door rehna chahta hoon 😤😹",
+                "😤 Yeh gaaliyaan nahi — sirf reality check hai 💀🔥",
+                "🙅 Bhai sharam tab aati hai jab insaan mein insaniyat hoti hai 😤😂",
+                "😤 Tu ek example bana diya khud ko — negative example 💀😹",
+                "🙅 Beta tujhe ek baar ruk ke soochna chahiye tha — nahi soocha 😤🔥",
+                "😤 Yeh sab karke tu yahan hai — aur sochta hai main galat hoon? 💀😂",
+                "🙅 Bhai itna toh bata — tujhe kaisa feel hota hai yeh sab karne ke baad 😤😹",
+                "😤 Tu sharminda nahi — tujhe sharminda feel karna chahiye 💀🔥",
+                "🙅 Beta yeh rasta galat hai — abhi bhi change ho sakta hai 😤😂",
+                "😤 Yeh sab khud se bura nahi tha — tu tha 💀😹",
+                "🙅 Bhai teri harkaton ka real world impact sun — sab tujhse dur hain 😤🔥",
+                "😤 Tu soch raha hai main overreact kar raha hoon — par tujhe hisaab hoga 💀😂",
+                "🙅 Beta tujhe pata hai tu kya kar raha hai — aur phir bhi kar raha hai 😤😹",
+                "😤 Yeh sharm ki baat hai — aur tujhe realize karna chahiye 💀🔥",
+                "🙅 Bhai tujhe mirror mein dekhna chahiye — ek baar 😤😂",
+                "😤 Tu itna bura nahi hai — par yeh kaam bura tha 💀😹",
+                "🙅 Beta sharam isliye nahi aati — kyunki tu sochta nahi consequences ke baare mein 😤🔥",
+                "😤 Yeh moment tera lowest point hai — aur abhi bhi jaag sakta hai 💀😂",
+                "🙅 Bhai aaj ek kaam kar — sharminda ho aur badal — bas itna chahiye 😤😎",
+            ]
+
+            diss_texts = [
+                "🎤 Tera naam sun ke log mute kar dete hain khud ko 🔇😂",
+                "💀 Tu diss kar raha hai — khud ko diss kar pehle 🪞😹",
+                "🎙️ Teri rap jaisi hai — no flow no bars no future 🎵😂",
+                "💥 Bhai tera verse sun ke Eminem ne retire le liya 😹🎤",
+                "🔥 Teri diss itni kamzor hai ke whisper bhi zyada loud hai 🤫😂",
+                "💀 Tu sirf bolne mein mard hai karne mein? Zero 😈🎙️",
+                "🎤 Beta teri bars mein bar hi nahi — sirf khali string 🎸😂",
+                "💥 Tera diss track sunne ke baad logon ne earbuds tod diye 🎧😹",
+                "🔥 Bhai teri lyric likh ke dekha — autocorrect ne bhi reject kiya ✍️😂",
+                "💀 Tu diss karta hai aur log diss ko diss karte hain 😂🎤",
+                "🎙️ Teri voice aisi hai ke autotune bhi nahi bach sakta 🎶😹",
+                "💥 Beta freestyle kar le — ya phir stop the embarrassment 🛑😂",
+                "🔥 Tujhe sun ke DJ ne plug nikal diya 🔌😹",
+                "💀 Bhai tera flow aisa hai jaise jaam mein traffic — ruka hua 🚗😂",
+                "🎤 Teri soch itni slow hai ke beat ke saath nahi chalti 🥁😹",
+                "💥 Tera diss mujhe sula raha hai — better than sleeping pills 😴😂",
+                "🔥 Bhai asli diss toh tab hogi jab tu actually kuch achieve kare 🏆😹",
+                "💀 Teri lyrics Google Translate se better hain — bas 🌐😂",
+                "🎙️ Beta chal hat stage se — pehle walk-on music bana 🎵😹",
+                "💥 Tera punchline itna weak hai ke paper bhi survive kar le 📄😂",
+                "🔥 Bhai teri diss sun ke crowd ne baat karna shuru kar diya 🙄😹",
+                "💀 Tu verse likhta hai ya grocery list — same energy 🛒😂",
+                "🎤 Teri bars mein calories zyada hain — totally empty 😹🔥",
+                "💥 Bhai teri rhyme sunke chhote bacche bhi sharma jaate hain 😂💀",
+                "🔥 Teri diss aisi hai — sirf uski maa samjhi 😹🎙️",
+                "💀 Tu diss karta hai mujhe — main khud apni diss sunta hoon for fun 😂💥",
+                "🎤 Tera stage naam kya hai — Bakwas ke Raja? 👑😹",
+                "💥 Bhai teri microphone bhi teri awaaz se dara hua hai 🎙️😂",
+                "🔥 Tu diss mein expert hai — aur expert hone mein loser 😹💀",
+                "💀 Teri har line mein cringe hai — Olympic level 🥇😂",
+                "🎙️ Beta khud ki diss sun le — ek baar realise hoga 😹🔥",
+                "💥 Bhai tera diss itna slow hai ke mujhe neend aa gayi 😴😂",
+                "🔥 Teri creativity level: template pe naam likhna 💀😹",
+                "💀 Tu diss karne ke liye paida hua tha — aur fail ho gaya 😂🎤",
+                "🎙️ Tera rhyme scheme: aab aab aab — boring AF 📝😹",
+                "💥 Bhai teri diss response mein Soulja Boy beat use karta hun 😂🔥",
+                "🔥 Tu keyboard pe rap karta hai — phone pe nahi kaata 📱💀",
+                "💀 Teri diss sun ke mic khud neeche gir gaya 🎙️😂",
+                "🎤 Beta teri bars itni weak hain ke paper toh chodh kaagaz bhi nahi chhapega 📰😹",
+                "💥 Bhai tera flow paani mein nahi petrol mein hai — ab blast 🔥😂",
+                "🔥 Teri diss sunta hoon toh lagta hai sabne kaan band kar rakhe hain 🔇💀",
+                "💀 Tu diss mein ghusaa — tu diss tha diss 😹😂",
+                "🎙️ Bhai tera verse industry standard se neeche hai — ground floor bhi nahi 🏚️🔥",
+                "💥 Teri awaaz mein woh baat nahi jo diss mein chahiye — talent 😂💀",
+                "🔥 Beta teri diss itni pathetic hai ke pity vote mil sakta tha 🗳️😹",
+                "💀 Bhai teri rap career ek Instagram story jaisi hai — 24 ghante mein khatam 📸😂",
+                "🎤 Tu rapper nahi rapper ki copy ki copy ka knock-off hai 😹🔥",
+                "💥 Teri diss sun ke auto-generated ho sakti thi — aur better hoti 🤖😂",
+                "🔥 Bhai freestyle maar — aur phir sun khud ko — tujhe pata chalega 🎧💀",
+                "💀 Teri diss ka reply nahi deta — tujhe dignify karna time waste hai 😂🎙️",
+            ]
+
+            devil_texts = [
+                "😈 DEVIL MODE — yahan woh aaya hai jo tujhe deserve karta hai 🔥💀",
+                "😈 Beta main devil nahi — main tera worst nightmare hoon 🔥⚡",
+                "😈 Devil raid activate — teri poori timeline disturbed 💀😂",
+                "😈 Bhai devil pe hath lagaya — ab bhog 🔥💥",
+                "😈 DEVIL FURY — teri sab cheez ek baar mein 💀⚡",
+                "😈 Beta devil ke saamne hum sab khiladi hain — tu beginner 🔥😂",
+                "😈 DEVIL ATTACK — teri defense devil ke touch se fail 💀😈",
+                "😈 Bhai devil mode mein koi safe nahi — tu bhi nahi 🔥⚡",
+                "😈 Teri galti — devil ko challenge karna 💀😂",
+                "😈 Beta devil ki bhasha — punishment aur reward — tu punishment mein hai 🔥😈",
+                "😈 DEVIL LEVEL RAGE — teri poori life on line 💀⚡",
+                "😈 Bhai devil se lad ke koi nahi jeeta — tu bhi nahi jeetega 🔥😂",
+                "😈 Devil mode — tera sab kuch noted — sab 💀😈",
+                "😈 Beta DEVIL FIRE — teri poori duniya burn 🔥⚡",
+                "😈 DEVIL RAID COMPLETE — tujhe koi nahi bachayega 💀😂",
+                "😈 Bhai devil teri har move pe already plan bana chuka 🔥😈",
+                "😈 Devil mode — tera future bleak — teri choice thi 💀⚡",
+                "😈 Beta devil ne tujhe select kiya — koi bada reason hoga 🔥😂",
+                "😈 DEVIL STORM — teri poori squad disbanded 💀😈",
+                "😈 Bhai devil ke game mein tera turn tha — abhi mera 🔥⚡",
+                "😈 Devil raid engage — now teri responsibility 💀😂",
+                "😈 Beta devil level punishment — tujhse tune karaya tha 🔥😈",
+                "😈 DEVIL ZONE — nikal ja nahi toh devil ka guest ban 💀⚡",
+                "😈 Bhai devil hamesha sunta hai — teri bhi sun li 🔥😂",
+                "😈 Devil mode ACTIVATED — teri poori timeline hijacked 💀😈",
+                "😈 Beta devil ke saamne sirf ek option — respect ya suffer 🔥⚡",
+                "😈 DEVIL FINAL BLOW — teri defense completely gone 💀😂",
+                "😈 Bhai devil ne decide kiya — teri loss is inevitable 🔥😈",
+                "😈 Devil mein aake dekha — tu deserving nahi tha challenge ka 💀⚡",
+                "😈 Beta DEVIL RAIN — teri har cheez soaked in fire 🔥😂",
+                "😈 DEVIL vs YOU — spoiler: devil wins 💀😈",
+                "😈 Bhai devil ke saamne teri prayers bhi kaam nahi aate 🔥⚡",
+                "😈 Devil mode — teri weak spots identified — attack 💀😂",
+                "😈 Beta devil ki nazar se tu nahi chhupta 🔥😈",
+                "😈 DEVIL JUDGMENT — teri poori history reviewed — verdict: guilty 💀⚡",
+                "😈 Bhai devil ki duniya mein tu tourist tha — time up 🔥😂",
+                "😈 Devil fury — tere steps already tracked hain 💀😈",
+                "😈 Beta DEVIL COUNTER — teri har move ka counter ready tha 🔥⚡",
+                "😈 DEVIL FINISH — teri game over — my game continues 💀😂",
+                "😈 Bhai devil mode se nikalna — tujhe option nahi 🔥😈",
+                "😈 Devil attack — teri soul targeted — figuratively 💀⚡",
+                "😈 Beta devil ne kaha — teri aukat nahi — aur devil galat nahi hota 🔥😂",
+                "😈 DEVIL STORM OVER — teri side: scorched earth 💀😈",
+                "😈 Bhai devil ke rules simple hain — tu follow nahi kiya 🔥⚡",
+                "😈 Devil raid — teri position compromised — retreat 💀😂",
+                "😈 Beta DEVIL mein aake rota mat — khud aaya tha 🔥😈",
+                "😈 DEVIL WAVE — teri har defence erased 💀⚡",
+                "😈 Bhai devil ka favorite — log jo khud ko smart samjhte hain — tu 🔥😂",
+                "😈 Devil mode DONE — check teri condition 💀😈",
+                "😈 Beta devil ne aaj tujhe yaadgaar bana diya — wrong reasons se 🔥⚡",
+            ]
+
+            karma_texts = [
+                "☯️ Karma aaya — teri sab harkat ka hisaab ho raha hai 🔥💀",
+                "☯️ Beta karma kisi ki nahi sunta — teri bhi nahi 😂⚡",
+                "☯️ KARMA STRIKE — tune jo kiya woh teri taraf wapas aaya 🔥😈",
+                "☯️ Bhai karma judge nahi karta — deliver karta hai 💀😂",
+                "☯️ Karma mode activate — teri sab galtiyan wapas aa rahi hain 🔥⚡",
+                "☯️ Beta karma tujhe bhool nahi gaya — yaad rakha tha 😂💀",
+                "☯️ KARMA DELIVERY — teri harkat ka package arrive ho gaya 🔥😈",
+                "☯️ Bhai karma se koi nahi bachta — tu bhi nahi bachega 💀⚡",
+                "☯️ Karma tujhe dhundh raha tha — dhundh liya 🔥😂",
+                "☯️ Beta karma aata hai jab expect nahi karte — sun le 😂💀",
+                "☯️ KARMA HITS DIFFERENT — teri sab cheez wapas 🔥⚡",
+                "☯️ Bhai karma teri priority nahi thi — karma mein tu priority hai 😂💀",
+                "☯️ Karma cycle complete — tune jo kiya tune hi bhoga 🔥😈",
+                "☯️ Beta karma slow hota hai par sure hota hai — yeh sure tha 💀⚡",
+                "☯️ KARMA CALL — teri line pe aa gaya 🔥😂",
+                "☯️ Bhai karma mein koi error nahi — teri galti recorded thi 😂💀",
+                "☯️ Karma teri taraf waapis — enjoy 🔥⚡",
+                "☯️ Beta karma tera address jaanta tha 😂💀",
+                "☯️ KARMA FINAL — teri poori account balance zero 🔥😈",
+                "☯️ Bhai karma se lad nahi sakte — tu chhupa nahi karma se 💀⚡",
+                "☯️ Karma strike — tune deserve kiya — mila 🔥😂",
+                "☯️ Beta karma ko excuse nahi deta — sirf result deta hai 😂💀",
+                "☯️ KARMA STORM — teri sab beizzati aaj ekatha aayi 🔥⚡",
+                "☯️ Bhai karma tujhse behtar account maintain karta hai 😂💀",
+                "☯️ Karma mein tera account — overdraft mein hai 🔥😈",
+                "☯️ Beta karma ki speed teri speed se faster hai 💀⚡",
+                "☯️ KARMA BLAST — teri sab cheezon ka hisaab 🔥😂",
+                "☯️ Bhai karma ko pata tha tune kya kiya — sab record mein hai 😂💀",
+                "☯️ Karma kisi pe bhi nahi rulta — teri bhi nahi 🔥⚡",
+                "☯️ Beta karma tera future nahi — karma tera present hai 😂💀",
+                "☯️ KARMA INVOICE — teri sab galtiyon ka bill aa gaya 🔥😈",
+                "☯️ Bhai karma mein koi discount nahi milta — full price pay 💀⚡",
+                "☯️ Karma delivered — tune jo bheja wahi mila 🔥😂",
+                "☯️ Beta karma tujhse kisi ki nahi sunta — seedha deliver karta hai 😂💀",
+                "☯️ KARMA FULL CIRCLE — teri sab harkat ghumke teri hi taraf aayi 🔥⚡",
+                "☯️ Bhai karma teri taraf — aur tu prepared nahi tha 😂💀",
+                "☯️ Karma hit kiya — tujhe pata tha aayega — aaya 🔥😈",
+                "☯️ Beta karma mein interest bhi hota hai — tera compound ho gaya 💀⚡",
+                "☯️ KARMA COMPLETE — lesson mila? 🔥😂",
+                "☯️ Bhai karma ne tujhe select kiya — deservingly 😂💀",
+                "☯️ Karma tujhe yaad dila raha hai — tune kya kiya tha 🔥⚡",
+                "☯️ Beta karma ki awaaz nahi hoti — par result loud hota hai 😂💀",
+                "☯️ KARMA RESPONSE — teri har cheez ka seedha jawab 🔥😈",
+                "☯️ Bhai karma ki list mein tu first position pe tha 💀⚡",
+                "☯️ Karma tujhe bhool nahi gaya — teri galti note thi 🔥😂",
+                "☯️ Beta karma aur tu — aaj inka meetup schedule tha 😂💀",
+                "☯️ KARMA WRAP UP — teri life lesson: yeh tha 🔥⚡",
+                "☯️ Bhai karma ne apna kaam kiya — efficient tha 😂💀",
+                "☯️ Karma strike final — teri sab cheez balanced ho gayi — zero pe 🔥😈",
+                "☯️ Beta karma yaad rakhna — abhi bhi teri account open hai ☯️😂",
+            ]
+
+            doom_texts = [
+                "💀 DOOM activated — teri poori existence on countdown 🔥😈",
+                "💀 Beta doom aaya — tera timer start ho gaya 😂⚡",
+                "💀 DOOM STRIKE — teri poori defense wiped 🔥😈",
+                "💀 Bhai doom se koi nahi bachta — teri bhi date aane wali thi 😂💀",
+                "💀 Doom mode — teri sab cheez: scheduled for deletion 🔥⚡",
+                "💀 Beta doom tera waqt dekh ke aaya — perfect timing 😂😈",
+                "💀 DOOM RAID — teri poori squad: doomed 🔥💀",
+                "💀 Bhai doom pe haath lagaya — yeh result expect karna chahiye tha 😂⚡",
+                "💀 Doom finale — teri poori story: ended 🔥😈",
+                "💀 Beta doom ki awaaz sunna nahi chahte log — teri aa gayi 😂💀",
+                "💀 DOOM COMPLETE — teri sab cheez: finished 🔥⚡",
+                "💀 Bhai doom tujhse pehle plan kar ke aaya tha 😂😈",
+                "💀 Doom level CRITICAL — teri situation: hopeless 🔥💀",
+                "💀 Beta doom ne tujhe select kiya — teri achievement nahi 😂⚡",
+                "💀 DOOM COUNTDOWN — teri sab cheez: 3... 2... 1... done 🔥😈",
+                "💀 Bhai doom mein rasta ek hi hota hai — neeche 😂💀",
+                "💀 Doom activated — teri poori future: uncertain 🔥⚡",
+                "💀 Beta doom ki language — teri samajh nahi aati — result aata hai 😂😈",
+                "💀 DOOM FINAL — teri poori team: gone 🔥💀",
+                "💀 Bhai doom aur tu — aaj ka meetup tera worst tha 😂⚡",
+                "💀 Doom mode — tera har step: tracked 🔥😈",
+                "💀 Beta doom ne teri position: permanent zero confirm ki 😂💀",
+                "💀 DOOM RAIN — teri har cheez: destroyed 🔥⚡",
+                "💀 Bhai doom mein mercy nahi hoti — teri request: denied 😂😈",
+                "💀 Doom strike — teri sab galtiyan: collected 🔥💀",
+                "💀 Beta doom clock — teri ticking: started 😂⚡",
+                "💀 DOOM WAVE — teri poori defense: overwhelmed 🔥😈",
+                "💀 Bhai doom ki speed mein teri situation resolve ho gayi — badly 😂💀",
+                "💀 Doom verdict — teri case: closed — against you 🔥⚡",
+                "💀 Beta doom se pehle sun: teri galti — doom aaya 😂😈",
+                "💀 DOOM ARRIVAL — teri poori day ruined 🔥💀",
+                "💀 Bhai doom ne tujhe apna project bana liya 😂⚡",
+                "💀 Doom mode final — teri sab cheez: ash 🔥😈",
+                "💀 Beta doom ki ek khasiyat — woh aata zaroor hai 😂💀",
+                "💀 DOOM EXECUTION — teri poori plan: failed 🔥⚡",
+                "💀 Bhai doom tera number leke aaya tha — mila 😂😈",
+                "💀 Doom level MAX — teri recovery: impossible 🔥💀",
+                "💀 Beta doom ki taraf se ek gift — teri haari 😂⚡",
+                "💀 DOOM COMPLETE CYCLE — teri poori existence reset 🔥😈",
+                "💀 Bhai doom tujhse better hai — wait nahi karta 😂💀",
+                "💀 Doom mode — teri sab cheez: compromised 🔥⚡",
+                "💀 Beta DOOM aur tu — tujhe jeetna tha par doom ka hi naam hai 😂😈",
+                "💀 DOOM FINAL WAVE — teri sab: erased 🔥💀",
+                "💀 Bhai doom ne tujhe memorable bana diya — galat reasons se 😂⚡",
+                "💀 Doom activated final time — teri countdown: zero 🔥😈",
+                "💀 Beta DOOM se seekhna tha — tujhe nahi tha pata ab hai 😂💀",
+                "💀 DOOM OVER — teri side: collapsed — mine: standing 🔥⚡",
+                "💀 Bhai doom ne tera chapter likh diya — R.I.P. chapter 😂😈",
+                "💀 Doom final message — tujhe yaad rahega — sahi reasons se nahi 🔥💀",
+                "💀 Beta DOOM complete — check teri condition — yahi tha 😂⚡",
+            ]
+
+            # ─── GAME TEXTS (Menu10) ──────────────────────────────────────────────
+
+            truth_texts = [
+                "Tumhara sabse bada secret kya hai jo kisi ko nahi pata? 🤫",
+                "Kisi pe crush tha jo ab dost hai? 😳",
+                "Kabhi kisi ki baat repeat ki thi jo confidence mein batai gayi thi? 😬",
+                "Woh kaun hai jis par sabse zyada trust karte ho? ❤️",
+                "Life mein sabse bada regret kya hai? 💭",
+                "Kabhi class ya office se bina bataye bhaage ho? 😂",
+                "Tumhari sabse embarrassing memory kya hai? 😳",
+                "Kabhi kisi ko jhooth bol ke escape kiya hai? 🤥",
+                "Tumhara sabse bada fear kya hai? 😨",
+                "Kabhi kisi se pyaar kiya hai jo tumhe pata nahi? 💔",
+                "Tumhari life ka best decision kya tha? ✅",
+                "Kabhi kisi ko ghost kiya hai? 👻",
+                "Tumhara sabse bada achievement kya hai? 🏆",
+                "Kabhi kisi ko 'I love you' bola hai jhooth mein? 💀",
+                "Tumhari sabse badi weakness kya hai? 😅",
+                "Kabhi kisi ka trust todna pada hai? 💔",
+                "Tumhari favourite memory kya hai? 📸",
+                "Kabhi kisi ko dekh ke jealous feel kiya hai? 😤",
+                "Tumhara sabse bada dream kya hai? 🌟",
+                "Kabhi kisi ki feelings hurt kari hai? 😢",
+                "Tumhari sabse badi strength kya hai? 💪",
+                "Kabhi kisi ko forgive kiya hai jo worth nahi tha? 🙏",
+                "Tumhara worst date experience kya tha? 😬",
+                "Kabhi kisi ko block kiya hai without reason? 🚫",
+                "Tumhari guilty pleasure kya hai? 🍫",
+                "Kabhi kisi se jealous hoke galat kiya hai? 😤",
+                "Tumhara favourite childhood memory kya hai? 🧸",
+                "Kabhi kisi ko sacrifice kiya hai apne liye? 🥺",
+                "Tumhari life ki best advice kya hai? 💡",
+                "Kabhi apne best friend se jhooth bola hai? 🤥"
+            ]
+
+            dare_texts = [
+                "Apni maa ko call kar ke bol — 'Main tujhse pyaar karta hoon' 📞❤️",
+                "Apni sabse embarrassing photo share kar group mein 📸😹",
+                "Kisi bhi friend ko abhi message kar — 'Bhai mujhe pata chal gaya' — aur reaction dekho 😈",
+                "10 seconds ke liye khud se hi baat karo — loud 🗣️",
+                "Abhi ek push-up kar aur photo bhejo 💪",
+                "Apne crush ko 'Hi' bol — screenshot bhejo 😳",
+                "Khud ki roast karo ek paragraph mein — seriously 😂",
+                "Apna phone wallpaper change karo kisi funny photo mein 📱",
+                "5 random logo ko 'I love you' message karo 💌",
+                "Apni last seen status pe kuch funny likho 📝",
+                "Kisi bhi group mein 'Main pagal hoon' bolo 🤪",
+                "Apna profile pic change karo kisi meme se 🖼️",
+                "Apne best friend ko call karo aur kuch funny bolo 📞",
+                "Apni gallery se koi embarrassing photo share karo 📸",
+                "Kisi random person ko compliment do 🌹",
+                "Apne parents ko 'I love you' bolo ❤️",
+                "Kisi bhi chat mein 'I am the best' bolo 😎",
+                "Apna phone number kisi stranger ko do 📱",
+                "Kisi ko 'You are amazing' bol kar photo bhejo 💖",
+                "Apni life ka sabse embarrassing story share karo 📖",
+                "Kisi ko 'Mujhe tumse pyaar hai' bol kar block karo 💀",
+                "Apni bio mein kuch weird likho 📝",
+                "Kisi bhi group mein 'Main aaj gussa hoon' bolo 😤",
+                "Apne crush ko 'Hi' bol kar screenshot bhejo 😳",
+                "Kisi ko 'You are my hero' bolo 🦸",
+                "Apni last seen story mein kuch funny daalo 📱",
+                "Kisi bhi chat mein 'Main bhagwan hoon' bolo 😂",
+                "Apne best friend ko 'Main teri maa hoon' bolo 🤣",
+                "Kisi random person ko 'You are beautiful' bolo 💕",
+                "Apni life ki best memory share karo 📸"
+            ]
+
+            situation_texts = [
+                "Agar tumhe 1 crore mil jaye toh kya karoge? 💰",
+                "Agar tum 1 din invisible ho sakte ho toh kya karoge? 👻",
+                "Agar tumhe ek wish mil jaye toh kya maangoge? ✨",
+                "Agar tum president ban jao toh kya change karoge? 🏛️",
+                "Agar tumhe time travel karna hai toh kahan jaoge? ⏳",
+                "Agar tumhe 3 wishes mil jaye toh kya maangoge? 🌟",
+                "Agar tum superpower choose kar sakte ho toh kya? 🦸",
+                "Agar tumhe ek book likhni hai toh kya likhoge? 📖",
+                "Agar tum famous ho jao toh kya karoge? 🌟",
+                "Agar tumhe ek din kuch bhi karne ko mile toh kya karoge? 🎉",
+                "Agar tumhe ek country choose karni hai toh kaunsi? 🌍",
+                "Agar tumhe ek language seekhni hai toh kaunsi? 🗣️",
+                "Agar tum apna naam change kar sakte ho toh kya rakhenge? 📛",
+                "Agar tumhe apni life 1 word mein describe karni hai toh kya? 💬",
+                "Agar tumhe ek famous personality se milna hai toh kaun? 🌟",
+                "Agar tumhe 1 din life free ho toh kya karoge? 🎈",
+                "Agar tumhe apni life ka best moment choose karna hai toh kya? 📸",
+                "Agar tumhe ek skill seekhni hai toh kaunsi? 🎯",
+                "Agar tumhe apni life ka worst moment choose karna hai toh kya? 😢",
+                "Agar tumhe ek adventure karna hai toh kya? 🏔️",
+                "Agar tumhe apni life change karni hai toh kya change karoge? 🔄",
+                "Agar tumhe ek dream choose karna hai toh kya? 💭",
+                "Agar tumhe apni life ka best decision choose karna hai toh kya? ✅",
+                "Agar tumhe ek challenge choose karna hai toh kya? 🏆",
+                "Agar tumhe apni life ka best friend choose karna hai toh kaun? 🤝",
+                "Agar tumhe apni life ka worst decision choose karna hai toh kya? ❌",
+                "Agar tumhe ek goal choose karna hai toh kya? 🎯",
+                "Agar tumhe apni life ka best memory choose karna hai toh kya? 📸",
+                "Agar tumhe apni life ka worst memory choose karna hai toh kya? 😢",
+                "Agar tumhe apni life ka best achievement choose karna hai toh kya? 🏆"
+            ]
+
+            # ─── QUIZ TEXTS ────────────────────────────────────────────────────────
+
+            quiz_texts = [
+                {"q": "IIT JEE mein kaunsi book sabse important hai?", "a": "HC Verma"},
+                {"q": "Physics mein 'g' ki value kya hai?", "a": "9.8"},
+                {"q": "Formula E = mc² kisne diya?", "a": "Einstein"},
+                {"q": "IIT ka full form kya hai?", "a": "Indian Institute of Technology"},
+                {"q": "JEE ka full form kya hai?", "a": "Joint Entrance Examination"},
+                {"q": "Physics mein SI unit of force kya hai?", "a": "Newton"},
+                {"q": "Chemistry mein H2O kya hai?", "a": "Water"},
+                {"q": "Maths mein 'pi' ki value kya hai?", "a": "3.14"},
+                {"q": "Biology mein human body mein kitna water hai?", "a": "70%"},
+                {"q": "IIT mein admission kaunsi exam se hota hai?", "a": "JEE Advanced"},
+                {"q": "NEET ka full form kya hai?", "a": "National Eligibility cum Entrance Test"},
+                {"q": "Human body mein kitna blood hai?", "a": "5 liters"},
+                {"q": "Heart ka function kya hai?", "a": "Blood pump"},
+                {"q": "Brain ka weight kitna hai?", "a": "1.4 kg"},
+                {"q": "Biology mein DNA ka full form kya hai?", "a": "Deoxyribonucleic Acid"},
+                {"q": "Human eye mein kitne colors dikhte hain?", "a": "10 million"},
+                {"q": "Body mein kitne bones hain?", "a": "206"},
+                {"q": "Blood group kaunse type ke hote hain?", "a": "A, B, AB, O"},
+                {"q": "NEET mein kitne questions hote hain?", "a": "200"},
+                {"q": "MBBS ka full form kya hai?", "a": "Bachelor of Medicine and Bachelor of Surgery"},
+                {"q": "Earth ka sabse bada ocean kaunsa hai?", "a": "Pacific Ocean"},
+                {"q": "World ka sabse lamba river kaunsa hai?", "a": "Nile River"},
+                {"q": "Human body mein sabse bada organ kaunsa hai?", "a": "Skin"},
+                {"q": "Universe ka sabse bada planet kaunsa hai?", "a": "Jupiter"},
+                {"q": "Light ki speed kya hai?", "a": "3x10^8 m/s"},
+                {"q": "Earth ka sabse ooncha mountain kaunsa hai?", "a": "Mount Everest"},
+                {"q": "World mein sabse zyada population wala country kaunsa hai?", "a": "India"},
+                {"q": "Computer ka brain kaunsa hai?", "a": "CPU"},
+                {"q": "Mobile OS kaunse hain?", "a": "Android, iOS"},
+                {"q": "World ka sabse bada desert kaunsa hai?", "a": "Sahara Desert"}
+            ]
+
+            # ─── RIDDLE TEXTS ──────────────────────────────────────────────────────
+
+            riddle_texts = [
+                {"q": "Main hoon jo andar aata hai par bahar nahi jaata. Main hoon jo har insaan ke paas hai. Main kya hoon?", "a": "Sans (Breath)"},
+                {"q": "Main hoon jo duniya mein sabse bada hai, par main kisi ko dikhta nahi. Main kya hoon?", "a": "Pyaar (Love)"},
+                {"q": "Main hoon jo haath mein aata hai par pakda nahi jaata. Main kya hoon?", "a": "Pani (Water)"},
+                {"q": "Main hoon jo har insaan ko dikhta hai par koi dekh nahi sakta. Main kya hoon?", "a": "Andhera (Darkness)"},
+                {"q": "Main hoon jo kabhi nahi rukta, kabhi nahi thakta. Main kya hoon?", "a": "Samay (Time)"},
+                {"q": "Main hoon jo duniya mein sabse tez hai, par main kisi ko dikhta nahi. Main kya hoon?", "a": "Vichar (Thought)"},
+                {"q": "Main hoon jo andar hota hai par bahar nahi. Main kya hoon?", "a": "Dil (Heart)"},
+                {"q": "Main hoon jo har insaan ke paas hai par koi use nahi karta. Main kya hoon?", "a": "Dimag (Brain)"},
+                {"q": "Main hoon jo kabhi nahi sota, kabhi nahi thakta. Main kya hoon?", "a": "Aankh (Eye)"},
+                {"q": "Main hoon jo har insaan ki madad karta hai par koi use nahi dekhta. Main kya hoon?", "a": "Hawa (Air)"},
+                {"q": "Main hoon jo duniya mein sabse chhota hai, par sab se bada kaam karta hoon. Main kya hoon?", "a": "Beej (Seed)"},
+                {"q": "Main hoon jo kabhi nahi marta, kabhi nahi hota. Main kya hoon?", "a": "Atma (Soul)"},
+                {"q": "The person who makes it doesn't need it. The person who buys it doesn't use it. The person who uses it doesn't know they're using it. What is it?", "a": "coffin"},
+            ]
+
+            # ─── FUN TEXTS (Joke, Fact, Compliment, Quotes) ──────────────────────
+
+            joke_list = [
+                "Main apni life mein itna positive hoon... ki blood group bhi B+ hai! 😂",
+                "Teacher: Kal absent kyun the? Student: Sir, mujhe bukhar tha. Teacher: Proof? Student: Aaj aa gaya na! 😹",
+                "Santa: Main ghar ke bahar khada hun. Banta: Andar aa jao. Santa: Andar wala bhi main hoon! 🤣",
+                "Meri girlfriend ne kaha — tujhse better koi nahi. Phir chali gayi. Better koi mila hoga shayad 😂",
+                "Doctor: Patient ko hawa ki zaroorat hai. Nurse: Kya karein? Doctor: Fan on karo. Nurse: Ceiling se pakad ke? 😹",
+                "Ghar mein sabse zyada kaam mera — internet chalaana! 😂",
+                "Padhai karo beta future bright hoga. Maine padhi — future gaya andhera mein. 😂",
+                "Wo bolti hai 'I need space' — main bola ठीक है, NASA se contact karo! 😂",
+                "Mera wifi itna slow hai ke circle of life bhi nahi chalta 🐢",
+                "Main sochta hoon kal se gym jaunga... kal kab aata hai? 🤔",
+                "Mummy ka 2 minute aur Maggi ka 2 minute kabhi same nahi hote",
+                "Aaj kal log 'seen' karke itna attitude dikhate hain, jaise message nahi loan approve kar rahe ho",
+                "Meri life itni private hai ki mujhe khud next update ka pata nahi hota 🤡 ",
+                "Mere jokes pe sirf do log haste hain... main aur meri overconfidence 🤣",
+                "Log bolte hain Be yourself... phir judge bhi wahi log karte hain",
+                "Life ne itne twists diye hain ki Google Maps bhi rerouting kar de",
+            ]
+
+            fact_list = [
+                "🧠 Insaan ka dimag 75% paani se bana hai!",
+                "🐙 Octopus ke teen dil hote hain!",
+                "🌙 Chand par mobile signal nahi hai — par WiFi aata hai ek satellite se! (Future plan 😂)",
+                "🍯 Sahi tarike se rakha hua honey kabhi kharab nahi hota!",
+                "⚡ Bijli ka ek bolt 5 times zyada garam hota hai sun ki surface se!",
+                "🦈 Shark insaan se zyada purana hai — dinasors se bhi pehle!",
+                "👁️ Insaan ki aankh 10 million rangon ko differentiate kar sakti hai!",
+                "🐝 Ek machhar ek second mein 600 baar apne pankh hilata hai!",
+                "🦒 Giraffe ki tongue 20 inches lambi hoti hai!",
+                "🐧 Penguins ek dusre ko pehchanne ke liye unique calls use karte hain!",
+                "🚀 Space mein awaaz travel nahi karti, kyunki wahan hawa nahi hoti.",
+                "👅 Har insaan ki tongue print fingerprints ki tarah unique hoti hai.",
+                "🦒 Giraffe apni 21-inch lambi tongue se kaan saaf kar sakta hai.",
+                "⚡ Lightning ka temperature Suraj ki surface se bhi zyada hota hai",
+                "🌍 Har second Earth par lagbhag 100 lightning strikes hoti hain.",
+                "🐌 Snail 3 saal tak so sakta hai (kuch species mein).",
+                "🧊 Garam paani kuch conditions mein thande paani se jaldi jam sakta hai (Mpemba effect).",
+                "👀 Insaan ka brain ulta image dekhta hai aur use seedha process karta hai.",
+                "🍌 Banana technically ek berry hai, lekin strawberry nahi.",
+                "🦘 Kangaroo peeche ki taraf chal nahi sakta.",
+                "🐧 Penguins propose karne ke liye apne partner ko chhota sa pathar gift karte hain (kuch species mein).",
+                "💀 Human body mein itni blood vessels hoti hain ki unhe line mein jodo to lagbhag 100,000 km lambi ho jaayengi.",
+                "🌌 Hum raat ko jo kuch stars dekhte hain, unki light kai saal pehle nikli hoti hai.",
+                "🐝 Bees insaanon ke chehre pehchaan sakti hain.",
+            ]
+
+            compliment_list = [
+                "Bhai tu bahut positive energy rakhta hai — seriously 🌟",
+                "Teri thinking bahut alag hai — creative hai tu 🧠✨",
+                "Tu jo bhi karta hai dil se karta hai — yeh rare hai ❤️",
+                "Teri sense of humor? Top tier 😂👑",
+                "Tujhse baat karna genuinely enjoyable hota hai 🗣️✨",
+                "Tu ek natural leader hai — log tujhe follow karte hain 👑",
+                "Teri mehnat dekh ke lagta hai, success teri waiting hai 💪",
+                "Teri smile contagious hai — sabko khushi deti hai 😊",
+                "Tu bahut strong insaan hai — sab handle kar leta hai 💪",
+                "Teri vibe bohot positive hai — tere saath time acha lagta hai ✨",
+                "You're one of a kind.",
+                "Tumhari vibe alag hi level ki hai.",
+                "You're effortlessly cool.",
+                "Tum jahan hote ho, wahan energy aa jaati hai.",
+                "You make everything look easy.",
+                "Tumhari personality hi alag hai.",
+                "You're genuinely impressive.",
+                "Tumhare ideas hamesha unique hote hain.",
+                "You're unforgettable.",
+                "Tum confidence ka perfect example ho.",
+                "Built different. 💯",
+                "Aura speaks louder than words.",
+                "You're the main character.",
+                "Tumhari smile mood fix kar deti hai.",
+                "You make people feel comfortable.",
+                "You're naturally adorable.",
+                "Tumhari laugh contagious hai.",
+                "You're a walking green flag.",
+                "You're sunshine in human form.",
+                "Tumhare saath time ka pata hi nahi chalta.",
+                "You have the kindest heart.",
+                "You're effortlessly charming.",
+                "You make ordinary moments special.",
+                "Standards on another level.",
+                "Too real to be fake.",
+                "Calm outside, dangerous inside.",
+                "Rare people have this kind of aura.",
+                "Silent, but unforgettable.",
+                "Class never chases attention.",
+                "You don't follow trends, you set them.",
+                "You're the flex you don't even need to show.",
+                "Some people have looks, you have presence.",
+                "Your aura deserves its own fan club.",
+                "You're proof that being real is attractive.",
+                "Not everyone shines, but you do.",
+                "You don't need attention, attention finds you.",
+                "Legends don't introduce themselves.",
+                "Your vibe is expensive.",
+                "You're the kind of person people remember.",
+                "You make confidence look natural. 😎",
+            ]
+
+            quote_list = [
+                "💭 Sapne woh nahi jo sote waqt aate hain, sapne woh hain jo sone nahi dete. — APJ Abdul Kalam",
+                "💭 'Mehnat karo itna ki luck ko bhi mauka mile tujhe dhundhne ka.' — Unknown",
+                "💭 'Duniya ka sabse bada teacher: failure hai.' — Unknown",
+                "💭 'Ek accha dost aur ek accha kitaab — dono hi tujhe better banate hain.' — Unknown",
+                "💭 'Zindagi ek echo hai — jo bejhoge woh wapas aayega.' — Unknown",
+                "💭 'Success is not final, failure is not fatal: it is the courage to continue that counts.' — Churchill",
+                "💭 'The only way to do great work is to love what you do.' — Steve Jobs",
+                "💭 'In the middle of difficulty lies opportunity.' — Einstein",
+                "💭 'Believe you can and you're halfway there.' — Theodore Roosevelt",
+                "💭 'The best time to plant a tree was 20 years ago. The second best time is now.' — Chinese Proverb",
+                "💭 People's lives don't end when they die, it ends when they lose faith. — Itachi Uchiha",
+                "💭 Wake up to reality. Nothing ever goes as planned in this world. — Madara Uchiha",
+                "💭 Those who break the rules are trash, but those who abandon their friends are worse than trash. — Kakashi Hatake",
+                "💭 When people are protecting something truly precious, they truly become strong. — Haku",
+                "💭 A lesson without pain is meaningless. — Edward Elric",
+                "💭 A person grows up when they're able to overcome hardships. — Jiraiya",
+                "💭 Power comes in response to a need, not a desire. — Goku",
+                "💭 If you don't take risks, you can't create a future. — Monkey D. Luffy",
+                "💭 The world isn't perfect, but it's there for us. — Roy Mustang",
+                "💭 Fear is not evil. It tells you your weakness. — Gildarts Clive",
+                "💭 The moment you think of giving up, think of the reason why you held on so long. — Natsu Dragneel",
+                "💭 Hard work is worthless for those that don't believe in themselves. — Naruto Uzumaki",
+                "💭 The difference between the novice and the master is that the master has failed more times than the novice has tried. — Koro-sensei",
+                "💭 To know sorrow is not terrifying. What is terrifying is to know you can't go back to happiness. — Matsumoto Rangiku",
+                "💭 Whatever you lose, you'll find it again. But what you throw away you'll never get back. — Kenshin Himura",
+                "💭 Success is not final, failure is not fatal: it is the courage to continue that counts. — Winston Churchill",
+                "💭 The only way to do great work is to love what you do. — Steve Jobs",
+                "💭 Stay hungry, stay foolish. — Steve Jobs",
+                "💭 Your time is limited, so don't waste it living someone else's life. — Steve Jobs",
+                "💭 The future belongs to those who believe in the beauty of their dreams. — Eleanor Roosevelt",
+                "💭 Be yourself; everyone else is already taken. — Oscar Wilde",
+                "💭 It always seems impossible until it's done. — Nelson Mandela",
+                "💭 Dream big and dare to fail. — Norman Vaughan",
+                "💭 Do what you can, with what you have, where you are. — Theodore Roosevelt",
+                "💭 Believe you can and you're halfway there. — Theodore Roosevelt",
+                "💭 The best way to predict the future is to create it. — Peter Drucker",
+                "💭 Discipline is choosing between what you want now and what you want most.",
+                "💭 Don't watch the clock; do what it does. Keep going. — Sam Levenson",
+                "💭 The journey of a thousand miles begins with one step. — Lao Tzu",
+                "💭 Fall seven times, stand up eight. — Japanese Proverb",
+                "💭 Action is the foundational key to all success. — Pablo Picasso",
+                "💭 Work hard in silence, let success make the noise.",
+                "💭 Great things never come from comfort zones.",
+                "💭 Small steps every day lead to big results.",
+                "💭 Consistency beats motivation.",
+                "💭 Discipline creates freedom.",
+                "💭 Your only competition is the person you were yesterday.",
+                "💭 Never let success get to your head or failure get to your heart.",
+                "💭 A calm mind is a powerful weapon.",
+                "💭 Pressure creates diamonds.",
+            ]
+            # ─── PWR & OWS TEXT LISTS ─────────────────────────────────────────────
+            pwr_texts = [
+                                    "Kyun",
+                                    "Re",
+                                    "Mc",
+                                    "Ka",
+                                    "Baccha",
+                                    "Apna",
+                                    "Papa",
+                                    "Sa",
+                                    "Hawabji",
+                                    "Karega",
+                                    "Randi",
+                                    "Rand",
+                                    "Ka",
+                                    "Beta",
+                                    "Teri",
+                                    "Maa",
+                                    "Ki",
+                                    "Kali",
+                                    "Kali",
+                                    "Chut",
+                                    "Ma",
+                                    "Lund",
+                                    "Daal",
+                                    "Ka",
+                                    "Mix",
+                                    "Kar",
+                                    "Dunga",
+                                    "Te",
+                                    "RANDI",
+                                    "Ka",
+                                    "Beta",
+                                    "Teri",
+                                    "Mausi",
+                                    "Ko",
+                                    "Apna",
+                                    "Lund",
+                                    "Pa",
+                                    "Baitha",
+                                    "Ka",
+                                    "Puri",
+                                    "Duniya",
+                                    "Ghumunga",
+                                    "Re",
+                                    "Chinnar",
+                                    "Ka",
+                                    "Beta",
+                                    "Tere",
+                                    "Baap",
+                                    "Ko",
+                                    "Apna",
+                                    "Goto",
+                                    "Sa",
+                                    "Chap",
+                                    "Ka",
+                                    "Maar",
+                                    "DUNGA",
+                                    "Mc",
+                                    "Dhanda",
+                                    "Wali",
+                                    "Ka",
+                                    "Ladka",
+                                    "Kaha",
+                                    "Gayi",
+                                    "Teri",
+                                    "Speed",
+                                    "Abb",
+                                    "Apna",
+                                    "Papa",
+                                    "Sa",
+                                    "Hawabaji",
+                                    "Nahi",
+                                    "KAREGA",
+                                    "Mc",
+                                    "Ka",
+                                    "Pill",
+                                    "Teri",
+                                    "Bhen",
+                                    "Ka",
+                                    "Rape",
+                                    "Kar",
+                                    "Dunga",
+                                    "Bc",
+                                    "Majduri",
+                                    "Ruko",
+                                    "Teri",
+                                    "Tho",
+                                    "Mai",
+                                    "Tera",
+                                    "Bhen",
+                                    "Betiyon",
+                                    "Ka",
+                                    "Rape",
+                                    "Kar",
+                                    "Ka",
+                                    "Bhagg",
+                                    "Jaunga",
+                                    "Mc",
+                                    "Teri",
+                                    "Maa",
+                                    "Ke"
+                
+            ]
+            ows_texts = [
+                                    "Kyun",
+                                    "Re",
+                                    "Mc",
+                                    "Ka",
+                                    "Baccha",
+                                    "Apna",
+                                    "Papa",
+                                    "Sa",
+                                    "Hawabji",
+                                    "Karega",
+                                    "Randi",
+                                    "Rand",
+                                    "Ka",
+                                    "Beta",
+                                    "Teri",
+                                    "Maa",
+                                    "Ki",
+                                    "Kali",
+                                    "Kali",
+                                    "Chut",
+                                    "Ma",
+                                    "Lund",
+                                    "Daal",
+                                    "Ka",
+                                    "Mix",
+                                    "Kar",
+                                    "Dunga",
+                                    "Te",
+                                    "RANDI",
+                                    "Ka",
+                                    "Beta",
+                                    "Teri",
+                                    "Mausi",
+                                    "Ko",
+                                    "Apna",
+                                    "Lund",
+                                    "Pa",
+                                    "Baitha",
+                                    "Ka",
+                                    "Puri",
+                                    "Duniya",
+                                    "Ghumunga",
+                                    "Re",
+                                    "Chinnar",
+                                    "Ka",
+                                    "Beta",
+                                    "Tere",
+                                    "Baap",
+                                    "Ko",
+                                    "Apna",
+                                    "Goto",
+                                    "Sa",
+                                    "Chap",
+                                    "Ka",
+                                    "Maar",
+                                    "DUNGA",
+                                    "Mc",
+                                    "Dhanda",
+                                    "Wali",
+                                    "Ka",
+                                    "Ladka",
+                                    "Kaha",
+                                    "Gayi",
+                                    "Teri",
+                                    "Speed",
+                                    "Abb",
+                                    "Apna",
+                                    "Papa",
+                                    "Sa",
+                                    "Hawabaji",
+                                    "Nahi",
+                                    "KAREGA",
+                                    "Mc",
+                                    "Ka",
+                                    "Pill",
+                                    "Teri",
+                                    "Bhen",
+                                    "Ka",
+                                    "Rape",
+                                    "Kar",
+                                    "Dunga",
+                                    "Bc",
+                                    "Majduri",
+                                    "Ruko",
+                                    "Teri",
+                                    "Tho",
+                                    "Mai",
+                                    "Tera",
+                                    "Bhen",
+                                    "Betiyon",
+                                    "Ka",
+                                    "Rape",
+                                    "Kar",
+                                    "Ka",
+                                    "Bhagg",
+                                    "Jaunga",
+                                    "Mc",
+                                    "Teri",
+                                    "Maa",
+                                    "Ke"
+            ]
 
         # ─── LOAD/SAVE FUNCTIONS ─────────────────────────────────────────────
         def load_admins():
@@ -3183,10 +12779,72 @@ async def run_user_bot(session_string, chat_id):
             except:
                 pass
 
+        def load_filters():
+            try:
+                if not os.path.isfile(FILTERS_FILE):
+                    return []
+                with open(FILTERS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, list) else []
+            except:
+                return []
+
+        def save_filters():
+            try:
+                with open(FILTERS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(user_bot.filters, f, ensure_ascii=False, indent=2)
+            except:
+                pass
+
+        def load_autoreply():
+            try:
+                if not os.path.isfile(AUTO_REPLY_FILE):
+                    return None
+                with open(AUTO_REPLY_FILE, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+            except:
+                return None
+
+        def save_autoreply(text):
+            try:
+                with open(AUTO_REPLY_FILE, "w", encoding="utf-8") as f:
+                    f.write(text if text else "")
+            except:
+                pass
+
+        def get_sangmata_file(uid):
+            return os.path.join(SANGMATA_DIR, f"{uid}.json")
+
+        def load_sangmata(uid):
+            fname = get_sangmata_file(uid)
+            try:
+                if not os.path.isfile(fname):
+                    return []
+                with open(fname, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except:
+                return []
+
+        def save_sangmata(uid, history):
+            fname = get_sangmata_file(uid)
+            try:
+                with open(fname, "w", encoding="utf-8") as f:
+                    json.dump(history, f, ensure_ascii=False, indent=2)
+            except:
+                pass
+
+        # ─── INIT STATE ──────────────────────────────────────────────────────
         user_bot.admins = load_admins()
         user_bot.notes = load_notes()
         user_bot.menu_banner_msg = load_banner()
         user_bot.spam_texts = load_common_spam()
+        user_bot.filters = load_filters()
+        user_bot.auto_reply = load_autoreply()
+        user_bot.dm_shield_enabled = False  # will be loaded from DB per user later
+        user_bot.god_protection_enabled = False
+        user_bot.frozen = False
+        user_bot.dm_approved = set()  # will be loaded from DB
+        user_bot.dm_blocked = set()
 
         # ─── PREMIUM CHECKS ──────────────────────────────────────────────────
         async def is_premium_user(uid: int) -> bool:
@@ -3318,43 +12976,46 @@ async def run_user_bot(session_string, chat_id):
 
         owner_only_commands = {
             "addtext", "edittext", "deltext", "cleartext",
-            "spraydelay", "addadmin", "deladmin", "giftpremium"
+            "spraydelay", "addadmin", "deladmin", "giftpremium",
+            "freeze", "unfreeze", "stopallspray"
         }
 
         # ======================================================================
-        #                             MENUS
+        #                             MENUS (UPDATED UI)
         # ======================================================================
 
         @register_cmd("menu")
         async def cmd_menu(event, _):
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║            ✦ ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐔𝐒𝐄𝐑𝐁𝐎𝐓 ✦             ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║                                                              ║\n"
-                "║  👑 Owner  : ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️                          ║\n"
-                "║  📦 Commands: 500+                                          ║\n"
-                "║  🔥 Prefix  : `.` (Dot)                                    ║\n"
-                "║                                                              ║\n"
-                "║  ────〔 📖 𝐌𝐀𝐈𝐍 𝐌𝐄𝐍𝐔 〕────                            ║\n"
-                "║                                                              ║\n"
-                "║  📌 `.menu1` → 👑 Admin, 🔇 Mute, 🧹 Group, 🏷️ Auto Tag   ║\n"
-                "║  📌 `.menu2` → ⚔️ Raid Engine (Original)                   ║\n"
-                "║  📌 `.menu3` → 💣 Spam, 📝 Text, ☠️ Deathgod              ║\n"
-                "║  📌 `.menu4` → 🛡️ Protection & ❤️ Auto                   ║\n"
-                "║  📌 `.menu5` → 🛠️ Tools & 🎵 Music & 📝 Echo              ║\n"
-                "║  📌 `.menu6` → 🎭 Fun Features (Send/Tag)                 ║\n"
-                "║  📌 `.menu7` → 📊 Fun Meters (Sigma/Pookie/Baddie)        ║\n"
-                "║  📌 `.menu8` → 🎭 FUN RAIDS (Shayari/Rizz/Pickup/Roast)   ║\n"
-                "║  📌 `.menu9` → ⚔️ NON-ABUSIVE RAIDS (Attack/War/Savage/Ultra/Shame/Diss/Devil/Karma/Doom) ║\n"
-                "║  📌 `.menu10`→ 🎮 GAMES & FUN (Truth/Dare/Situation/RPS/TTT/Flip/Dice/Joke/Fact/Compliment/Quotes) ║\n"
-                "║  📌 `.menu11a`→ 💎 PREMIUM COMMANDS (Part 1)               ║\n"
-                "║  📌 `.menu11b`→ 💎 PREMIUM COMMANDS (Part 2)               ║\n"
-                "║                                                              ║\n"
-                "║  💡 Use `.cmds` for complete command list.                  ║\n"
-                "║                                                              ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          ✦ ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  𝐔𝐒𝐄𝐑𝐁𝐎𝐓 ✦
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  👑 Owner  : ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️
+  📦 Commands: 500+
+  🔥 Prefix  : `.` (Dot)
+
+  ────〔 📖 𝐌𝐀𝐈𝐍 𝐌𝐄𝐍𝐔 〕────
+
+  📌 `.menu1` → 👑 Admin, 🔇 Mute, 🧹 Group, 🏷️ Auto Tag
+  📌 `.menu2` → ⚔️ Raid Engine (Original + PWR)
+  📌 `.menu3` → 💣 Spam, 📝 Text, ☠️ Deathgod, OWS Spam
+  📌 `.menu4` → 🛡️ Protection & ❤️ Auto
+  📌 `.menu5` → 🛠️ Tools & 🎵 Music & 📝 Echo
+  📌 `.menu6` → 🎭 Fun Features (Send/Tag)
+  📌 `.menu7` → 📊 Fun Meters (Sigma/Pookie/Baddie)
+  📌 `.menu8` → 🎭 FUN RAIDS (Shayari/Rizz/Pickup/Roast)
+  📌 `.menu9` → ⚔️ NON-ABUSIVE RAIDS (Attack/War/Savage/Ultra/Shame/Diss/Devil/Karma/Doom)
+  📌 `.menu10`→ 🎮 GAMES & FUN (Truth/Dare/Situation/RPS/TTT/Flip/Dice/Joke/Fact/Compliment/Quotes)
+  📌 `.menu11a`→ 💎 PREMIUM COMMANDS (Part 1)
+  📌 `.menu11b`→ 💎 PREMIUM COMMANDS (Part 2)
+  📌 `.menu12` → 🛡️ NEW PROTECTION & PREMIUM FEATURES
+  📌 `.menu13` → 💎 PREMIUM RAIDS
+  📌 `.menu14` → 💎 PREMIUM SPAM
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  💡 Use `.cmds` for complete command list.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             await safe_edit(event, menu)
             if user_bot.menu_banner_msg:
                 chat_id2, msg_id = user_bot.menu_banner_msg
@@ -3370,433 +13031,495 @@ async def run_user_bot(session_string, chat_id):
 
         @register_cmd("menu1")
         async def cmd_menu1(event, _):
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║      👑 𝐀𝐃𝐌𝐈𝐍 • 🔇 𝐌𝐔𝐓𝐄 • 🧹 𝐆𝐑𝐎𝐔𝐏 • 🏷️ 𝐀𝐔𝐓𝐎 𝐓𝐀𝐆    ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║  ┌───〔 👑 𝐀𝐃𝐌𝐈𝐍 〕───┐                                   ║\n"
-                "║  │  `.admins` → View all admins                             ║\n"
-                "║  │  `.addadmin @user` (or reply) → Make admin               ║\n"
-                "║  │  `.deladmin @user` (or reply) → Remove admin             ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🔇 𝐌𝐔𝐓𝐄 & 𝐑𝐄𝐒𝐓𝐑𝐈𝐂𝐓 〕───┐                   ║\n"
-                "║  │  `.mute @user` → Local mute                              ║\n"
-                "║  │  `.unmute @user` → Local unmute                          ║\n"
-                "║  │  `.gmute @user` → Global mute                            ║\n"
-                "║  │  `.gunmute @user` → Global unmute                        ║\n"
-                "║  │  `.mutelist` → Check mute status                         ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🧹 𝐆𝐑𝐎𝐔𝐏 𝐌𝐎𝐃 〕───┐                           ║\n"
-                "║  │  `.lock` → Lock group messages                           ║\n"
-                "║  │  `.unlock` → Unlock group                               ║\n"
-                "║  │  `.purge <count>` → Delete N messages (max 200)          ║\n"
-                "║  │  `.throw @user` → Kick user                              ║\n"
-                "║  │  `.addbots <n>` → Add N bots from list                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🏷️ 𝐀𝐔𝐓𝐎 𝐓𝐀𝐆 〕───┐                            ║\n"
-                "║  │  `.autotag` → Tag all members one by one                ║\n"
-                "║  │  `.stopautotag` → Stop auto tag                         ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  📌 `.menu` → Main menu                                     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        👑 𝐀𝐃𝐌𝐈𝐍 • 🔇 𝐌𝐔𝐓𝐄 • 🧹 𝐆𝐑𝐎𝐔𝐏 • 🏷️ 𝐀𝐔𝐓𝐎 𝐓𝐀𝐆
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 👑 𝐀𝐃𝐌𝐈𝐍 〕───┐
+  │  `.admins`          → View all admins
+  │  `.addadmin @user`  → Make admin
+  │  `.deladmin @user`  → Remove admin
+  └───────────────────────────────┘
+
+  ┌───〔 🔇 𝐌𝐔𝐓𝐄 & 𝐑𝐄𝐒𝐓𝐑𝐈𝐂𝐓 〕───┐
+  │  `.mute @user`      → Local mute
+  │  `.unmute @user`    → Local unmute
+  │  `.gmute @user`     → Global mute
+  │  `.gunmute @user`   → Global unmute
+  │  `.mutelist`        → Show mute status
+  └───────────────────────────────┘
+
+  ┌───〔 🧹 𝐆𝐑𝐎𝐔𝐏 𝐌𝐎𝐃 〕───┐
+  │  `.lock`            → Lock group
+  │  `.unlock`          → Unlock group
+  │  `.purge <count>`   → Delete N messages
+  │  `.throw @user`     → Kick user
+  │  `.addbots <n>`     → Add bots from list
+  └───────────────────────────────┘
+
+  ┌───〔 🏷️ 𝐀𝐔𝐓𝐎 𝐓𝐀𝐆 〕───┐
+  │  `.autotag`         → Tag all members
+  │  `.stopautotag`     → Stop auto tag
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             await safe_edit(event, menu)
 
         @register_cmd("menu2")
         async def cmd_menu2(event, _):
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║                   ⚔️ 𝐑𝐀𝐈𝐃 𝐄𝐍𝐆𝐈𝐍𝐄                      ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║  ┌───〔 💬 𝐑𝐄𝐏𝐋𝐘 𝐑𝐀𝐈𝐃 〕───┐                          ║\n"
-                "║  │  `.reply @user` → Start reply raid                       ║\n"
-                "║  │  `.sreply @user` → Stop reply raid                       ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🤣 𝐑𝐑 𝐑𝐀𝐈𝐃 (Reply + React) 〕───┐              ║\n"
-                "║  │  `.rr @user` → Start RR raid                            ║\n"
-                "║  │  `.srr @user` → Stop RR raid                            ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🚩 𝐅𝐋𝐀𝐆 𝐑𝐀𝐈𝐃 〕───┐                          ║\n"
-                "║  │  `.flag @user` → Start flag raid                         ║\n"
-                "║  │  `.sflag @user` → Stop flag raid                         ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 💗 𝐇𝐄𝐀𝐑𝐓 𝐑𝐀𝐈𝐃 〕───┐                          ║\n"
-                "║  │  `.hrr @user` → Start heart raid                         ║\n"
-                "║  │  `.shrr @user` → Stop heart raid                         ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 😈 𝐆𝐎𝐃 𝐑𝐀𝐈𝐃 (4 replies) 〕───┐                 ║\n"
-                "║  │  `.replygod @user` → Start god raid                      ║\n"
-                "║  │  `.sgod @user` → Stop god raid                           ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🎯 𝐂𝐔𝐒𝐓𝐎𝐌 𝐑𝐀𝐈𝐃 〕───┐                        ║\n"
-                "║  │  `.customraid <text> <count>` (reply to user)            ║\n"
-                "║  │  `.stopcustomraid @user` → Stop                          ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  💡 For Fun Raids, use `.menu8`                            ║\n"
-                "║  📌 `.menu` → Main menu                                     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    ⚔️ 𝐑𝐀𝐈𝐃 𝐄𝐍𝐆𝐈𝐍𝐄
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 💬 𝐑𝐄𝐏𝐋𝐘 𝐑𝐀𝐈𝐃 〕───┐
+  │  `.reply @user`   → Start reply raid
+  │  `.sreply @user`  → Stop reply raid
+  └───────────────────────────────┘
+
+  ┌───〔 🤣 𝐑𝐑 (Reply+React) 〕───┐
+  │  `.rr @user`      → Start RR raid
+  │  `.srr @user`     → Stop RR raid
+  └───────────────────────────────┘
+
+  ┌───〔 🚩 𝐅𝐋𝐀𝐆 𝐑𝐀𝐈𝐃 〕───┐
+  │  `.flag @user`    → Start flag raid
+  │  `.sflag @user`   → Stop flag raid
+  └───────────────────────────────┘
+
+  ┌───〔 💗 𝐇𝐄𝐀𝐑𝐓 𝐑𝐀𝐈𝐃 〕───┐
+  │  `.hrr @user`     → Start heart raid
+  │  `.shrr @user`    → Stop heart raid
+  └───────────────────────────────┘
+
+  ┌───〔 😈 𝐆𝐎𝐃 𝐑𝐀𝐈𝐃 (4 replies) 〕───┐
+  │  `.replygod @user` → Start god raid
+  │  `.sgod @user`    → Stop god raid
+  └───────────────────────────────┘
+
+  ┌───〔 🎯 𝐂𝐔𝐒𝐓𝐎𝐌 𝐑𝐀𝐈𝐃 〕───┐
+  │  `.customraid <text> <count>` → Start
+  │  `.stopcustomraid @user`      → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 🔥 𝐏𝐖𝐑 𝐑𝐀𝐈𝐃 (New) 〕───┐
+  │  `.pwr @user <count>` → Start PWR raid
+  │  `.spwr @user`        → Stop PWR raid
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  💡 For Fun Raids, use `.menu8`
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             await safe_edit(event, menu)
 
         @register_cmd("menu3")
         async def cmd_menu3(event, _):
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║           💣 𝐒𝐏𝐀𝐌 & 📝 𝐓𝐄𝐗𝐓 & ☠️ 𝐃𝐄𝐀𝐓𝐇𝐆𝐎𝐃          ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║  ┌───〔 💣 𝐒𝐏𝐀𝐌 𝐂𝐎𝐌𝐌𝐀𝐍𝐃𝐒 〕───┐                    ║\n"
-                "║  │  `.spray <text>` or `.spray <count> <text>` → spam       ║\n"
-                "║  │  `.dspray` → Stop any spray                              ║\n"
-                "║  │  `.tspray <num>` → Spam saved text (from .listtexts)     ║\n"
-                "║  │  `.rspray` → Random saved text spam                      ║\n"
-                "║  │  `.multispray <count>` → Rotate all saved texts          ║\n"
-                "║  │  `.countspray <n> <text>` → Exactly N times              ║\n"
-                "║  │  `.spraydelay <sec>` → Adjust speed (owner only)         ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 📝 𝐓𝐄𝐗𝐓 𝐌𝐀𝐍𝐀𝐆𝐄𝐑 (Premium) 〕───┐           ║\n"
-                "║  │  `.addtext <text>` → Save a text                         ║\n"
-                "║  │  `.listtexts` → Show all saved texts                     ║\n"
-                "║  │  `.edittext <num> <new>` → Edit a text                   ║\n"
-                "║  │  `.deltext <num>` → Delete a text                        ║\n"
-                "║  │  `.cleartext confirm` → Delete all texts                 ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 ☠️ 𝐃𝐄𝐀𝐓𝐇𝐆𝐎𝐃 〕───┐                           ║\n"
-                "║  │  `.deathgod <count>` → Spam from Deathgod list           ║\n"
-                "║  │  `.sdeathgod` → Stop Deathgod                            ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  📌 `.menu` → Main menu                                     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+           💣 𝐒𝐏𝐀𝐌 & 📝 𝐓𝐄𝐗𝐓 & ☠️ 𝐃𝐄𝐀𝐓𝐇𝐆𝐎𝐃
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 💣 𝐒𝐏𝐀𝐌 𝐂𝐎𝐌𝐌𝐀𝐍𝐃𝐒 〕───┐
+  │  `.spray <text>` or `.spray <count> <text>`
+  │  `.dspray`          → Stop spray in this chat
+  │  `.tspray <num>`    → Spam saved text
+  │  `.rspray`          → Random saved text
+  │  `.multispray <c>`  → Rotate saved texts
+  │  `.countspray <n> <text>` → Exactly N
+  │  `.spraydelay <sec>`→ Adjust speed (owner)
+  └───────────────────────────────┘
+
+  ┌───〔 📝 𝐓𝐄𝐗𝐓 𝐌𝐀𝐍𝐀𝐆𝐄𝐑 (Premium) 〕───┐
+  │  `.addtext <text>`   → Save a text
+  │  `.listtexts`        → Show saved texts
+  │  `.edittext <num> <new>` → Edit
+  │  `.deltext <num>`    → Delete
+  │  `.cleartext confirm`→ Delete all
+  └───────────────────────────────┘
+
+  ┌───〔 ☠️ 𝐃𝐄𝐀𝐓𝐇𝐆𝐎𝐃 〕───┐
+  │  `.deathgod <count>`→ Start Deathgod
+  │  `.sdeathgod`       → Stop Deathgod
+  └───────────────────────────────┘
+
+  ┌───〔 💬 𝐎𝐖𝐒 𝐒𝐏𝐀𝐌 (New) 〕───┐
+  │  `.ows @user <count>` → Start OWS spam
+  │  `.sows @user`        → Stop OWS spam
+  └───────────────────────────────┘
+
+  ┌───〔 🛑 𝐆𝐋𝐎𝐁𝐀𝐋 𝐒𝐓𝐎𝐏 〕───┐
+  │  `.stopallspray`      → Stop all sprays in all chats
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             await safe_edit(event, menu)
 
         @register_cmd("menu4")
         async def cmd_menu4(event, _):
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║  🛡️ 𝐏𝐑𝐎𝐓𝐄𝐂𝐓𝐈𝐎𝐍 & 🖼️ 𝐆𝐑𝐎𝐔𝐏 𝐏𝐅𝐏 & ❤️ 𝐀𝐔𝐓𝐎  ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║  ┌───〔 🛡️ 𝐀𝐍𝐓𝐈-𝐃𝐄𝐋𝐄𝐓𝐄 〕───┐                       ║\n"
-                "║  │  `.antidel on` → Enable protection                       ║\n"
-                "║  │  `.antidel off` → Disable                                ║\n"
-                "║  │  `.antidel` → Show status                                ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 👁️ 𝐖𝐀𝐓𝐂𝐇𝐒𝐏𝐀𝐌 〕───┐                         ║\n"
-                "║  │  `.watchspam @user <limit> <sec>`                        ║\n"
-                "║  │  `.unwatchspam @user` → Remove watch                     ║\n"
-                "║  │  `.unwatchspam` → Remove all in chat                     ║\n"
-                "║  │  `.watchlist` → Show active watches                      ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🖼️ 𝐆𝐑𝐎𝐔𝐏 𝐏𝐅𝐏 𝐂𝐇𝐀𝐍𝐆𝐄𝐑 〕───┐                ║\n"
-                "║  │  `.setgpfp` (reply with image) → Set as group PFP        ║\n"
-                "║  │  `.addgpfp` → Add image to pool                          ║\n"
-                "║  │  `.listgpfp` → Show pool                                 ║\n"
-                "║  │  `.autogpfp <sec>` → Auto-rotate every N seconds         ║\n"
-                "║  │  `.stopgpfp` → Stop rotation                             ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 ❤️ 𝐀𝐔𝐓𝐎 𝐒𝐘𝐒𝐓𝐄𝐌 〕───┐                       ║\n"
-                "║  │  `.ar <emoji>` → Auto-react to your own msgs             ║\n"
-                "║  │  `.sar` → Disable auto-react                             ║\n"
-                "║  │  `.react @user <emoji>` → React to target's msgs         ║\n"
-                "║  │  `.unreact @user` → Remove target                        ║\n"
-                "║  │  `.reactlist` → Show all targets                         ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  📌 `.menu` → Main menu                                     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🛡️ 𝐏𝐑𝐎𝐓𝐄𝐂𝐓𝐈𝐎𝐍 & 🖼️ 𝐆𝐑𝐎𝐔𝐏 𝐏𝐅𝐏 & ❤️ 𝐀𝐔𝐓𝐎
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 🛡️ 𝐀𝐍𝐓𝐈-𝐃𝐄𝐋𝐄𝐓𝐄 〕───┐
+  │  `.antidel on/off` → Enable/disable
+  │  `.antidel`        → Show status
+  └───────────────────────────────┘
+
+  ┌───〔 👁️ 𝐖𝐀𝐓𝐂𝐇𝐒𝐏𝐀𝐌 〕───┐
+  │  `.watchspam @user <limit> <sec>`
+  │  `.unwatchspam @user` → Remove
+  │  `.unwatchspam`       → Remove all in chat
+  │  `.watchlist`         → Show active watches
+  └───────────────────────────────┘
+
+  ┌───〔 ❤️ 𝐀𝐔𝐓𝐎 𝐑𝐄𝐀𝐂𝐓 〕───┐
+  │  `.ar <emoji>`      → Auto-react to own msgs
+  │  `.sar`             → Disable auto-react
+  │  `.react @user <emoji>` → React to target's msgs
+  │  `.unreact @user`   → Remove target
+  │  `.reactlist`       → Show all targets
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             await safe_edit(event, menu)
 
         @register_cmd("menu5")
         async def cmd_menu5(event, _):
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║  🛠️ 𝐓𝐎𝐎𝐋𝐒 & 🎵 𝐌𝐔𝐒𝐈𝐂 & 📝 𝐄𝐂𝐇𝐎 & 🧠 𝐍𝐎𝐓𝐄𝐒  ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║  ┌───〔 🛠️ 𝐓𝐎𝐎𝐋𝐒 〕───┐                                ║\n"
-                "║  │  `.tts <text> [lang]` → Text-to-Speech                   ║\n"
-                "║  │  `.qrcode <text>` → Generate QR code                     ║\n"
-                "║  │  `.fancy <text>` → Fancy text styles                     ║\n"
-                "║  │  `.style <text>` → Bold/Italic/Mono                      ║\n"
-                "║  │  `.emoji <text>` → Add random emojis                     ║\n"
-                "║  │  `.calc <expr>` → Calculate                              ║\n"
-                "║  │  `.weather <city>` → Weather info                        ║\n"
-                "║  │  `.ip <ip>` → IP location                                ║\n"
-                "║  │  `.short <url>` → Shorten URL                            ║\n"
-                "║  │  `.info @user` → User info                               ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 📝 𝐄𝐂𝐇𝐎 〕───┐                                   ║\n"
-                "║  │  `.echo <text>` → Echo the text back                     ║\n"
-                "║  │  `.echo <count> <text>` → Echo N times                  ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🎵 𝐌𝐔𝐒𝐈𝐂 〕───┐                                ║\n"
-                "║  │  `.music <song>` → Send as voice note                    ║\n"
-                "║  │  `.dmusic <song>` → Download MP3 (320kbps)               ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🧠 𝐍𝐎𝐓𝐄𝐒 〕───┐                                ║\n"
-                "║  │  `.notesadd <text>` → Save note                          ║\n"
-                "║  │  `.noteslist` → View all notes                           ║\n"
-                "║  │  `.notesdelete <id>` → Delete note                       ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 👑 𝐎𝐖𝐍𝐄𝐑-𝐎𝐍𝐋𝐘 〕───┐                         ║\n"
-                "║  │  `.spraydelay <sec>` → Adjust spray speed                ║\n"
-                "║  │  `.addadmin` & `.deladmin`                               ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🔓 𝐀𝐃𝐌𝐈𝐍-𝐀𝐂𝐂𝐄𝐒𝐒𝐈𝐁𝐋𝐄 〕───┐                ║\n"
-                "║  │  `.nc set <lang> <text>` → Name Changer                  ║\n"
-                "║  │  `.nc stop` → Stop Name Changer                          ║\n"
-                "║  │  `.copy @user` → Clone user's profile                    ║\n"
-                "║  │  `.normal` → Restore your original profile               ║\n"
-                "║  │  `.banner` (reply with image) → Set menu banner          ║\n"
-                "║  │  `.rembanner` → Remove banner                            ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  📌 `.menu` → Main menu                                     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🛠️ 𝐓𝐎𝐎𝐋𝐒 & 🎵 𝐌𝐔𝐒𝐈𝐂 & 📝 𝐄𝐂𝐇𝐎 & 🧠 𝐍𝐎𝐓𝐄𝐒
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 🛠️ 𝐓𝐎𝐎𝐋𝐒 〕───┐
+  │  `.tts <text> [lang]` → Text-to-Speech
+  │  `.qrcode <text>`     → Generate QR
+  │  `.fancy <text>`      → Fancy styles
+  │  `.style <text>`      → Bold/Italic/Mono
+  │  `.emoji <text>`      → Add random emojis
+  │  `.calc <expr>`       → Calculate
+  │  `.weather <city>`    → Weather info
+  │  `.ip <ip>`           → IP location
+  │  `.short <url>`       → Shorten URL
+  │  `.info @user`        → User info
+  └───────────────────────────────┘
+
+  ┌───〔 📝 𝐄𝐂𝐇𝐎 〕───┐
+  │  `.echo <text>`      → Echo back
+  │  `.echo <count> <text>` → Echo N times
+  └───────────────────────────────┘
+
+  ┌───〔 🎵 𝐌𝐔𝐒𝐈𝐂 〕───┐
+  │  `.music <song>`     → Send as voice note
+  │  `.dmusic <song>`    → Download MP3
+  └───────────────────────────────┘
+
+  ┌───〔 🧠 𝐍𝐎𝐓𝐄𝐒 〕───┐
+  │  `.notesadd <text>`  → Save note
+  │  `.noteslist`        → View notes
+  │  `.notesdelete <id>` → Delete note
+  └───────────────────────────────┘
+
+  ┌───〔 👑 𝐎𝐖𝐍𝐄𝐑-𝐎𝐍𝐋𝐘 〕───┐
+  │  `.spraydelay <sec>` → Adjust speed
+  │  `.addadmin` / `.deladmin`
+  └───────────────────────────────┘
+
+  ┌───〔 🔓 𝐀𝐃𝐌𝐈𝐍-𝐀𝐂𝐂𝐄𝐒𝐒𝐈𝐁𝐋𝐄 〕───┐
+  │  `.nc set <lang> <text>` → Name Changer
+  │  `.nc stop`          → Stop Name Changer
+  │  `.copy @user`       → Clone profile
+  │  `.normal`           → Restore original
+  │  `.banner` (reply)   → Set menu banner
+  │  `.rembanner`        → Remove banner
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             await safe_edit(event, menu)
 
         @register_cmd("menu6")
         async def cmd_menu6(event, _):
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║              🎭 FUN FEATURES                                ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║  ┌───〔 📤 SEND MESSAGE 〕───┐\n"
-                "║  │  `.send @user <message>` → Send a direct message        ║\n"
-                "║  └───────────────────────────────┘\n"
-                "║  ┌───〔 🏷️ TAG MULTIPLE USERS 〕───┐\n"
-                "║  │  `.tag @user1 msg1 @user2 msg2 ...` → Tag users        ║\n"
-                "║  └───────────────────────────────┘\n"
-                "║  📌 `.menu` → Main menu                                     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    🎭 𝐅𝐔𝐍 𝐅𝐄𝐀𝐓𝐔𝐑𝐄𝐒
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 📤 𝐒𝐄𝐍𝐃 𝐌𝐄𝐒𝐒𝐀𝐆𝐄 〕───┐
+  │  `.send @user <message>` → Direct message
+  └───────────────────────────────┘
+
+  ┌───〔 🏷️ 𝐓𝐀𝐆 𝐌𝐔𝐋𝐓𝐈𝐏𝐋𝐄 𝐔𝐒𝐄𝐑𝐒 〕───┐
+  │  `.tag @user1 msg1 @user2 msg2 ...`
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             await safe_edit(event, menu)
 
         @register_cmd("menu7")
         async def cmd_menu7(event, _):
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║            📊 FUN METERS                                    ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║  ┌───〔 📊 METERS 〕───┐\n"
-                "║  │  `.studmeter @user` → Stud %                            ║\n"
-                "║  │  `.looks @user` → Looks %                               ║\n"
-                "║  │  `.gay @user` → Gay %                                   ║\n"
-                "║  │  `.lesbian @user` → Lesbian %                           ║\n"
-                "║  │  `.straight @user` → Straight %                         ║\n"
-                "║  │  `.bi @user` → Bi %                                     ║\n"
-                "║  │  `.trans @user` → Trans %                               ║\n"
-                "║  │  `.simp @user` → Simp %                                 ║\n"
-                "║  │  `.chad @user` → Chad %                                 ║\n"
-                "║  │  `.friendly @user` → Friendly %                         ║\n"
-                "║  │  `.rizz @user` → Rizz Meter (1-100)                    ║\n"
-                "║  │  `.iq @user` → IQ Score (1-200)                        ║\n"
-                "║  │  `.stupidmeter @user` → Stupid %                       ║\n"
-                "║  │  `.sigma @user` → Sigma Meter %                        ║\n"
-                "║  │  `.pookie @user` → Pookie Meter %                      ║\n"
-                "║  │  `.baddie @user` → Baddie Meter %                      ║\n"
-                "║  └───────────────────────────────┘\n"
-                "║  ┌───〔 💖 BEST FRIEND? 〕───┐\n"
-                "║  │  `.bestfrnd @user` → Ask with poetic style & buttons    ║\n"
-                "║  └───────────────────────────────┘\n"
-                "║  ┌───〔 💔 DIVORCE & 💍 MARRIAGE 〕───┐\n"
-                "║  │  `.divorce @user` → Ask with Yes/No buttons             ║\n"
-                "║  │  `.marriage @user` → Ask with Yes/No buttons            ║\n"
-                "║  └───────────────────────────────┘\n"
-                "║  📌 `.menu` → Main menu                                     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    📊 𝐅𝐔𝐍 𝐌𝐄𝐓𝐄𝐑𝐒
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 📊 𝐌𝐄𝐓𝐄𝐑𝐒 〕───┐
+  │  `.studmeter @user`  → Stud %
+  │  `.looks @user`      → Looks %
+  │  `.gay @user`        → Gay %
+  │  `.lesbian @user`    → Lesbian %
+  │  `.straight @user`   → Straight %
+  │  `.bi @user`         → Bi %
+  │  `.trans @user`      → Trans %
+  │  `.simp @user`       → Simp %
+  │  `.chad @user`       → Chad %
+  │  `.friendly @user`   → Friendly %
+  │  `.rizz @user`       → Rizz (1-100)
+  │  `.iq @user`         → IQ (1-200)
+  │  `.stupidmeter @user`→ Stupid %
+  │  `.sigma @user`      → Sigma %
+  │  `.pookie @user`     → Pookie %
+  │  `.baddie @user`     → Baddie %
+  └───────────────────────────────┘
+
+  ┌───〔 💖 𝐁𝐄𝐒𝐓 𝐅𝐑𝐈𝐄𝐍𝐃? 〕───┐
+  │  `.bestfrnd @user`   → Ask with buttons
+  └───────────────────────────────┘
+
+  ┌───〔 💍 𝐌𝐀𝐑𝐑𝐈𝐀𝐆𝐄 / 💔 𝐃𝐈𝐕𝐎𝐑𝐂𝐄 〕───┐
+  │  `.marriage @user`   → Propose with buttons
+  │  `.divorce @user`    → Ask divorce with buttons
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             await safe_edit(event, menu)
 
         @register_cmd("menu8")
         async def cmd_menu8(event, _):
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║              🎭 FUN RAIDS                                   ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║  ┌───〔 📜 SHAYARI RAID 〕───┐                            ║\n"
-                "║  │  `.shayariraid @user <count>`  → Start                   ║\n"
-                "║  │  `.sshayariraid @user`          → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 💋 RIZZ RAID 〕───┐                                ║\n"
-                "║  │  `.rizzraid @user <count>`      → Start                   ║\n"
-                "║  │  `.srizzraid @user`             → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 💘 PICKUP RAID 〕───┐                              ║\n"
-                "║  │  `.pickupraid @user <count>`   → Start                   ║\n"
-                "║  │  `.spickupraid @user`          → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 ❤️ ROMANCE RAID 〕───┐                              ║\n"
-                "║  │  `.romanceraid @user <count>`  → Start                   ║\n"
-                "║  │  `.sromanceraid @user`         → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🤡 TROLL RAID 〕───┐                                ║\n"
-                "║  │  `.trollraid @user <count>`     → Start                   ║\n"
-                "║  │  `.strollraid @user`            → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 😤 RAGEBAIT RAID 〕───┐                              ║\n"
-                "║  │  `.ragebaitraid @user <count>`  → Start                   ║\n"
-                "║  │  `.sragebaitraid @user`         → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🔥 ROAST RAID 〕───┐                                ║\n"
-                "║  │  `.roastraid @user <count>`     → Start                   ║\n"
-                "║  │  `.sroastraid @user`            → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  📌 `.menu` → Main menu                                     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    🎭 𝐅𝐔𝐍 𝐑𝐀𝐈𝐃𝐒
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 📜 𝐒𝐇𝐀𝐘𝐀𝐑𝐈 𝐑𝐀𝐈𝐃 〕───┐
+  │  `.shayariraid @user <count>` → Start
+  │  `.sshayariraid @user`        → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 💋 𝐑𝐈𝐙𝐙 𝐑𝐀𝐈𝐃 〕───┐
+  │  `.rizzraid @user <count>`  → Start
+  │  `.srizzraid @user`         → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 💘 𝐏𝐈𝐂𝐊𝐔𝐏 𝐑𝐀𝐈𝐃 〕───┐
+  │  `.pickupraid @user <count>` → Start
+  │  `.spickupraid @user`        → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 ❤️ 𝐑𝐎𝐌𝐀𝐍𝐂𝐄 𝐑𝐀𝐈𝐃 〕───┐
+  │  `.romanceraid @user <count>` → Start
+  │  `.sromanceraid @user`        → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 🤡 𝐓𝐑𝐎𝐋𝐋 𝐑𝐀𝐈𝐃 〕───┐
+  │  `.trollraid @user <count>`  → Start
+  │  `.strollraid @user`         → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 😤 𝐑𝐀𝐆𝐄𝐁𝐀𝐈𝐓 𝐑𝐀𝐈𝐃 〕───┐
+  │  `.ragebaitraid @user <count>` → Start
+  │  `.sragebaitraid @user`        → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 🔥 𝐑𝐎𝐀𝐒𝐓 𝐑𝐀𝐈𝐃 〕───┐
+  │  `.roastraid @user <count>`  → Start
+  │  `.sroastraid @user`         → Stop
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             await safe_edit(event, menu)
 
         @register_cmd("menu9")
         async def cmd_menu9(event, _):
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║         ⚔️ 𝗡𝗢𝗡-𝗔𝗕𝗨𝗦𝗜𝗩𝗘 𝗥𝗔𝗜𝗗𝗦  (𝟵 𝗧𝗬𝗣𝗘𝗦)          ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║  ┌───〔 ⚔️ ATTACK 〕───┐                                  ║\n"
-                "║  │  `.attackraid @user <count>`  → Start                   ║\n"
-                "║  │  `.sattackraid @user`         → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🏴‍☠️ WAR 〕───┐                                      ║\n"
-                "║  │  `.warraid @user <count>`      → Start                   ║\n"
-                "║  │  `.swarraid @user`             → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 😈 SAVAGE 〕───┐                                    ║\n"
-                "║  │  `.savageraid @user <count>`   → Start                   ║\n"
-                "║  │  `.ssavageraid @user`          → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 ⚡ ULTRA 〕───┐                                    ║\n"
-                "║  │  `.ultraraid @user <count>`   → Start                   ║\n"
-                "║  │  `.sultraraid @user`           → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 😤 SHAME 〕───┐                                    ║\n"
-                "║  │  `.shameraid @user <count>`   → Start                   ║\n"
-                "║  │  `.sshameraid @user`          → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🎤 DISS 〕───┐                                      ║\n"
-                "║  │  `.dissraid @user <count>`    → Start                   ║\n"
-                "║  │  `.sdissraid @user`           → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 😈 DEVIL 〕───┐                                    ║\n"
-                "║  │  `.devilraid @user <count>`   → Start                   ║\n"
-                "║  │  `.sdevilraid @user`          → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 ☯️ KARMA 〕───┐                                    ║\n"
-                "║  │  `.karmaraid @user <count>`   → Start                   ║\n"
-                "║  │  `.skarmaraid @user`          → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 💀 DOOM 〕───┐                                    ║\n"
-                "║  │  `.doomraid @user <count>`    → Start                   ║\n"
-                "║  │  `.sdoomraid @user`           → Stop                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  📌 `.menu` → Main menu                                     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        ⚔️ 𝗡𝗢𝗡-𝗔𝗕𝗨𝗦𝗜𝗩𝗘 𝗥𝗔𝗜𝗗𝗦  (𝟵 𝗧𝗬𝗣𝗘𝗦)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 ⚔️ 𝐀𝐓𝐓𝐀𝐂𝐊 〕───┐
+  │  `.attackraid @user <count>` → Start
+  │  `.sattackraid @user`        → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 🏴‍☠️ 𝐖𝐀𝐑 〕───┐
+  │  `.warraid @user <count>`  → Start
+  │  `.swarraid @user`         → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 😈 𝐒𝐀𝐕𝐀𝐆𝐄 〕───┐
+  │  `.savageraid @user <count>` → Start
+  │  `.ssavageraid @user`        → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 ⚡ 𝐔𝐋𝐓𝐑𝐀 〕───┐
+  │  `.ultraraid @user <count>` → Start
+  │  `.sultraraid @user`        → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 😤 𝐒𝐇𝐀𝐌𝐄 〕───┐
+  │  `.shameraid @user <count>` → Start
+  │  `.sshameraid @user`        → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 🎤 𝐃𝐈𝐒𝐒 〕───┐
+  │  `.dissraid @user <count>` → Start
+  │  `.sdissraid @user`        → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 😈 𝐃𝐄𝐕𝐈𝐋 〕───┐
+  │  `.devilraid @user <count>` → Start
+  │  `.sdevilraid @user`        → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 ☯️ 𝐊𝐀𝐑𝐌𝐀 〕───┐
+  │  `.karmaraid @user <count>` → Start
+  │  `.skarmaraid @user`        → Stop
+  └───────────────────────────────┘
+
+  ┌───〔 💀 𝐃𝐎𝐎𝐌 〕───┐
+  │  `.doomraid @user <count>` → Start
+  │  `.sdoomraid @user`        → Stop
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             await safe_edit(event, menu)
 
         @register_cmd("menu10")
         async def cmd_menu10(event, _):
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║          🎮 𝗚𝗔𝗠𝗘𝗦 & 𝗙𝗨𝗡  (𝗠𝗘𝗡𝗨 𝟭𝟬)                   ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║  ┌───〔 🎱 TRUTH / DARE / SITUATION 〕───┐                ║\n"
-                "║  │  `.truth`    → Random truth                             ║\n"
-                "║  │  `.dare`     → Random dare                              ║\n"
-                "║  │  `.situation`→ Random situation                         ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🧩 RIDDLE WITH TIMER 〕───┐                        ║\n"
-                "║  │  `.riddle`   → Paheli with 60s timer                   ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 📚 QUIZ (JEE/NEET/GK) 〕───┐                      ║\n"
-                "║  │  `.quiz`     → Random quiz with 60s timer              ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 ✂️ RPS (Rock-Paper-Scissors) 〕───┐              ║\n"
-                "║  │  `.rps r/p/s` → Play rock-paper-scissors               ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 ❌ Tic-Tac-Toe 〕───┐                              ║\n"
-                "║  │  `.ttt`      → Start Tic-Tac-Toe game                   ║\n"
-                "║  │  `.ttt_move 1-9` → Make a move                         ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🎲 DICE / FLIP 〕───┐                              ║\n"
-                "║  │  `.dice`     → Roll a dice                             ║\n"
-                "║  │  `.flip`     → Flip a coin                             ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 😂 JOKE / FACT / COMPLIMENT / QUOTE 〕───┐        ║\n"
-                "║  │  `.joke`     → Random joke                              ║\n"
-                "║  │  `.fact`     → Interesting fact                         ║\n"
-                "║  │  `.compliment`→ Random compliment                       ║\n"
-                "║  │  `.quote`    → Inspirational quote                      ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 ✍️ TYPING EFFECT 〕───┐                           ║\n"
-                "║  │  `.typing bold <text>`  → Bold typing                  ║\n"
-                "║  │  `.typing italic <text>`→ Italic typing                ║\n"
-                "║  │  `.typing double <text>`→ Double struck typing         ║\n"
-                "║  │  `.typing script <text>`→ Script typing                ║\n"
-                "║  │  `.typing mono <text>`  → Monospace typing             ║\n"
-                "║  │  `.typing circle <text>`→ Circled typing               ║\n"
-                "║  │  `.typing square <text>`→ Squared typing               ║\n"
-                "║  │  `.typing default <text>`→ Normal typing               ║\n"
-                "║  │  `.typing <text>`       → Bold typing (default)        ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  📌 `.menu` → Main menu                                     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
-            await safe_edit(event, menu)
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+           🎮 𝗚𝗔𝗠𝗘𝗦 & 𝗙𝗨𝗡  (𝗠𝗘𝗡𝗨 𝟭𝟬)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        # ─── MENU11a & MENU11b (split premium commands) ──────────────────────
+  ┌───〔 🎱 𝐓𝐑𝐔𝐓𝐇 / 𝐃𝐀𝐑𝐄 / 𝐒𝐈𝐓𝐔𝐀𝐓𝐈𝐎𝐍 〕───┐
+  │  `.truth`       → Random truth
+  │  `.dare`        → Random dare
+  │  `.situation`   → Random situation
+  └───────────────────────────────┘
+
+  ┌───〔 🧩 𝐑𝐈𝐃𝐃𝐋𝐄 (with timer) 〕───┐
+  │  `.riddle`      → Paheli with 60s timer
+  └───────────────────────────────┘
+
+  ┌───〔 📚 𝐐𝐔𝐈𝐙 (JEE/NEET/GK) 〕───┐
+  │  `.quiz`        → Random quiz with 60s timer
+  └───────────────────────────────┘
+
+  ┌───〔 ✂️ 𝐑𝐏𝐒 (Rock-Paper-Scissors) 〕───┐
+  │  `.rps r/p/s`   → Play RPS
+  └───────────────────────────────┘
+
+  ┌───〔 ❌ 𝐓𝐢𝐜-𝐓𝐚𝐜-𝐓𝐨𝐞 〕───┐
+  │  `.ttt`         → Start game
+  │  `.ttt_move 1-9`→ Make a move
+  └───────────────────────────────┘
+
+  ┌───〔 🎲 𝐃𝐈𝐂𝐄 / 𝐅𝐋𝐈𝐏 〕───┐
+  │  `.dice`        → Roll a dice
+  │  `.flip`        → Flip a coin
+  └───────────────────────────────┘
+
+  ┌───〔 😂 𝐉𝐎𝐊𝐄 / 𝐅𝐀𝐂𝐓 / 𝐂𝐎𝐌𝐏𝐋𝐈𝐌𝐄𝐍𝐓 / 𝐐𝐔𝐎𝐓𝐄 〕───┐
+  │  `.joke`        → Random joke
+  │  `.fact`        → Interesting fact
+  │  `.compliment`  → Random compliment
+  │  `.quote`       → Inspirational quote
+  └───────────────────────────────┘
+
+  ┌───〔 ✍️ 𝐓𝐘𝐏𝐈𝐍𝐆 𝐄𝐅𝐅𝐄𝐂𝐓 (Premium) 〕───┐
+  │  `.typing bold <text>` etc.
+  │  See `.menu11b` for full list
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+            await safe_edit(event, menu)
 
         @register_cmd("menu11a")
         async def cmd_menu11a(event, _):
             if not await is_premium_user(event.sender_id):
                 await safe_edit(event, "❌ This menu is for premium users only.\nBuy premium with `/buy` in main bot.")
                 return
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║            💎 𝗣𝗥𝗘𝗠𝗜𝗨𝗠 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦 (𝗣𝗮𝗿𝘁 𝗔)         ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║  ┌───〔 💬 TEXT FORMATTING 〕───┐                          ║\n"
-                "║  │  `.upper <text>`   → Uppercase                          ║\n"
-                "║  │  `.lower <text>`   → Lowercase                          ║\n"
-                "║  │  `.reverse <text>` → Reverse text                       ║\n"
-                "║  │  `.len <text>`     → Character count                    ║\n"
-                "║  │  `.wcount <text>`  → Word count                         ║\n"
-                "║  │  `.bold <text>`    → Bold                               ║\n"
-                "║  │  `.italic <text>`  → Italic                            ║\n"
-                "║  │  `.mono <text>`    → Monospace                          ║\n"
-                "║  │  `.camel <text>`   → camelCase                         ║\n"
-                "║  │  `.repeat <n> <text>` → Repeat text                    ║\n"
-                "║  │  `.big <text>`     → Big text                          ║\n"
-                "║  │  `.small <text>`   → Small text                        ║\n"
-                "║  │  `.shadow <text>`  → Shadow text                       ║\n"
-                "║  │  `.zalgo <text>`   → Zalgo text                        ║\n"
-                "║  │  `.leet <text>`    → Leet speak                        ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🔢 UTILITY 〕───┐                                  ║\n"
-                "║  │  `.hex <text>`     → Hex encode                         ║\n"
-                "║  │  `.octal <text>`   → Octal encode                       ║\n"
-                "║  │  `.ascii <text>`   → ASCII codes                        ║\n"
-                "║  │  `.nato <text>`    → NATO phonetic                      ║\n"
-                "║  │  `.palindrome <text>` → Check palindrome               ║\n"
-                "║  │  `.vowels <text>`  → Count vowels                       ║\n"
-                "║  │  `.wordfreq <text>` → Word frequency                   ║\n"
-                "║  │  `.charcount <text>` → Character count (with spaces)   ║\n"
-                "║  │  `.lettercount <text>` → Letter count (without spaces) ║\n"
-                "║  │  `.charinfo <text>` → Info about first character       ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 ✨ STYLISH TEXT 〕───┐                             ║\n"
-                "║  │  `.titlecase <text>` → Title Case                      ║\n"
-                "║  │  `.snake <text>`     → snake_case                      ║\n"
-                "║  │  `.shout <text>`     → SHOUT!                          ║\n"
-                "║  │  `.mock <text>`      → mOcKiNg TeXt                   ║\n"
-                "║  │  `.spaceit <text>`   → S p a c e d                    ║\n"
-                "║  │  `.removespaces <text>` → Removespaces                 ║\n"
-                "║  │  `.clap <text>`      → 👏 Clap 👏 Between 👏 Words    ║\n"
-                "║  │  `.mirror <text>`    → Mirror text                     ║\n"
-                "║  │  `.flip_text <text>` → Flip upside down                ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  📌 `.menu11b` → Part B                                    ║\n"
-                "║  📌 `.menu` → Main menu                                     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            💎 𝗣𝗥𝗘𝗠𝗜𝗨𝗠 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦 (𝗣𝗮𝗿𝘁 𝗔)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 💬 𝐓𝐄𝐗𝐓 𝐅𝐎𝐑𝐌𝐀𝐓𝐓𝐈𝐍𝐆 〕───┐
+  │  `.upper <text>`   → Uppercase
+  │  `.lower <text>`   → Lowercase
+  │  `.reverse <text>` → Reverse
+  │  `.len <text>`     → Character count
+  │  `.wcount <text>`  → Word count
+  │  `.bold <text>`    → Bold
+  │  `.italic <text>`  → Italic
+  │  `.mono <text>`    → Monospace
+  │  `.camel <text>`   → camelCase
+  │  `.repeat <n> <text>` → Repeat
+  │  `.big <text>`     → Big text
+  │  `.small <text>`   → Small text
+  │  `.shadow <text>`  → Shadow text
+  │  `.zalgo <text>`   → Zalgo
+  │  `.leet <text>`    → Leet speak
+  └───────────────────────────────┘
+
+  ┌───〔 🔢 𝐔𝐓𝐈𝐋𝐈𝐓𝐘 〕───┐
+  │  `.hex <text>`     → Hex encode
+  │  `.octal <text>`   → Octal encode
+  │  `.ascii <text>`   → ASCII codes
+  │  `.nato <text>`    → NATO phonetic
+  │  `.palindrome <text>` → Check
+  │  `.vowels <text>`  → Count vowels
+  │  `.wordfreq <text>`→ Word frequency
+  │  `.charcount <text>`→ Characters (with spaces)
+  │  `.lettercount <text>`→ Letters (without spaces)
+  │  `.charinfo <text>`→ Info about first char
+  └───────────────────────────────┘
+
+  ┌───〔 ✨ 𝐒𝐓𝐘𝐋𝐈𝐒𝐇 𝐓𝐄𝐗𝐓 〕───┐
+  │  `.titlecase <text>` → Title Case
+  │  `.snake <text>`     → snake_case
+  │  `.shout <text>`     → SHOUT!
+  │  `.mock <text>`      → mOcKiNg
+  │  `.spaceit <text>`   → S p a c e d
+  │  `.removespaces <text>` → Remove spaces
+  │  `.clap <text>`      → 👏 Clap 👏
+  │  `.mirror <text>`    → Mirror
+  │  `.flip_text <text>` → Flip upside down
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📌 `.menu11b` → Part B
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             await safe_edit(event, menu)
 
         @register_cmd("menu11b")
@@ -3804,63 +13527,201 @@ async def run_user_bot(session_string, chat_id):
             if not await is_premium_user(event.sender_id):
                 await safe_edit(event, "❌ This menu is for premium users only.\nBuy premium with `/buy` in main bot.")
                 return
-            menu = (
-                "╔══════════════════════════════════════════════════════════════╗\n"
-                "║            💎 𝗣𝗥𝗘𝗠𝗜𝗨𝗠 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦 (𝗣𝗮𝗿𝘁 𝗕)         ║\n"
-                "╠══════════════════════════════════════════════════════════════╣\n"
-                "║  ┌───〔 ✍️ TYPING EFFECT (Premium) 〕───┐                  ║\n"
-                "║  │  `.typing bold <text>`  → Bold typing effect            ║\n"
-                "║  │  `.typing italic <text>`→ Italic typing effect          ║\n"
-                "║  │  `.typing double <text>`→ Double struck typing          ║\n"
-                "║  │  `.typing script <text>`→ Script typing effect          ║\n"
-                "║  │  `.typing mono <text>`  → Monospace typing              ║\n"
-                "║  │  `.typing circle <text>`→ Circled typing                ║\n"
-                "║  │  `.typing square <text>`→ Squared typing                ║\n"
-                "║  │  `.typing default <text>`→ Normal typing                ║\n"
-                "║  │  `.typing <text>`       → Bold typing (default)         ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🧮 MATH & FUNCTIONS 〕───┐                        ║\n"
-                "║  │  `.bmi <weight_kg> <height_m>` → BMI                   ║\n"
-                "║  │  `.age <YYYY-MM-DD>` → Age from birth date              ║\n"
-                "║  │  `.prime <n>`      → Check if prime                     ║\n"
-                "║  │  `.factorial <n>`  → Factorial                          ║\n"
-                "║  │  `.fibonacci <n>`  → Fibonacci sequence                 ║\n"
-                "║  │  `.square <n>`     → Square of number                   ║\n"
-                "║  │  `.roman <n>`      → Roman numeral                      ║\n"
-                "║  │  `.table <n>`      → Multiplication table (1-10)        ║\n"
-                "║  │  `.percentage <n> <total>` → Percentage                 ║\n"
-                "║  │  `.number <n>`     → Number properties                  ║\n"
-                "║  │  `.countdown <seconds>` → Countdown timer               ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🔒 ENCRYPTION & MORE 〕───┐                       ║\n"
-                "║  │  `.encrypt <text>`  → Caesar cipher (shift 3)           ║\n"
-                "║  │  `.decrypt <text>`  → Decrypt Caesar                    ║\n"
-                "║  │  `.sha1 <text>`     → SHA1 hash                         ║\n"
-                "║  │  `.sha512 <text>`   → SHA512 hash                       ║\n"
-                "║  │  `.strike <text>`   → ~~Strikethrough~~                ║\n"
-                "║  │  `.spoiler <text>`  → ||Spoiler||                      ║\n"
-                "║  │  `.typetest <text>` → Typing speed test (simulated)     ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🎲 FUN GAMES 〕───┐                                ║\n"
-                "║  │  `.coin`           → Flip a coin                        ║\n"
-                "║  │  `.lucky`          → Lucky number                       ║\n"
-                "║  │  `.roll <max>`     → Roll a dice (1-max)                ║\n"
-                "║  │  `.timer <sec>`    → Set a timer                        ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 🛡️ PROTECTION MANAGEMENT 〕───┐                  ║\n"
-                "║  │  `.protect <command>` → Protect yourself from a cmd    ║\n"
-                "║  │  `.unprotect <command>` → Remove protection             ║\n"
-                "║  │  `.protectlist`      → List protected commands          ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  ┌───〔 💬 OTHER PREMIUM 〕───┐                            ║\n"
-                "║  │  `.afk <reason>`   → Set AFK (mention triggers reply)  ║\n"
-                "║  │  `.afk off`        → Remove AFK                         ║\n"
-                "║  │  `.premiumstatus`  → Check your premium status          ║\n"
-                "║  └───────────────────────────────┘                          ║\n"
-                "║  📌 `.menu11a` → Part A                                    ║\n"
-                "║  📌 `.menu` → Main menu                                     ║\n"
-                "╚══════════════════════════════════════════════════════════════╝"
-            )
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            💎 𝗣𝗥𝗘𝗠𝗜𝗨𝗠 𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦 (𝗣𝗮𝗿𝘁 𝗕)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 ✍️ 𝐓𝐘𝐏𝐈𝐍𝐆 𝐄𝐅𝐅𝐄𝐂𝐓 〕───┐
+  │  `.typing bold <text>`   → Bold
+  │  `.typing italic <text>` → Italic
+  │  `.typing double <text>` → Double struck
+  │  `.typing script <text>` → Script
+  │  `.typing mono <text>`   → Monospace
+  │  `.typing circle <text>` → Circled
+  │  `.typing square <text>` → Squared
+  │  `.typing default <text>`→ Normal
+  │  `.typing <text>`        → Bold (default)
+  └───────────────────────────────┘
+
+  ┌───〔 🧮 𝐌𝐀𝐓𝐇 & 𝐅𝐔𝐍𝐂𝐓𝐈𝐎𝐍𝐒 〕───┐
+  │  `.bmi <weight> <height>` → BMI
+  │  `.age <YYYY-MM-DD>` → Age
+  │  `.prime <n>`       → Check prime
+  │  `.factorial <n>`   → Factorial
+  │  `.fibonacci <n>`   → Fibonacci
+  │  `.square <n>`      → Square
+  │  `.roman <n>`       → Roman numeral
+  │  `.table <n>`       → Multiplication table
+  │  `.percentage <part> <total>` → %
+  │  `.number <n>`      → Number properties
+  │  `.countdown <sec>` → Countdown timer
+  └───────────────────────────────┘
+
+  ┌───〔 🔒 𝐄𝐍𝐂𝐑𝐘𝐏𝐓𝐈𝐎𝐍 & 𝐌𝐎𝐑𝐄 〕───┐
+  │  `.encrypt <text>`  → Caesar cipher (shift 3)
+  │  `.decrypt <text>`  → Decrypt Caesar
+  │  `.sha1 <text>`     → SHA1 hash
+  │  `.sha512 <text>`   → SHA512 hash
+  │  `.strike <text>`   → ~~Strikethrough~~
+  │  `.spoiler <text>`  → ||Spoiler||
+  │  `.typetest <text>` → Typing speed test
+  └───────────────────────────────┘
+
+  ┌───〔 🎲 𝐅𝐔𝐍 𝐆𝐀𝐌𝐄𝐒 〕───┐
+  │  `.coin`      → Flip a coin
+  │  `.lucky`     → Lucky number
+  │  `.roll <max>`→ Roll a dice
+  │  `.timer <sec>`→ Set a timer
+  └───────────────────────────────┘
+
+  ┌───〔 🛡️ 𝐏𝐑𝐎𝐓𝐄𝐂𝐓𝐈𝐎𝐍 𝐌𝐀𝐍𝐀𝐆𝐄𝐌𝐄𝐍𝐓 〕───┐
+  │  `.protect <command>` → Protect from a cmd
+  │  `.unprotect <command>` → Remove protection
+  │  `.protectlist`      → List protected cmds
+  └───────────────────────────────┘
+
+  ┌───〔 💬 𝐎𝐓𝐇𝐄𝐑 𝐏𝐑𝐄𝐌𝐈𝐔𝐌 〕───┐
+  │  `.afk <reason>`   → Set AFK
+  │  `.afk off`        → Remove AFK
+  │  `.premiumstatus`  → Check premium status
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  📌 `.menu11a` → Part A
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+            await safe_edit(event, menu)
+
+        @register_cmd("menu12")
+        async def cmd_menu12(event, _):
+            if not await is_premium_user(event.sender_id):
+                await safe_edit(event, "❌ This menu is for premium users only.\nBuy premium with `/buy` in main bot.")
+                return
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        🛡️ 𝐍𝐄𝐖 𝐏𝐑𝐎𝐓𝐄𝐂𝐓𝐈𝐎𝐍 & 𝐏𝐑𝐄𝐌𝐈𝐔𝐌 𝐅𝐄𝐀𝐓𝐔𝐑𝐄𝐒
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 🛡️ 𝐃𝐌 𝐒𝐇𝐈𝐄𝐋𝐃 & 𝐅𝐈𝐋𝐓𝐄𝐑𝐒 〕───┐
+  │  `.dmshield on/off` → Enable/disable
+  │  `.approve @user`   → Approve user
+  │  `.unapprove @user` → Remove approval
+  │  `.blockedlist`     → List blocked users
+  │  `.addfilter <word>`→ Add filter word
+  │  `.delfilter <word>`→ Remove filter
+  │  `.listfilters`     → Show filters
+  └───────────────────────────────┘
+
+  ┌───〔 🤖 𝐀𝐔𝐓𝐎-𝐑𝐄𝐏𝐋𝐘 (DM) 〕───┐
+  │  `.setautoreply <text>` → Set auto-reply
+  │  `.delautoreply`      → Remove auto-reply
+  └───────────────────────────────┘
+
+  ┌───〔 👁️ 𝐆𝐎𝐃 𝐏𝐑𝐎𝐓𝐄𝐂𝐓𝐈𝐎𝐍 (Spam/Raid) 〕───┐
+  │  `.godprotection on/off` → Toggle
+  │  `.godprotection status` → Show status
+  └───────────────────────────────┘
+
+  ┌───〔 🔍 𝐒𝐀𝐍𝐆𝐌𝐀𝐓𝐀 (Name History) 〕───┐
+  │  `.sangmata @user` → Show name/username history
+  └───────────────────────────────┘
+
+  ┌───〔 🔖 𝐎𝐓𝐇𝐄𝐑 𝐂𝐎𝐌𝐌𝐀𝐍𝐃𝐒 〕───┐
+  │  `.id`            → Show user & chat ID
+  │  `.clearme <count>`→ Delete your messages
+  │  `.dltall <count>` → Delete all messages (admin)
+  └───────────────────────────────┘
+
+  ┌───〔 ❄️ 𝐅𝐑𝐄𝐄𝐙𝐄/𝐔𝐍𝐅𝐑𝐄𝐄𝐙𝐄 (Owner) 〕───┐
+  │  Use main bot: /freeze <user_id>
+  │  and /unfreeze <user_id> (owner only)
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  💎 For Premium Raids & Spam, see `.menu13` & `.menu14`
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+            await safe_edit(event, menu)
+
+        @register_cmd("menu13")
+        async def cmd_menu13(event, _):
+            if not await is_premium_user(event.sender_id):
+                await safe_edit(event, "❌ This menu is for premium users only.\nBuy premium with `/buy` in main bot.")
+                return
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    💎 𝐏𝐑𝐄𝐌𝐈𝐔𝐌 𝐑𝐀𝐈𝐃𝐒
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 ⚔️ 𝐏𝐑𝐄𝐌𝐈𝐔𝐌 𝐑𝐀𝐈𝐃𝐒 〕───┐
+  │  `.mr`   → Start Premium Raid 1
+  │  `.smr`  → Stop Premium Raid 1
+  │  `.mr2`  → Start Premium Raid 2
+  │  `.smr2` → Stop Premium Raid 2
+  │  `.br`   → Start Premium Raid 3
+  │  `.sbr`  → Stop Premium Raid 3
+  │  `.br2`  → Start Premium Raid 4
+  │  `.sbr2` → Stop Premium Raid 4
+  │  `.br3`  → Start Premium Raid 5
+  │  `.sbr3` → Stop Premium Raid 5
+  │  `.sqr`  → Start Premium Raid 6
+  │  `.ssqr` → Stop Premium Raid 6
+  │  `.sq2`  → Start Premium Raid 7
+  │  `.ssq2` → Stop Premium Raid 7
+  │  `.cr`   → Start Premium Raid 8
+  │  `.scr`  → Stop Premium Raid 8
+  │  `.bar`  → Start Premium Raid 9
+  │  `.sbar` → Stop Premium Raid 9
+  │  `.gr`   → Start Premium Raid 10
+  │  `.sgr`  → Stop Premium Raid 10
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  💡 All premium raids have their own reply lists.
+  📌 `.menu14` → Premium Spam
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+            await safe_edit(event, menu)
+
+        @register_cmd("menu14")
+        async def cmd_menu14(event, _):
+            if not await is_premium_user(event.sender_id):
+                await safe_edit(event, "❌ This menu is for premium users only.\nBuy premium with `/buy` in main bot.")
+                return
+            menu = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    💎 𝐏𝐑𝐄𝐌𝐈𝐔𝐌 𝐒𝐏𝐀𝐌
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌───〔 💣 𝐏𝐑𝐄𝐌𝐈𝐔𝐌 𝐒𝐏𝐀𝐌 〕───┐
+  │  `.ms`   → Start Premium Spam 1
+  │  `.sms`  → Stop Premium Spam 1
+  │  `.ms2`  → Start Premium Spam 2
+  │  `.sms2` → Stop Premium Spam 2
+  │  `.bs`   → Start Premium Spam 3
+  │  `.sbs`  → Stop Premium Spam 3
+  │  `.bs2`  → Start Premium Spam 4
+  │  `.sbs2` → Stop Premium Spam 4
+  │  `.bs3`  → Start Premium Spam 5
+  │  `.sbs3` → Stop Premium Spam 5
+  │  `.sqs`  → Start Premium Spam 6
+  │  `.ssqs` → Stop Premium Spam 6
+  │  `.sqs2` → Start Premium Spam 7
+  │  `.ssqs2`→ Stop Premium Spam 7
+  │  `.cs`   → Start Premium Spam 8
+  │  `.scs`  → Stop Premium Spam 8
+  │  `.bas`  → Start Premium Spam 9
+  │  `.sbas` → Stop Premium Spam 9
+  │  `.gs`   → Start Premium Spam 10
+  │  `.sgs`  → Stop Premium Spam 10
+  └───────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  💡 All premium spams have their own reply lists.
+  📌 `.menu13` → Premium Raids
+  📌 `.menu` → Main menu
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
             await safe_edit(event, menu)
 
         # ─── PROTECTION COMMANDS ──────────────────────────────────────────────
@@ -3902,13 +13763,12 @@ async def run_user_bot(session_string, chat_id):
             plan = data['plan'].upper()
             await safe_edit(event, f"💎 **Premium Status**\n━━━━━━━━━━━━━━━\n📅 Plan: {plan}\n⏳ Expires: {expiry}\n🛡️ Protected from all raids/spam/deathgod.")
 
-               # ─── TYPING EFFECT WITH MULTIPLE STYLES ─────────────────────────────
+        # ─── TYPING EFFECT WITH MULTIPLE STYLES ─────────────────────────────
         @register_cmd("typing", premium=True)
         async def cmd_typing(event, arg):
             if not arg:
                 return
             
-            # Parse arguments: .typing <style> <text>
             parts = arg.split(maxsplit=1)
             style = "bold"
             text = arg
@@ -3917,7 +13777,6 @@ async def run_user_bot(session_string, chat_id):
                 style = parts[0].lower()
                 text = parts[1]
             
-            # ─── STYLISH FONT MAPS ──────────────────────────────────────────
             bold_map = {
                 'a': '𝗮', 'b': '𝗯', 'c': '𝗰', 'd': '𝗱', 'e': '𝗲', 'f': '𝗳', 'g': '𝗴', 'h': '𝗵',
                 'i': '𝗶', 'j': '𝗷', 'k': '𝗸', 'l': '𝗹', 'm': '𝗺', 'n': '𝗻', 'o': '𝗼', 'p': '𝗽',
@@ -4007,16 +13866,13 @@ async def run_user_bot(session_string, chat_id):
             char_map = font_maps.get(style, bold_map)
             stylish_text = ''.join(char_map.get(c, c) for c in text) if style != 'default' else text
             
-            # Delete original command
             try:
                 await event.delete()
             except:
                 pass
             
-            # Send initial message with typing indicator only
             msg = await user_bot.send_message(event.chat_id, "✍️ ")
             
-            # Type each character slowly
             for i in range(1, len(stylish_text) + 1):
                 current_text = f"✍️ {stylish_text[:i]}"
                 try:
@@ -4025,7 +13881,6 @@ async def run_user_bot(session_string, chat_id):
                 except Exception:
                     pass
             
-            # Final message (no extra line)
             try:
                 await msg.edit(f"✍️ {stylish_text}")
             except:
@@ -4684,6 +14539,99 @@ async def run_user_bot(session_string, chat_id):
                 user_bot.custom_raid_users.clear()
                 await safe_edit(event, "🛑 All Custom Raids stopped")
 
+        # ─── PWR RAID ──────────────────────────────────────────────────────────
+        @register_cmd("pwr", needs_reply=True)
+        async def cmd_pwr(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                return
+            count = None
+            if arg:
+                parts = arg.strip().split()
+                if parts and parts[-1].isdigit():
+                    count = int(parts[-1])
+                    if count < 1: count = 1
+                    if count > 100: count = 100
+            added = []
+            for uid in targets:
+                user_bot.pwr_raid[uid] = count
+                user_bot.pwr_users.add(uid)
+                display = "∞" if count is None else f"{count} times"
+                added.append(f"{uid} ({display})")
+            await safe_edit(event, f"🔥 PWR raid started for {', '.join(added)}")
+
+        @register_cmd("spwr")
+        async def cmd_spwr(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                user_bot.pwr_raid.clear()
+                user_bot.pwr_users.clear()
+                return await safe_edit(event, "🛑 PWR raid stopped for all")
+            removed = []
+            for uid in targets:
+                if uid in user_bot.pwr_raid:
+                    del user_bot.pwr_raid[uid]
+                    user_bot.pwr_users.discard(uid)
+                    removed.append(str(uid))
+            if removed:
+                await safe_edit(event, f"🛑 Removed: {', '.join(removed)}")
+            else:
+                await safe_edit(event, "⚠️ No active raid for these users")
+
+        # ─── OWS SPAM ──────────────────────────────────────────────────────────
+        @register_cmd("ows", needs_reply=True)
+        async def cmd_ows(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                return
+            count = None
+            if arg:
+                parts = arg.strip().split()
+                if parts and parts[-1].isdigit():
+                    count = int(parts[-1])
+                    if count < 1: count = 1
+                    if count > 100: count = 100
+            added = []
+            for uid in targets:
+                user_bot.ows_spam[uid] = count
+                user_bot.ows_users.add(uid)
+                display = "∞" if count is None else f"{count} times"
+                added.append(f"{uid} ({display})")
+            await safe_edit(event, f"💬 OWS spam started for {', '.join(added)}")
+
+        @register_cmd("sows")
+        async def cmd_sows(event, arg):
+            targets = await get_targets(event, arg)
+            if not targets:
+                user_bot.ows_spam.clear()
+                user_bot.ows_users.clear()
+                return await safe_edit(event, "🛑 OWS spam stopped for all")
+            removed = []
+            for uid in targets:
+                if uid in user_bot.ows_spam:
+                    del user_bot.ows_spam[uid]
+                    user_bot.ows_users.discard(uid)
+                    removed.append(str(uid))
+            if removed:
+                await safe_edit(event, f"🛑 Removed: {', '.join(removed)}")
+            else:
+                await safe_edit(event, "⚠️ No active spam for these users")
+
+        # ─── GLOBAL STOP ALL SPRAYS ────────────────────────────────────────────
+        @register_cmd("stopallspray")
+        async def cmd_stopallspray(event, _):
+            if not is_admin(event.sender_id):
+                return
+            count = 0
+            for chat in list(user_bot.spray_tasks.keys()):
+                try:
+                    user_bot.spray_tasks[chat].cancel()
+                    count += 1
+                except:
+                    pass
+            user_bot.spray_tasks.clear()
+            await safe_edit(event, f"🛑 Stopped all sprays in {count} chats.")
+
         # ─── ECHO ──────────────────────────────────────────────────────────────────
 
         @register_cmd("echo")
@@ -4724,7 +14672,6 @@ async def run_user_bot(session_string, chat_id):
                 reply = await event.get_reply_message()
                 if reply:
                     target_user = reply.sender_id
-                    # 🛡️ PROTECTION CHECK
                     if target_user and await is_protected(target_user, "spray"):
                         await safe_edit(event, "🚫 This user is protected from Spray.")
                         return
@@ -4737,7 +14684,6 @@ async def run_user_bot(session_string, chat_id):
                     while chat in user_bot.spray_tasks:
                         if count is not None and sent >= count:
                             break
-                        # re-check protection every 20 messages
                         if target_user and sent % 20 == 0 and await is_protected(target_user, "spray"):
                             await safe_send(chat, "🛑 Target is now protected. Stopping Spray.")
                             break
@@ -4895,7 +14841,6 @@ async def run_user_bot(session_string, chat_id):
                 if reply:
                     target_msg_id = reply.id
                     target_user = reply.sender_id
-                    # 🛡️ PROTECTION CHECK
                     if target_user and await is_protected(target_user, "multispray"):
                         await safe_edit(event, "🚫 This user is protected from MultiSpray.")
                         return
@@ -4910,7 +14855,6 @@ async def run_user_bot(session_string, chat_id):
                     while chat in user_bot.spray_tasks:
                         if count is not None and sent >= count:
                             break
-                        # re-check protection every 20 messages
                         if target_user and sent % 20 == 0 and await is_protected(target_user, "multispray"):
                             await safe_send(chat, "🛑 Target is now protected. Stopping MultiSpray.")
                             break
@@ -4951,7 +14895,6 @@ async def run_user_bot(session_string, chat_id):
                 if reply:
                     target_msg_id = reply.id
                     target_user = reply.sender_id
-                    # 🛡️ PROTECTION CHECK
                     if target_user and await is_protected(target_user, "countspray"):
                         await safe_edit(event, "🚫 This user is protected from CountSpray.")
                         return
@@ -4962,7 +14905,6 @@ async def run_user_bot(session_string, chat_id):
                 sent = 0
                 try:
                     while sent < count and chat in user_bot.spray_tasks:
-                        # re-check protection every 20 messages
                         if target_user and sent % 20 == 0 and await is_protected(target_user, "countspray"):
                             await safe_send(chat, "🛑 Target is now protected. Stopping CountSpray.")
                             break
@@ -5793,7 +15735,8 @@ async def run_user_bot(session_string, chat_id):
                     stop_loader.set(); loader_task.cancel()
                     await safe_edit(event, f"❌ DMusic error: {e}")
             asyncio.create_task(download_music())
-                   # ─── FUN METERS (Menu7) ──────────────────────────────────────────────
+
+        # ─── FUN METERS (Menu7) ──────────────────────────────────────────────
 
         # Helper function for funny lines (10 lines per meter, alternating Hindi/English/Hinglish)
         def get_funny_line(meter_type, percent):
@@ -6314,7 +16257,86 @@ async def run_user_bot(session_string, chat_id):
                 await safe_edit(event, msg, buttons=buttons)
             except:
                 await safe_edit(event, "❌ Failed to find user.")
-        
+
+        # ─── CALLBACK HANDLER FOR BESTFRIEND, MARRIAGE, DIVORCE ──────────
+        @user_bot.on(events.CallbackQuery)
+        async def userbot_callback(event):
+            data = event.data.decode()
+            if data.startswith("bestfrnd_yes_"):
+                _, _, uid = data.split("_")
+                uid = int(uid)
+                sender = event.sender_id
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    await event.edit(f"💞 **{name}** said YES! 🎉\nYou are now best friends forever! 🌟")
+                    await user_bot.send_message(uid, f"💞 {sender} asked you to be best friend and you said YES! 🥳")
+                except:
+                    await event.edit("❌ Something went wrong.")
+
+            elif data.startswith("bestfrnd_no_"):
+                _, _, uid = data.split("_")
+                uid = int(uid)
+                sender = event.sender_id
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    await event.edit(f"💔 **{name}** said NO. 😢\nMaybe next time...")
+                    await user_bot.send_message(uid, f"💔 {sender} asked you to be best friend but you said NO.")
+                except:
+                    await event.edit("❌ Something went wrong.")
+
+            elif data.startswith("marriage_yes_"):
+                _, _, uid = data.split("_")
+                uid = int(uid)
+                sender = event.sender_id
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    await event.edit(f"💍 **{name}** said YES! 💍🎉\nYou are now married! ❤️")
+                    await user_bot.send_message(uid, f"💍 {sender} proposed and you said YES! Congratulations! 🥂")
+                except:
+                    await event.edit("❌ Something went wrong.")
+
+            elif data.startswith("marriage_no_"):
+                _, _, uid = data.split("_")
+                uid = int(uid)
+                sender = event.sender_id
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    await event.edit(f"💔 **{name}** said NO. 😢\nMaybe next time...")
+                    await user_bot.send_message(uid, f"💔 {sender} proposed but you said NO.")
+                except:
+                    await event.edit("❌ Something went wrong.")
+
+            elif data.startswith("divorce_yes_"):
+                _, _, uid = data.split("_")
+                uid = int(uid)
+                sender = event.sender_id
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    await event.edit(f"💔 **{name}** agreed to divorce. 😢\nIt's over...")
+                    await user_bot.send_message(uid, f"💔 {sender} wants a divorce and you agreed.")
+                except:
+                    await event.edit("❌ Something went wrong.")
+
+            elif data.startswith("divorce_no_"):
+                _, _, uid = data.split("_")
+                uid = int(uid)
+                sender = event.sender_id
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = u.first_name or str(uid)
+                    await event.edit(f"💔 **{name}** said NO to divorce. 💔\nMaybe try to work it out?")
+                    await user_bot.send_message(uid, f"💔 {sender} asked for divorce but you said NO.")
+                except:
+                    await event.edit("❌ Something went wrong.")
+
+            else:
+                await event.answer("Unknown action.")
+
         # ─── FUN RAIDS (Menu8) ──────────────────────────────────────────────────
 
         @register_cmd("shayariraid", needs_reply=True)
@@ -6935,6 +16957,76 @@ async def run_user_bot(session_string, chat_id):
             else:
                 await safe_edit(event, "⚠️ No active raid for these users")
 
+        # ─── PREMIUM RAID START/STOP COMMANDS ──────────────────────────────────
+        for start_cmd, stop_cmd in [
+            ("mr", "smr"), ("mr2", "smr2"), ("br", "sbr"), ("br2", "sbr2"),
+            ("br3", "sbr3"), ("sqr", "ssqr"), ("sq2", "ssq2"), ("cr", "scr"),
+            ("bar", "sbar"), ("gr", "sgr")
+        ]:
+            @register_cmd(start_cmd, needs_reply=True, premium=True)
+            async def start_premium_raid(event, arg, cmd=start_cmd):
+                targets = await get_targets(event, arg)
+                if not targets:
+                    return
+                if cmd not in user_bot.premium_raid_targets:
+                    user_bot.premium_raid_targets[cmd] = {}
+                for uid in targets:
+                    user_bot.premium_raid_targets[cmd][uid] = None
+                added = ", ".join(str(uid) for uid in targets)
+                await safe_edit(event, f"⚔️ Premium Raid `{cmd}` started on {added} (infinite).")
+
+            @register_cmd(stop_cmd, premium=True)
+            async def stop_premium_raid(event, arg, cmd=start_cmd):
+                targets = await get_targets(event, arg)
+                if not targets:
+                    if cmd in user_bot.premium_raid_targets:
+                        del user_bot.premium_raid_targets[cmd]
+                    await safe_edit(event, f"🛑 Premium Raid `{cmd}` stopped for all.")
+                    return
+                if cmd in user_bot.premium_raid_targets:
+                    for uid in targets:
+                        user_bot.premium_raid_targets[cmd].pop(uid, None)
+                    if not user_bot.premium_raid_targets[cmd]:
+                        del user_bot.premium_raid_targets[cmd]
+                    await safe_edit(event, f"🛑 Premium Raid `{cmd}` stopped for given users.")
+                else:
+                    await safe_edit(event, f"⚠️ No active premium raid `{cmd}`.")
+
+        # ─── PREMIUM SPAM START/STOP COMMANDS ──────────────────────────────────
+        for start_cmd, stop_cmd in [
+            ("ms", "sms"), ("ms2", "sms2"), ("bs", "sbs"), ("bs2", "sbs2"),
+            ("bs3", "sbs3"), ("sqs", "ssqs"), ("sqs2", "ssqs2"), ("cs", "scs"),
+            ("bas", "sbas"), ("gs", "sgs")
+        ]:
+            @register_cmd(start_cmd, needs_reply=True, premium=True)
+            async def start_premium_spam(event, arg, cmd=start_cmd):
+                targets = await get_targets(event, arg)
+                if not targets:
+                    return
+                if cmd not in user_bot.premium_spam_targets:
+                    user_bot.premium_spam_targets[cmd] = {}
+                for uid in targets:
+                    user_bot.premium_spam_targets[cmd][uid] = None
+                added = ", ".join(str(uid) for uid in targets)
+                await safe_edit(event, f"💣 Premium Spam `{cmd}` started on {added} (infinite).")
+
+            @register_cmd(stop_cmd, premium=True)
+            async def stop_premium_spam(event, arg, cmd=start_cmd):
+                targets = await get_targets(event, arg)
+                if not targets:
+                    if cmd in user_bot.premium_spam_targets:
+                        del user_bot.premium_spam_targets[cmd]
+                    await safe_edit(event, f"🛑 Premium Spam `{cmd}` stopped for all.")
+                    return
+                if cmd in user_bot.premium_spam_targets:
+                    for uid in targets:
+                        user_bot.premium_spam_targets[cmd].pop(uid, None)
+                    if not user_bot.premium_spam_targets[cmd]:
+                        del user_bot.premium_spam_targets[cmd]
+                    await safe_edit(event, f"🛑 Premium Spam `{cmd}` stopped for given users.")
+                else:
+                    await safe_edit(event, f"⚠️ No active premium spam `{cmd}`.")
+
         # ─── ADMIN ────────────────────────────────────────────────────────────────
 
         @register_cmd("addadmin", needs_reply=True)
@@ -7414,7 +17506,6 @@ async def run_user_bot(session_string, chat_id):
                 if reply:
                     reply_to = reply.id
                     target_user = reply.sender_id
-                    # 🛡️ PREMIUM PROTECTION CHECK
                     if target_user and await is_protected(target_user, "deathgod"):
                         await safe_edit(event, "🚫 This user is protected from Deathgod.")
                         return
@@ -7430,7 +17521,6 @@ async def run_user_bot(session_string, chat_id):
                     while chat in user_bot.spray_tasks:
                         if count is not None and sent >= count:
                             break
-                        # Re-check protection every 10 messages
                         if target_user and sent % 10 == 0 and await is_protected(target_user, "deathgod"):
                             await safe_send(chat, "🛑 Target is now protected. Stopping Deathgod.")
                             break
@@ -7463,10 +17553,307 @@ async def run_user_bot(session_string, chat_id):
             else:
                 await safe_edit(event, "⚠️ No active Deathgod spray in this chat.")
 
+        # ─── NEW: DM SHIELD ──────────────────────────────────────────────────────
+        @register_cmd("dmshield")
+        async def cmd_dmshield(event, arg):
+            if not is_admin(event.sender_id):
+                return
+            if not arg:
+                status = "🟢 ON" if user_bot.dm_shield_enabled else "🔴 OFF"
+                await safe_edit(event, f"🛡️ DM Shield Status: {status}")
+                return
+            if arg.lower() in ("on", "off"):
+                user_bot.dm_shield_enabled = arg.lower() == "on"
+                await safe_edit(event, f"✅ DM Shield {'enabled' if user_bot.dm_shield_enabled else 'disabled'}")
+            else:
+                await safe_edit(event, "❌ Usage: .dmshield on/off")
+
+        @register_cmd("approve")
+        async def cmd_approve(event, arg):
+            if not is_admin(event.sender_id):
+                return
+            targets = await get_targets(event, arg)
+            if not targets:
+                return
+            added = []
+            for uid in targets:
+                user_bot.dm_approved.add(uid)
+                added.append(str(uid))
+            await safe_edit(event, f"✅ Approved: {', '.join(added)}")
+
+        @register_cmd("unapprove")
+        async def cmd_unapprove(event, arg):
+            if not is_admin(event.sender_id):
+                return
+            targets = await get_targets(event, arg)
+            if not targets:
+                return
+            removed = []
+            for uid in targets:
+                if uid in user_bot.dm_approved:
+                    user_bot.dm_approved.discard(uid)
+                    removed.append(str(uid))
+            await safe_edit(event, f"🛑 Removed approval: {', '.join(removed)}")
+
+        @register_cmd("blockedlist")
+        async def cmd_blockedlist(event, _):
+            if not is_admin(event.sender_id):
+                return
+            if not user_bot.dm_blocked:
+                await safe_edit(event, "📭 No blocked users.")
+                return
+            msg = "🚫 Blocked Users:\n"
+            for uid in user_bot.dm_blocked:
+                try:
+                    u = await user_bot.get_entity(uid)
+                    name = f"@{u.username}" if u.username else u.first_name or str(uid)
+                    msg += f"• {uid} → {name}\n"
+                except:
+                    msg += f"• {uid}\n"
+            await safe_edit(event, msg)
+
+        # ─── NEW: FILTERS ──────────────────────────────────────────────────────
+        @register_cmd("addfilter")
+        async def cmd_addfilter(event, arg):
+            if not is_admin(event.sender_id):
+                return
+            if not arg:
+                return
+            word = arg.strip().lower()
+            if word in user_bot.filters:
+                await safe_edit(event, f"⚠️ Filter '{word}' already exists.")
+                return
+            user_bot.filters.append(word)
+            save_filters()
+            await safe_edit(event, f"✅ Filter added: `{word}`")
+
+        @register_cmd("delfilter")
+        async def cmd_delfilter(event, arg):
+            if not is_admin(event.sender_id):
+                return
+            if not arg:
+                return
+            word = arg.strip().lower()
+            if word not in user_bot.filters:
+                await safe_edit(event, f"⚠️ Filter '{word}' not found.")
+                return
+            user_bot.filters.remove(word)
+            save_filters()
+            await safe_edit(event, f"🗑️ Filter removed: `{word}`")
+
+        @register_cmd("listfilters")
+        async def cmd_listfilters(event, _):
+            if not is_admin(event.sender_id):
+                return
+            if not user_bot.filters:
+                await safe_edit(event, "📭 No filters set.")
+                return
+            msg = "📋 Filters:\n" + "\n".join(f"• `{w}`" for w in user_bot.filters)
+            await safe_edit(event, msg)
+
+        # ─── NEW: AUTO-REPLY ──────────────────────────────────────────────────
+        @register_cmd("setautoreply")
+        async def cmd_setautoreply(event, arg):
+            if not is_admin(event.sender_id):
+                return
+            if not arg:
+                return
+            user_bot.auto_reply = arg.strip()
+            save_autoreply(user_bot.auto_reply)
+            await safe_edit(event, f"✅ Auto-reply set:\n{user_bot.auto_reply}")
+
+        @register_cmd("delautoreply")
+        async def cmd_delautoreply(event, _):
+            if not is_admin(event.sender_id):
+                return
+            user_bot.auto_reply = None
+            save_autoreply("")
+            await safe_edit(event, "🗑️ Auto-reply removed.")
+
+        # ─── NEW: GOD PROTECTION ──────────────────────────────────────────────
+        @register_cmd("godprotection")
+        async def cmd_godprotection(event, arg):
+            if not is_admin(event.sender_id):
+                return
+            if not arg:
+                status = "🟢 ON" if user_bot.god_protection_enabled else "🔴 OFF"
+                await safe_edit(event, f"🛡️ God Protection Status: {status}")
+                return
+            if arg.lower() in ("on", "off"):
+                user_bot.god_protection_enabled = arg.lower() == "on"
+                await safe_edit(event, f"✅ God Protection {'enabled' if user_bot.god_protection_enabled else 'disabled'}")
+            else:
+                await safe_edit(event, "❌ Usage: .godprotection on/off")
+
+        # ─── NEW: SANGGMATA (using Telethon) ──────────────────────────────────
+        @register_cmd("sangmata")
+        async def cmd_sangmata(event, arg):
+            target = None
+            if event.is_reply:
+                r = await event.get_reply_message()
+                if r and r.sender_id:
+                    target = r.sender_id
+            elif arg:
+                try:
+                    ent = await user_bot.get_entity(arg)
+                    target = ent.id
+                except:
+                    pass
+            if not target:
+                return await safe_edit(event, "❌ Please reply to a user or mention one.")
+
+            # Try to fetch from local history first
+            history = load_sangmata(target)
+            if history:
+                # Format local history with boxed style
+                try:
+                    u = await user_bot.get_entity(target)
+                    name = u.first_name or "User"
+                except:
+                    name = str(target)
+                msg = (
+                    "<pre>"
+                    "❀═══⟦ HISTORY TRACKER ⟧═══❀\n"
+                    f"✧➤ Target: {name}\n"
+                    f"✧➤ User ID: {target}\n"
+                    f"✧➤ Type: Name & Username History\n"
+                    "❀═════════════════════════❀\n\n"
+                )
+                for entry in history[-20:]:
+                    time_str = entry.get('time', 'Unknown')
+                    old_name = entry.get('old_name', 'N/A')
+                    new_name = entry.get('new_name', 'N/A')
+                    old_username = entry.get('old_username', 'N/A')
+                    new_username = entry.get('new_username', 'N/A')
+                    msg += f"🕒 {time_str}\n"
+                    msg += f"📛 {old_name} → {new_name}\n"
+                    msg += f"🔗 {old_username} → {new_username}\n\n"
+                msg += "</pre>"
+                await safe_edit(event, msg)
+                return
+
+            # If no local history, fetch from SangMata_beta_bot
+            status_msg = await safe_edit(event, "<pre>❀ Fetching History From SangMata... ❀</pre>")
+            bot_username = "SangMata_beta_bot"
+
+            try:
+                await user_bot.send_message(bot_username, str(target))
+            except Exception as e:
+                await status_msg.edit(f"<pre>❀ ERROR: {str(e)} ❀</pre>")
+                return
+
+            combined_response = ""
+            for _ in range(12):
+                await asyncio.sleep(0.9)
+                async for msg in user_bot.iter_messages(bot_username, limit=3):
+                    if msg.text and str(target) not in msg.text:
+                        text_lower = msg.text.lower()
+                        if "history" in text_lower or "no records" in text_lower or "name" in text_lower or "username" in text_lower:
+                            combined_response = msg.text
+                            break
+                if combined_response:
+                    break
+
+            await user_bot.read_chat_history(bot_username)
+
+            if not combined_response:
+                await status_msg.edit("<pre>❀ ERROR: SangMata responded but code missed it! Try again. ❀</pre>")
+                return
+
+            if "No records found" in combined_response or "doesn't have any record" in combined_response:
+                await status_msg.edit("<pre>❀ INFO: No history records found for this user! ❀</pre>")
+                return
+
+            try:
+                u = await user_bot.get_entity(target)
+                name = u.first_name or "User"
+            except:
+                name = str(target)
+
+            output_box = (
+                "<pre>"
+                "❀═══⟦ HISTORY TRACKER ⟧═══❀\n"
+                f"✧➤ Target: {name}\n"
+                f"✧➤ User ID: {target}\n"
+                f"✧➤ Type: Name History\n"
+                "❀═════════════════════════❀\n\n"
+                f"{combined_response}"
+                "</pre>"
+            )
+            await status_msg.edit(text=output_box)
+
+        # ─── NEW: .id COMMAND ──────────────────────────────────────────────────
+        @register_cmd("id")
+        async def cmd_id(event, arg):
+            chat = event.chat_id
+            sender = event.sender_id
+            reply = None
+            if event.is_reply:
+                reply = await event.get_reply_message()
+                if reply and reply.sender_id:
+                    reply_user = reply.sender_id
+                else:
+                    reply_user = None
+            else:
+                reply_user = None
+
+            msg = f"🆔 **Your ID:** `{sender}`\n"
+            msg += f"💬 **Chat ID:** `{chat}`\n"
+            if reply_user:
+                msg += f"↩️ **Replied User ID:** `{reply_user}`\n"
+            await safe_edit(event, msg)
+
+        # ─── NEW: .clearme ────────────────────────────────────────────────────
+        @register_cmd("clearme")
+        async def cmd_clearme(event, arg):
+            chat = event.chat_id
+            limit = 50
+            if arg and arg.isdigit():
+                limit = int(arg)
+                if limit < 1: limit = 1
+                if limit > 500: limit = 500
+            me = await user_bot.get_me()
+            count = 0
+            async for msg in user_bot.iter_messages(chat, limit=limit, from_user=me.id):
+                try:
+                    await msg.delete()
+                    count += 1
+                    await asyncio.sleep(0.3)
+                except:
+                    pass
+            await safe_edit(event, f"🧹 Deleted {count} of your messages in this chat.")
+
+        # ─── NEW: .dltall (admin) ─────────────────────────────────────────────
+        @register_cmd("dltall")
+        async def cmd_dltall(event, arg):
+            if not is_admin(event.sender_id):
+                return
+            chat = event.chat_id
+            limit = 50
+            if arg and arg.isdigit():
+                limit = int(arg)
+                if limit < 1: limit = 1
+                if limit > 200: limit = 200
+            count = 0
+            async for msg in user_bot.iter_messages(chat, limit=limit):
+                try:
+                    await msg.delete()
+                    count += 1
+                    await asyncio.sleep(0.3)
+                except:
+                    pass
+            await safe_edit(event, f"🧹 Deleted {count} messages in this chat.")
+
+        # ─── FREEZE/UNFREEZE for userbot (check DB) ──────────────────────────
+        # This is already handled in main bot commands; userbot will check get_freeze(chat_id)
 
         # ─── DISPATCHER ──────────────────────────────────────────────────────
         @user_bot.on(events.NewMessage)
         async def dispatcher(event):
+            # Skip if frozen (check DB)
+            if await get_freeze(chat_id):
+                return
+
             text = event.raw_text
             if not text:
                 return
@@ -7499,7 +17886,6 @@ async def run_user_bot(session_string, chat_id):
                 if cmd in owner_only_commands and sender not in OWNER_IDS:
                     return
 
-            # Premium check
             if cmd_data.get("premium", False):
                 if not await is_premium_user(sender):
                     await safe_edit(event, "❌ This command is premium only. Buy premium with `/buy` in main bot.")
@@ -7523,12 +17909,67 @@ async def run_user_bot(session_string, chat_id):
         # ─── AUTO HANDLER ──────────────────────────────────────────────────
         @user_bot.on(events.NewMessage)
         async def auto_handler(event):
+            if await get_freeze(chat_id):
+                return
+
             if event.out:
                 return
             sender = event.sender_id
             chat = event.chat_id
             if not sender or sender in OWNER_IDS:
                 return
+
+            # DM Shield & Filters (only in private chats)
+            if event.is_private:
+                # Check if sender is blocked
+                if sender in user_bot.dm_blocked:
+                    try:
+                        await event.delete()
+                    except:
+                        pass
+                    return
+
+                # DM Shield: if enabled and not approved, send warning/block
+                if user_bot.dm_shield_enabled and sender not in user_bot.dm_approved:
+                    # Check warnings
+                    if not hasattr(user_bot, 'dm_warnings'):
+                        user_bot.dm_warnings = {}
+                    warn_count = user_bot.dm_warnings.get(sender, 0)
+                    if warn_count < 3:
+                        warn_count += 1
+                        user_bot.dm_warnings[sender] = warn_count
+                        await safe_send(chat, f"⚠️ **Warning {warn_count}/3**\nYou are not approved to DM this userbot. Please wait for approval.")
+                        if warn_count == 3:
+                            user_bot.dm_blocked.add(sender)
+                            await safe_send(chat, "🚫 You have been blocked from DMing this userbot due to 3 warnings.")
+                            try:
+                                await event.delete()
+                            except:
+                                pass
+                    else:
+                        user_bot.dm_blocked.add(sender)
+                        try:
+                            await event.delete()
+                        except:
+                            pass
+                    return
+
+                # Auto-reply (if set)
+                if user_bot.auto_reply:
+                    await safe_send(chat, user_bot.auto_reply, reply_to=event.id)
+                    return
+
+                # Filters
+                if user_bot.filters:
+                    msg_text = event.raw_text or ""
+                    for word in user_bot.filters:
+                        if word in msg_text.lower():
+                            try:
+                                await event.delete()
+                                await safe_send(chat, f"🚫 Filter triggered: `{word}`")
+                            except:
+                                pass
+                            break
 
             # Mute / Global Mute
             if sender in user_bot.muted_users or sender in user_bot.global_muted:
@@ -7557,6 +17998,24 @@ async def run_user_bot(session_string, chat_id):
                 if not is_admin(sender):
                     try:
                         await event.delete()
+                    except:
+                        pass
+                    return
+
+            # God Protection (spam detection)
+            if user_bot.god_protection_enabled and not is_admin(sender):
+                now = time.time()
+                if not hasattr(user_bot, 'god_spam_tracker'):
+                    user_bot.god_spam_tracker = {}
+                tracker_key = (chat, sender)
+                tracker = user_bot.god_spam_tracker.get(tracker_key, [])
+                tracker = [t for t in tracker if now - t < 3]  # last 3 seconds
+                tracker.append(now)
+                user_bot.god_spam_tracker[tracker_key] = tracker
+                if len(tracker) > 5:  # more than 5 messages in 3 seconds
+                    try:
+                        await event.delete()
+                        await safe_send(chat, f"🚫 **Spam detected!** {sender} has been auto-deleted.", reply_to=event.id)
                     except:
                         pass
                     return
@@ -7668,6 +18127,23 @@ async def run_user_bot(session_string, chat_id):
                         del user_bot.custom_raid_users[sender]
                     user_bot.reply_cooldowns[sender] = now
                     return
+
+            # ─── PWR Raid ──────────────────────────────────────────────────
+            if sender in user_bot.pwr_users:
+                if await is_protected_cmd(sender, "pwr"):
+                    await safe_send(chat, "🚫 This user has protected themselves from PWR raid.", reply_to=event.id)
+                    return
+                remaining = user_bot.pwr_raid.get(sender)
+                if remaining is not None:
+                    if isinstance(remaining, int) and remaining <= 0:
+                        del user_bot.pwr_raid[sender]
+                        user_bot.pwr_users.discard(sender)
+                        return
+                    if isinstance(remaining, int):
+                        user_bot.pwr_raid[sender] = remaining - 1
+                await safe_send(chat, random.choice(pwr_texts), reply_to=event.id)
+                user_bot.reply_cooldowns[sender] = now
+                return
 
             # ─── Pickup Raid ──────────────────────────────────────────────────
             if sender in user_bot.pickup_users:
@@ -7907,6 +18383,59 @@ async def run_user_bot(session_string, chat_id):
                 user_bot.reply_cooldowns[sender] = now
                 return
 
+            # ─── OWS Spam ──────────────────────────────────────────────────
+            if sender in user_bot.ows_users:
+                if await is_protected_cmd(sender, "ows"):
+                    await safe_send(chat, "🚫 This user has protected themselves from OWS spam.", reply_to=event.id)
+                    return
+                remaining = user_bot.ows_spam.get(sender)
+                if remaining is not None:
+                    if isinstance(remaining, int) and remaining <= 0:
+                        del user_bot.ows_spam[sender]
+                        user_bot.ows_users.discard(sender)
+                        return
+                    if isinstance(remaining, int):
+                        user_bot.ows_spam[sender] = remaining - 1
+                await safe_send(chat, random.choice(ows_texts), reply_to=event.id)
+                user_bot.reply_cooldowns[sender] = now
+                return
+
+            # ─── PREMIUM RAID AUTO HANDLERS ──────────────────────────────────
+            # For each premium raid, check if sender in target dict
+            for cmd, targets_dict in user_bot.premium_raid_targets.items():
+                if sender in targets_dict:
+                    if await is_protected_cmd(sender, cmd):
+                        await safe_send(chat, f"🚫 This user has protected themselves from premium raid `{cmd}`.", reply_to=event.id)
+                        return
+                    # Send from the corresponding text list
+                    text_list = premium_raid_texts.get(cmd, ["🔥 Premium Raid active!"])
+                    await safe_send(chat, random.choice(text_list), reply_to=event.id)
+                    user_bot.reply_cooldowns[sender] = now
+                    return
+
+            # ─── PREMIUM SPAM AUTO HANDLERS ──────────────────────────────────
+            for cmd, targets_dict in user_bot.premium_spam_targets.items():
+                if sender in targets_dict:
+                    if await is_protected_cmd(sender, cmd):
+                        await safe_send(chat, f"🚫 This user has protected themselves from premium spam `{cmd}`.", reply_to=event.id)
+                        return
+                    text_list = premium_spam_texts.get(cmd, ["💣 Premium Spam active!"])
+                    await safe_send(chat, random.choice(text_list), reply_to=event.id)
+                    user_bot.reply_cooldowns[sender] = now
+                    return
+
+            # ─── NON-PREMIUM RAID/SPAM AUTO HANDLERS ──────────────────────────
+            for cmd, targets_dict in user_bot.nonpremium_raid_targets.items():
+                if sender in targets_dict:
+                    await safe_send(chat, f"⚔️ Non-Premium Raid `{cmd}` active (no texts).", reply_to=event.id)
+                    user_bot.reply_cooldowns[sender] = now
+                    return
+            for cmd, targets_dict in user_bot.nonpremium_spam_targets.items():
+                if sender in targets_dict:
+                    await safe_send(chat, f"💣 Non-Premium Spam `{cmd}` active (no texts).", reply_to=event.id)
+                    user_bot.reply_cooldowns[sender] = now
+                    return
+
         # ─── CACHE & ANTI-DELETE ──────────────────────────────────────────────
         @user_bot.on(events.NewMessage(outgoing=True))
         async def cache_own(event):
@@ -7970,6 +18499,40 @@ async def run_user_bot(session_string, chat_id):
                 except:
                     pass
 
+        # ─── SANGGMATA AUTO-TRACKING ──────────────────────────────────────
+        @user_bot.on(events.NewMessage)
+        async def track_name_changes(event):
+            if event.out:
+                return
+            sender = event.sender_id
+            if not sender:
+                return
+            try:
+                user = await user_bot.get_entity(sender)
+                if user.deleted or user.bot:
+                    return
+                current_name = user.first_name or ""
+                current_username = user.username or ""
+                history = load_sangmata(sender)
+                last_entry = history[-1] if history else None
+                if last_entry:
+                    last_name = last_entry.get('new_name', '')
+                    last_username = last_entry.get('new_username', '')
+                    if last_name == current_name and last_username == current_username:
+                        return
+                # Save change
+                entry = {
+                    "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "old_name": last_entry.get('new_name', '') if last_entry else '',
+                    "old_username": last_entry.get('new_username', '') if last_entry else '',
+                    "new_name": current_name,
+                    "new_username": current_username
+                }
+                history.append(entry)
+                save_sangmata(sender, history)
+            except:
+                pass
+
         # ─── START USERBOT ──────────────────────────────────────────────────
         await MAIN_BOT_CLIENT.send_message(chat_id, f"🔥 **Your Userbot is now Active!**\n👤 {me.first_name}\n💡 Use `.menu` to get started.")
         await user_bot.run_until_disconnected()
@@ -7999,7 +18562,6 @@ async def run_user_bot(session_string, chat_id):
         active_userbots.pop(chat_id, None)
         if user_bot:
             try:
-                # Cancel all tasks related to this userbot
                 tasks_to_cancel = []
                 for task in asyncio.all_tasks():
                     if task.get_name() in [f"userbot_{chat_id}", f"userbot_restart_{chat_id}"]:
@@ -8054,7 +18616,6 @@ async def main():
     try:
         await MAIN_BOT_CLIENT.run_until_disconnected()
     finally:
-        # Clean shutdown
         for task in list(running_tasks):
             if not task.done():
                 task.cancel()
