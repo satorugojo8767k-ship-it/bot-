@@ -181,6 +181,50 @@ async def init_db():
                 frozen BOOLEAN DEFAULT FALSE
             )
         """)
+        # ─── ENCRYPTION FUNCTIONS ──────────────────────────────────────────
+
+async def get_encryption_key():
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT key_value FROM app_config WHERE key_name='encryption_key'"
+        )
+
+        if row:
+            return row["key_value"]
+
+        new_key = Fernet.generate_key().decode()
+
+        await conn.execute(
+            """
+            INSERT INTO app_config (key_name, key_value)
+            VALUES ($1, $2)
+            """,
+            "encryption_key",
+            new_key
+        )
+
+        return new_key
+
+
+async def init_cipher():
+    global cipher
+
+    key = await get_encryption_key()
+    cipher = Fernet(key.encode())
+
+
+def encrypt_session(sess: str):
+    if cipher is None:
+        raise RuntimeError("Cipher not initialized")
+
+    return cipher.encrypt(sess.encode()).decode()
+
+
+def decrypt_session(data: str):
+    if cipher is None:
+        raise RuntimeError("Cipher not initialized")
+
+    return cipher.decrypt(data.encode()).decode()
 
 # ─── PREMIUM ──────────────────────────────────────────────────────
 PROTECTED_COMMANDS = [
