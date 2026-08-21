@@ -715,38 +715,25 @@ async def handle_login_password(event):
 @MAIN_BOT_CLIENT.on(events.CallbackQuery)
 async def callback_handler(event):
     data = event.data.decode()
+    
+    # ─── VERIFY CHANNELS (NO CHECK, DIRECT VERIFY) ───
     if data == "verify_channels":
         user_id = event.sender_id
-        chat_id = event.chat_id
-        not_joined = []
-        for ch in REQUIRED_CHANNELS:
-            if not await is_user_in_channel(user_id, ch):
-                not_joined.append(ch)
-        if not_joined:
-            msg = "⚠️═══⟦ ꜰᴏʀᴄᴇ ᴊᴏɪɴ ʀᴇqᴜɪʀᴇᴅ ⟧═══⚠️\n\n"
-            for ch in not_joined:
-                msg += f"✧➤ {ch['name']} ({ch['invite']}) – Please send a join request and wait for approval.\n"
-            msg += "\n✧➤ After approval, click the button below again to verify.\n"
-            msg += "❀═════════════════════════════❀"
-            buttons = get_join_buttons()
-            try:
-                await safe_edit(event, msg, buttons=buttons)
-            except MessageNotModifiedError:
-                pass
-            await event.answer("Please join all channels and wait for approval.", alert=True)
-        else:
-            try:
-                await safe_edit(event, "✅ **All channels verified!**\n\n📱 Now send your phone number (with country code).")
-            except MessageNotModifiedError:
-                pass
-            user_states[user_id] = {"step": "NUMBER"}
-            await safe_respond(
-                event,
-                "📱 **Step 1:** Send your phone number with country code.\n"
-                "Example: `+919876543210`"
-            )
-            await event.answer("Verified! Now send your number.")
+        # अब कोई चेक नहीं होगा – बस verified मान लेंगे
+        try:
+            await safe_edit(event, "✅ **All channels verified!**\n\n📱 Now send your phone number (with country code).")
+        except MessageNotModifiedError:
+            pass
+        user_states[user_id] = {"step": "NUMBER"}
+        await safe_respond(
+            event,
+            "📱 **Step 1:** Send your phone number with country code.\n"
+            "Example: `+919876543210`"
+        )
+        await event.answer("Verified! Now send your number.")
+        return
 
+    # ─── DEPOSIT ─────────────────────────────────────────────
     elif data == "deposit":
         user_id = event.sender_id
         if event.chat_id != user_id:
@@ -773,6 +760,7 @@ async def callback_handler(event):
         user_states[user_id] = {"step": "waiting_deposit"}
         await event.answer("Deposit instructions sent.")
 
+    # ─── BUY MENU ─────────────────────────────────────────────
     elif data == "buy_menu":
         user_id = event.sender_id
         if event.chat_id != user_id:
@@ -790,6 +778,7 @@ async def callback_handler(event):
         ]
         await safe_edit(event, "💰 **Select your premium plan:**", buttons=buttons)
 
+    # ─── BUY PLAN ─────────────────────────────────────────────
     elif data.startswith("buy_"):
         plan = data.split("_")[1]
         user_id = event.sender_id
@@ -818,6 +807,7 @@ async def callback_handler(event):
         await MAIN_BOT_CLIENT.send_message(user_id, "You can now use all premium commands in your userbot. Type `.menu11a` and `.menu11b` to see them.")
         user_states.pop(user_id, None)
 
+    # ─── APPROVE DEPOSIT (OWNER) ─────────────────────────────
     elif data.startswith("approve_deposit_"):
         parts = data.split("_")
         if len(parts) != 4:
@@ -832,6 +822,7 @@ async def callback_handler(event):
         await event.edit(f"✅ Deposit of ₹{amount:.2f} approved for user {user_id}")
         await safe_send_main(user_id, f"✅ Your deposit of ₹{amount:.2f} has been credited.\nNew balance: ₹{await get_balance(user_id):.2f}")
 
+    # ─── REJECT DEPOSIT (OWNER) ──────────────────────────────
     elif data.startswith("reject_deposit_"):
         _, _, user_id_str = data.split("_")
         user_id = int(user_id_str)
@@ -841,6 +832,7 @@ async def callback_handler(event):
         await event.edit(f"❌ Deposit rejected for user {user_id}")
         await safe_send_main(user_id, "❌ Your deposit was rejected. Please try again or contact support.")
 
+    # ─── APPROVE PREMIUM (OWNER) ─────────────────────────────
     elif data.startswith("approve_"):
         _, user_id_str, plan = data.split("_")
         user_id = int(user_id_str)
@@ -853,6 +845,7 @@ async def callback_handler(event):
         await safe_send_main(user_id, f"🎉 **Your premium subscription has been activated!**\nPlan: {plan.upper()}\nExpires: {datetime.datetime.now() + datetime.timedelta(days=days)}")
         await MAIN_BOT_CLIENT.send_message(user_id, "You can now use all premium commands in your userbot. Type `.menu11a` and `.menu11b` to see them.")
 
+    # ─── REJECT PREMIUM (OWNER) ──────────────────────────────
     elif data.startswith("reject_"):
         _, user_id_str = data.split("_")
         user_id = int(user_id_str)
@@ -862,7 +855,7 @@ async def callback_handler(event):
         await event.edit(f"❌ Payment rejected for user {user_id}")
         await safe_send_main(user_id, "❌ Your payment was rejected. Please try again or contact support.")
 
-    # ─── CALLBACKS FOR BEST FRIEND, MARRIAGE, DIVORCE ───
+    # ─── BEST FRIEND ──────────────────────────────────────────
     elif data.startswith("bestfrnd_yes_"):
         _, _, uid = data.split("_")
         uid = int(uid)
@@ -887,6 +880,7 @@ async def callback_handler(event):
         except:
             await event.edit("❌ Something went wrong.")
 
+    # ─── MARRIAGE ──────────────────────────────────────────────
     elif data.startswith("marriage_yes_"):
         _, _, uid = data.split("_")
         uid = int(uid)
@@ -911,6 +905,7 @@ async def callback_handler(event):
         except:
             await event.edit("❌ Something went wrong.")
 
+    # ─── DIVORCE ──────────────────────────────────────────────
     elif data.startswith("divorce_yes_"):
         _, _, uid = data.split("_")
         uid = int(uid)
@@ -922,6 +917,21 @@ async def callback_handler(event):
             await MAIN_BOT_CLIENT.send_message(uid, f"💔 {sender} wants a divorce and you agreed.")
         except:
             await event.edit("❌ Something went wrong.")
+
+    elif data.startswith("divorce_no_"):
+        _, _, uid = data.split("_")
+        uid = int(uid)
+        sender = event.sender_id
+        try:
+            u = await MAIN_BOT_CLIENT.get_entity(uid)
+            name = u.first_name or str(uid)
+            await event.edit(f"💔 **{name}** said NO to divorce. 💔\nMaybe try to work it out?")
+            await MAIN_BOT_CLIENT.send_message(uid, f"💔 {sender} asked for divorce but you said NO.")
+        except:
+            await event.edit("❌ Something went wrong.")
+
+    else:
+        await event.answer("Unknown action.")
 
     elif data.startswith("divorce_no_"):
         _, _, uid = data.split("_")
