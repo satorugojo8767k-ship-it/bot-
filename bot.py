@@ -954,6 +954,409 @@ async def callback_handler(event):
 
     else:
         await event.answer("Unknown action.")
+
+@MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/buy"))
+async def buy_cmd(event):
+    if not event.is_private:
+        return
+    user_id = event.sender_id
+    prem = await check_premium_status(user_id)
+    if prem:
+        expiry = prem['expiry_date'].strftime("%Y-%m-%d")
+        await safe_reply(event, f"💎 You are already a premium user!\nPlan: {prem['plan'].upper()}\nExpires: {expiry}")
+        return
+    buttons = [
+        [types.KeyboardButtonCallback("📅 Monthly (₹45/30 days)", data="buy_monthly")],
+        [types.KeyboardButtonCallback("📅 Quarterly (₹120/90 days)", data="buy_quarterly")],
+        [types.KeyboardButtonCallback("📅 Yearly (₹490/365 days)", data="buy_yearly")],
+    ]
+    await safe_reply(event, "💰 **Select your premium plan:**", buttons=buttons)
+
+@MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/deposit"))
+async def deposit_cmd(event):
+    if not event.is_private:
+        return
+    user_id = event.sender_id
+    caption = (
+        "💰 **Deposit Funds**\n\n"
+        "1. Scan the QR below or use UPI: `{UPI_ID}`\n"
+        "2. Send any amount you want to deposit.\n"
+        "3. **After payment, send a screenshot** with the **amount paid** in the caption.\n"
+        "4. Example caption: `I paid ₹100`\n"
+        "5. Our team will verify and credit your wallet."
+    ).format(UPI_ID=UPI_ID)
+    buttons = [[types.KeyboardButtonUrl("🔗 Premium Features", url=PREMIUM_FEATURES_LINK)]]
+    try:
+        await event.reply(caption, file=QR_IMAGE_PATH, buttons=buttons)
+    except Exception as e:
+        await event.reply(caption + "\n\n⚠️ QR image not found. Please contact owner.", buttons=buttons)
+        print(f"Deposit QR send error: {e}")
+    user_states[user_id] = {"step": "waiting_deposit"}
+
+# ─── PAYMENT / DEPOSIT SCREENSHOT HANDLER ────────────────────────
+@MAIN_BOT_CLIENT.on(events.NewMessage)
+async def payment_handler(event):
+    if not event.is_private:
+        return
+    if event.raw_text and event.raw_text.startswith('/'):
+        return
+    user_id = event.sender_id
+    state = user_states.get(user_id, {})
+    step = state.get("step")
+
+    if step == "waiting_deposit":
+        if not event.photo:
+            await safe_reply(event, "❌ Please send a screenshot image of the deposit transaction.")
+            return
+        caption_text = event.raw_text or ""
+        amount = None
+        match = re.search(r'(\d+(\.\d+)?)', caption_text)
+        if match:
+            amount = float(match.group(1))
+        if amount is None or amount <= 0:
+            await safe_reply(event, "❌ Please include the amount you paid in the caption.\nExample: `I paid ₹100`")
+            return
+        try:
+            user_entity = await MAIN_BOT_CLIENT.get_entity(user_id)
+            user_name = user_entity.first_name or "Unknown"
+            user_username = f"@{user_entity.username}" if user_entity.username else "No username"
+        except:
+            user_name = "Unknown"
+            user_username = "Unknown"
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        caption = (
+            f"💰 **New Deposit Request**\n"
+            f"👤 **User:** {user_name}\n"
+            f"🆔 **ID:** `{user_id}`\n"
+            f"🔗 **Username:** {user_username}\n"
+            f"💵 **Amount:** ₹{amount:.2f}\n"
+            f"⏰ **Time:** {now}"
+        )
+        for owner in MY_OWNER_IDS:
+            try:
+                fwd = await MAIN_BOT_CLIENT.forward_messages(owner, event.id, event.chat_id)
+                if fwd:
+                    await MAIN_BOT_CLIENT.send_message(
+                        owner,
+                        caption,
+                        buttons=[
+                            [types.KeyboardButtonCallback("✅ Approve", f"approve_deposit_{user_id}_{amount}")],
+                            [types.KeyboardButtonCallback("❌ Reject", f"reject_deposit_{user_id}")],
+                        ]
+                    )
+            except Exception as e:
+                print(f"Failed to forward deposit to owner {owner}: {e}")
+        await safe_reply(event, "✅ Your deposit screenshot has been sent for verification.")
+        return
+
+    if step == "waiting_payment":
+        if not event.photo:
+            await safe_reply(event, "❌ Please send a screenshot image of the payment.")
+            return
+        plan = state.get("plan", "monthly")
+        try:
+            user_entity = await MAIN_BOT_CLIENT.get_entity(user_id)
+            user_name = user_entity.first_name or "Unknown"
+            user_username = f"@{user_entity.username}" if user_entity.username else "No username"
+        except:
+            user_name = "Unknown"
+            user_username = "Unknown"
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        caption = (
+            f"💳 **New Payment Request**\n"
+            f"👤 **User:** {user_name}\n"
+            f"🆔 **ID:** `{user_id}`\n"
+            f"🔗 **Username:** {user_username}\n"
+            f"📅 **Plan:** {plan.upper()}\n"
+            f"💰 **Amount:** {plan_price_str(plan)}\n"
+            f"⏰ **Time:** {now}"
+        )
+        for owner in MY_OWNER_IDS:
+            try:
+                fwd = await MAIN_BOT_CLIENT.forward_messages(owner, event.id, event.chat_id)
+                if fwd:
+                    await MAIN_BOT_CLIENT.send_message(
+                        owner,
+                        caption,
+                        buttons=[
+                            [types.KeyboardButtonCallback("✅ Approve", f"approve_{user_id}_{plan}")],
+                            [types.KeyboardButtonCallback("❌ Reject", f"reject_{user_id}")],
+                        ]
+                    )
+            except Exception as e:
+                print(f"Failed to forward to owner {owner}: {e}")
+        await safe_reply(event, "✅ Your payment screenshot has been sent for verification.")
+        user_states.pop(user_id, None)
+
+# ─── BROADCAST ──────────────────────────────────────────────────────
+@MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/broadcast"))
+async def broadcast_cmd(event):
+    if event.sender_id not in MY_OWNER_IDS:
+        return await safe_reply(event, "❌ Owner only.")
+    text = event.text.strip().replace("/broadcast", "").strip()
+    if not text:
+        return await safe_reply(event, "Usage: /broadcast <message>")
+    count = 0
+    for uid in list(broadcast_users):
+        try:
+            await safe_send_main(uid, f"📢 **Broadcast from Owner:**\n{text}")
+            count += 1
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            print(f"Broadcast failed for {uid}: {e}")
+    await safe_reply(event, f"✅ Broadcast sent to {count} users.")
+
+@MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/listusers"))
+async def listusers_cmd(event):
+    if event.sender_id not in MY_OWNER_IDS:
+        return
+    if not broadcast_users:
+        return await event.reply("📭 Koi user registered nahi hai.")
+    ids = "\n".join(f"• `{uid}`" for uid in sorted(broadcast_users))
+    await event.reply(f"👥 **Registered Users** ({len(broadcast_users)}):\n{ids}")
+
+# ─── LOGOUT ─────────────────────────────────────────────────────────
+@MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/logout"))
+async def logout_handler(event):
+    if not event.is_private:
+        return
+    user_id = event.sender_id
+    if user_id not in active_userbots:
+        await safe_reply(event, "❌ You don't have an active userbot.\n\nUse `/login` to start one.")
+        return
+    try:
+        user_bot = active_userbots[user_id]
+        tasks_to_cancel = []
+        for task in asyncio.all_tasks():
+            if task.get_name() in [f"userbot_{user_id}", f"userbot_restart_{user_id}"]:
+                tasks_to_cancel.append(task)
+        for task in tasks_to_cancel:
+            if not task.done():
+                task.cancel()
+                try:
+                    await asyncio.shield(task)
+                except:
+                    pass
+        await user_bot.disconnect()
+        del active_userbots[user_id]
+        user_sessions.pop(user_id, None)
+        await delete_session(user_id)
+        user_states.pop(user_id, None)
+        await safe_reply(
+            event,
+            "✅ **Your userbot has been safely logged out.**\n\n"
+            "• Userbot session terminated.\n"
+            "• You can start a new one anytime with `/login`.\n"
+            "• Your ID remains in the broadcast list."
+        )
+        user_entity = await MAIN_BOT_CLIENT.get_entity(user_id)
+        user_name = user_entity.first_name or "Unknown"
+        username = f"@{user_entity.username}" if user_entity.username else "No username"
+        for owner in MY_OWNER_IDS:
+            try:
+                await MAIN_BOT_CLIENT.send_message(
+                    owner,
+                    f"🚪 **User Logout**\n"
+                    f"👤 Name: {user_name}\n"
+                    f"🆔 ID: `{user_id}`\n"
+                    f"🔗 Username: {username}\n"
+                    f"⏰ Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            except:
+                pass
+    except Exception as e:
+        await safe_reply(event, f"❌ Logout error: `{str(e)}`")
+        active_userbots.pop(user_id, None)
+        user_sessions.pop(user_id, None)
+        await delete_session(user_id)
+
+# ─── PURNJANAM ─────────────────────────────────────────────────────
+@MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/purnjanam"))
+async def purnjanam_handler(event):
+    if event.sender_id not in MY_OWNER_IDS:
+        return
+    await safe_reply(event, "🌀 **पुनर्जन्म**...\n⏳ Userbot restart ho raha hai...")
+    count = 0
+    for uid, session_str in list(user_sessions.items()):
+        try:
+            if uid in active_userbots:
+                try:
+                    await active_userbots[uid].disconnect()
+                except:
+                    pass
+                del active_userbots[uid]
+            task = asyncio.create_task(run_user_bot_with_restart(session_str, uid))
+            task.set_name(f"userbot_restart_{uid}")
+            running_tasks.add(task)
+            task.add_done_callback(running_tasks.discard)
+            count += 1
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"Purnjanam error for {uid}: {e}")
+    await safe_reply(event, f"✅ **पुनर्जन्म पूर्ण!**\n🔄 {count} userbots restart kiye gaye.")
+
+# ─── GIFT PREMIUM ──────────────────────────────────────────────────
+@MAIN_BOT_CLIENT.on(events.NewMessage(pattern="/giftpremium"))
+async def gift_premium(event):
+    if event.sender_id not in MY_OWNER_IDS:
+        return
+    args = event.text.strip().split()
+    if len(args) < 3:
+        await safe_reply(event, "Usage: /giftpremium <user_id> <days>")
+        return
+    try:
+        user_id = int(args[1])
+        days = int(args[2])
+        if days <= 0:
+            await safe_reply(event, "Days must be a positive integer.")
+            return
+        plan = f"{days} days"
+        expiry = datetime.datetime.now() + datetime.timedelta(days=days)
+        await add_premium_user(user_id, plan, days)
+        await safe_reply(
+            event,
+            f"✅ Premium gifted to {user_id} for {days} days.\n"
+            f"📅 Expires on: {expiry.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        await safe_send_main(
+            user_id,
+            f"🎁 You have received a premium gift of **{days} days**!\n"
+            f"📅 Expires on: {expiry.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+    except ValueError:
+        await safe_reply(event, "❌ Invalid user ID or days. Usage: /giftpremium <user_id> <days>")
+    except Exception as e:
+        await safe_reply(event, f"❌ Error: {e}")
+
+# ─── USERBOT LAUNCHER WITH RESTART ──────────────────────────────
+async def run_user_bot_with_restart(session_string, chat_id):
+    restart_count = 0
+    last_restart_time = 0
+    session_invalid_notified = False
+    
+    while True:
+        try:
+            await run_user_bot(session_string, chat_id)
+            break
+        except FloodWaitError as e:
+            wait = e.seconds + 1
+            print(f"⏳ Userbot flood wait: {wait}s. Sleeping...")
+            try:
+                await MAIN_BOT_CLIENT.send_message(chat_id, f"⚠️ **Telegram flood limit reached.**\n⏳ Please wait **{wait//60} minutes {wait%60} seconds**.")
+                for owner in MY_OWNER_IDS:
+                    await MAIN_BOT_CLIENT.send_message(owner, f"🔄 **Userbot FloodWait**\nUser: {chat_id}\nWait: {wait}s")
+            except:
+                pass
+            await asyncio.sleep(wait)
+            restart_count = 0
+            session_invalid_notified = False
+
+        except (UnauthorizedError, ValueError, RPCError) as e:
+            error_msg = str(e)
+            if "SESSION_INVALID" in error_msg or "invalid" in error_msg.lower():
+                if not session_invalid_notified:
+                    session_invalid_notified = True
+                    try:
+                        await MAIN_BOT_CLIENT.send_message(chat_id, 
+                            "⚠️ **Your userbot session has expired.**\n\n"
+                            "Please login again using `/login`.\n"
+                            "🛑 This userbot will not restart automatically.")
+                        for owner in MY_OWNER_IDS:
+                            await MAIN_BOT_CLIENT.send_message(owner, 
+                                f"🔴 **Userbot Session Invalid**\n👤 User: {chat_id}\n📌 Reason: {error_msg[:100]}")
+                    except:
+                        pass
+                try:
+                    if chat_id in active_userbots:
+                        await active_userbots[chat_id].disconnect()
+                        del active_userbots[chat_id]
+                except:
+                    pass
+                user_sessions.pop(chat_id, None)
+                await delete_session(chat_id)
+                break
+
+        except AuthKeyDuplicatedError as e:
+            print(f"🔴 AuthKeyDuplicatedError for user {chat_id}. Session revoked. Stopping restarts.")
+            try:
+                await MAIN_BOT_CLIENT.send_message(chat_id,
+                    "⚠️ **Your session was used from two places simultaneously and has been revoked.**\n"
+                    "Please login again using `/login` in the main bot.\n"
+                    "🛑 This userbot will NOT restart automatically.")
+                for owner in MY_OWNER_IDS:
+                    await MAIN_BOT_CLIENT.send_message(owner,
+                        f"🔴 **AuthKeyDuplicatedError**\n👤 User: {chat_id}\n✅ Restart loop stopped.")
+            except:
+                pass
+            if chat_id in active_userbots:
+                try:
+                    await active_userbots[chat_id].disconnect()
+                except:
+                    pass
+                del active_userbots[chat_id]
+            user_sessions.pop(chat_id, None)
+            await delete_session(chat_id)
+            break
+
+        except asyncio.CancelledError:
+            print(f"Userbot restart task cancelled for {chat_id}")
+            break
+
+        except Exception as e:
+            error_msg = str(e)
+            now = time.time()
+            
+            if "EOF" in error_msg or "input" in error_msg.lower() or "interactive" in error_msg.lower():
+                print(f"🚫 Session invalid (EOF/interactive) for user {chat_id}. Stopping restarts.")
+                try:
+                    await MAIN_BOT_CLIENT.send_message(
+                        chat_id,
+                        "⚠️ **Your userbot session has expired or become invalid!**\n\n"
+                        "Please login again using `/login` in the main bot.\n"
+                        "🛑 This userbot will now stop automatically restarting.")
+                    for owner in MY_OWNER_IDS:
+                        await MAIN_BOT_CLIENT.send_message(
+                            owner,
+                            f"🚫 **Userbot Session Invalid (EOF/Interactive)**\n"
+                            f"👤 User: {chat_id}\n"
+                            f"📌 Reason: {error_msg[:100]}\n"
+                            f"✅ Restart loop stopped for this user.")
+                except:
+                    pass
+                try:
+                    if chat_id in active_userbots:
+                        await active_userbots[chat_id].disconnect()
+                        del active_userbots[chat_id]
+                except:
+                    pass
+                user_sessions.pop(chat_id, None)
+                await delete_session(chat_id)
+                break
+            
+            if restart_count >= 5 and (now - last_restart_time) < 60:
+                print(f"⚠️ Too many restarts for user {chat_id} in short time. Waiting...")
+                try:
+                    await MAIN_BOT_CLIENT.send_message(chat_id, f"⚠️ **Userbot is having issues.**\n⏳ Waiting 60 seconds before retry...")
+                except:
+                    pass
+                await asyncio.sleep(60)
+                restart_count = 0
+            restart_count += 1
+            last_restart_time = now
+            print(f"⚠️ Userbot crashed: {error_msg[:100]}\nRestarting in 5 seconds... (Attempt {restart_count})")
+            if restart_count % 3 == 1:
+                try:
+                    await MAIN_BOT_CLIENT.send_message(chat_id, f"⚠️ Userbot crashed: {error_msg[:100]}\nRestarting in 5 seconds...")
+                except:
+                    pass
+            if restart_count % 5 == 0:
+                try:
+                    for owner in MY_OWNER_IDS:
+                        await MAIN_BOT_CLIENT.send_message(owner, 
+                            f"🔄 **Userbot Restart**\n👤 User: {chat_id}\n📌 Reason: {error_msg[:80]}\n🔢 Attempt: {restart_count}")
+                except:
+                    pass
+            await asyncio.sleep(5)
     
 # ─── FULL USERBOT ENGINE ──────────────────────────────────────────
 async def run_user_bot(session_string, chat_id):
