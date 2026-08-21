@@ -719,7 +719,6 @@ async def callback_handler(event):
     # ─── VERIFY CHANNELS (NO CHECK, DIRECT VERIFY) ───
     if data == "verify_channels":
         user_id = event.sender_id
-        # अब कोई चेक नहीं होगा – बस verified मान लेंगे
         try:
             await safe_edit(event, "✅ **All channels verified!**\n\n📱 Now send your phone number (with country code).")
         except MessageNotModifiedError:
@@ -731,7 +730,7 @@ async def callback_handler(event):
             "Example: `+919876543210`"
         )
         await event.answer("Verified! Now send your number.")
-        return
+        return  # ← यह return जरूरी है
 
     # ─── DEPOSIT ─────────────────────────────────────────────
     elif data == "deposit":
@@ -917,21 +916,6 @@ async def callback_handler(event):
             await MAIN_BOT_CLIENT.send_message(uid, f"💔 {sender} wants a divorce and you agreed.")
         except:
             await event.edit("❌ Something went wrong.")
-
-    elif data.startswith("divorce_no_"):
-        _, _, uid = data.split("_")
-        uid = int(uid)
-        sender = event.sender_id
-        try:
-            u = await MAIN_BOT_CLIENT.get_entity(uid)
-            name = u.first_name or str(uid)
-            await event.edit(f"💔 **{name}** said NO to divorce. 💔\nMaybe try to work it out?")
-            await MAIN_BOT_CLIENT.send_message(uid, f"💔 {sender} asked for divorce but you said NO.")
-        except:
-            await event.edit("❌ Something went wrong.")
-
-    else:
-        await event.answer("Unknown action.")
 
     elif data.startswith("divorce_no_"):
         _, _, uid = data.split("_")
