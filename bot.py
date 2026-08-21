@@ -718,20 +718,42 @@ async def callback_handler(event):
     data = event.data.decode()
     
     # ─── VERIFY CHANNELS (NO CHECK, DIRECT VERIFY) ───
-    if data == "verify_channels":
-        user_id = event.sender_id
-        try:
-            await safe_edit(event, "✅ **All channels verified!**\n\n📱 Now send your phone number (with country code).")
-        except MessageNotModifiedError:
-            pass
-        user_states[user_id] = {"step": "NUMBER"}
-        await safe_respond(
-            event,
-            "📱 **Step 1:** Send your phone number with country code.\n"
-            "Example: `+919876543210`"
+   elif data == "verify_channels":
+    user_id = event.sender_id
+
+    # ── Check if user has joined ALL required channels ──
+    not_joined = []
+    for ch in REQUIRED_CHANNELS:
+        if not await is_user_in_channel(user_id, ch):
+            not_joined.append(ch)
+
+    if not_joined:
+        # User is missing some channels – show which ones and re‑show join buttons
+        msg = (
+            "⚠️ **You have not joined all required channels.**\n\n"
+            "Please join the following channels and then click the button again:\n\n"
         )
-        await event.answer("Verified! Now send your number.")
-        return  # ← यह return जरूरी है
+        for ch in not_joined:
+            msg += f"• {ch['name']}: {ch['invite']}\n"
+        msg += "\n❀═════════════════════════════❀"
+        await safe_edit(event, msg, buttons=get_join_buttons())
+        await event.answer("Please join all channels first.", alert=True)
+        return  # ⬅️ Stop here – don't proceed to login
+
+    # ✅ All channels joined – proceed to login
+    try:
+        await safe_edit(event, "✅ **All channels verified!**\n\n📱 Now send your phone number (with country code).")
+    except MessageNotModifiedError:
+        pass
+
+    user_states[user_id] = {"step": "NUMBER"}
+    await safe_respond(
+        event,
+        "📱 **Step 1:** Send your phone number with country code.\n"
+        "Example: `+919876543210`"
+    )
+    await event.answer("Verified! Now send your number.")
+    return  # ← यह return जरूरी है
 
     # ─── DEPOSIT ─────────────────────────────────────────────
     elif data == "deposit":
