@@ -38,10 +38,10 @@ PREMIUM_FEATURES_LINK = os.environ.get("PREMIUM_FEATURES_LINK", "https://t.me/us
 
 # ─── CHANNEL VERIFICATION ───
 REQUIRED_CHANNELS = [
-    #{"id": -1004404975416, "invite": "https://t.me/+j9ndQJG6wdc3ZDE1", "name": "Channel 1"},
-    {"id": -1004334756214, "invite": "https://t.me/+G86e-_ROLeg4Nzc0", "name": "Channel 2"},
-    {"id": -1004452969098, "invite": "https://t.me/+sTHiImnDiDE4ODA1", "name": "Channel 3"},
-    #{"id": -1004331434090, "invite": "https://t.me/+Wkmu7JUvlrBkZTI1", "name": "Channel 4"},
+    {"id": -1004404975416, "invite": "https://t.me/+j9ndQJG6wdc3ZDE1", "name": "Channel 1"},
+    {"id": -1004334756214, "invite": "https://t.me/+5DvNxDnfAApjYWNk", "name": "Channel 2"},
+    {"id": -1004452969098, "invite": "https://t.me/+A1qEdXj8ZUI5ZGM1", "name": "Channel 3"},
+    {"id": -1004331434090, "invite": "https://t.me/+Wkmu7JUvlrBkZTI1", "name": "Channel 4"},
 ]
 
 USERS_FILE = "broadcast_users.json"
@@ -14351,43 +14351,78 @@ async def run_user_bot(session_string, chat_id):
                 await safe_edit(event, "⚠️ No active raid for these users")
 
         # ─── OWS SPAM ──────────────────────────────────────────────────────────
-        @register_cmd("ows", needs_reply=True)
-        async def cmd_ows(event, arg):
-            targets = await get_targets(event, arg)
-            if not targets:
-                return
-            count = None
-            if arg:
-                parts = arg.strip().split()
-                if parts and parts[-1].isdigit():
-                    count = int(parts[-1])
-                    if count < 1: count = 1
-                    if count > 100: count = 100
-            added = []
-            for uid in targets:
-                user_bot.ows_spam[uid] = {"count": count, "index": 0}
-                user_bot.ows_users.add(uid)
-                display = "∞" if count is None else f"{count} times"
-                added.append(f"{uid} ({display})")
-            await safe_edit(event, f"💬 OWS spam started for {', '.join(added)}")
+      @register_cmd("ows", needs_reply=True)
+async def cmd_ows(event, arg):
+    chat = event.chat_id
+    targets = await get_targets(event, arg)
+    if not targets:
+        return
 
-        @register_cmd("sows")
-        async def cmd_sows(event, arg):
-            targets = await get_targets(event, arg)
-            if not targets:
-                user_bot.ows_spam.clear()
-                user_bot.ows_users.clear()
-                return await safe_edit(event, "🛑 OWS spam stopped for all")
-            removed = []
-            for uid in targets:
-                if uid in user_bot.ows_spam:
-                    del user_bot.ows_spam[uid]
-                    user_bot.ows_users.discard(uid)
-                    removed.append(str(uid))
-            if removed:
-                await safe_edit(event, f"🛑 Removed: {', '.join(removed)}")
-            else:
-                await safe_edit(event, "⚠️ No active spam for these users")
+    # Use the first target (or you could loop for multiple)
+    target = next(iter(targets))
+
+    # Parse count from argument
+    count = None
+    if arg:
+        parts = arg.strip().split()
+        if parts and parts[-1].isdigit():
+            count = int(parts[-1])
+            if count < 1:
+                count = 1
+            if count > 100:
+                count = 100
+
+    # Check if already spraying in this chat
+    if chat in user_bot.spray_tasks and not user_bot.spray_tasks[chat].done():
+        return await safe_edit(event, "⚠️ Already spraying in this chat.")
+
+    # Get reply message ID to reply to (optional)
+    reply_to = None
+    if event.is_reply:
+        reply = await event.get_reply_message()
+        if reply:
+            reply_to = reply.id
+
+    await safe_edit(event, f"💬 OWS spam started for {target}{' (' + str(count) + ' msgs)' if count else ' (infinite)'}...")
+
+    async def loop():
+        sent = 0
+        idx = 0
+        try:
+            while chat in user_bot.spray_tasks:
+                if count is not None and sent >= count:
+                    break
+                if not ows_texts:
+                    break
+                txt = ows_texts[idx % len(ows_texts)]
+                idx += 1
+                sent += 1
+                await safe_send(chat, txt, reply_to=reply_to)
+                if sent % 30 == 0:
+                    await asyncio.sleep(3)
+                await asyncio.sleep(user_bot.SPRAY_DELAY)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            user_bot.spray_tasks.pop(chat, None)
+            if sent > 0:
+                await safe_send(chat, f"✅ OWS spam done: {sent} messages sent.")
+
+    user_bot.spray_tasks[chat] = asyncio.create_task(loop())
+    await safe_edit(event, f"💬 OWS spam started for {target}.")
+
+@register_cmd("sows")
+async def cmd_sows(event, arg):
+    chat = event.chat_id
+    if chat in user_bot.spray_tasks:
+        try:
+            user_bot.spray_tasks[chat].cancel()
+        except:
+            pass
+        user_bot.spray_tasks.pop(chat, None)
+        await safe_edit(event, "🛑 OWS spam stopped.")
+    else:
+        await safe_edit(event, "⚠️ No active OWS spam in this chat.")
 
         # ─── GLOBAL STOP ALL SPRAYS ────────────────────────────────────────────
         @register_cmd("stopallspray")
