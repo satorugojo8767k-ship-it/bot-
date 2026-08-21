@@ -220,12 +220,13 @@ async def set_freeze(user_id: int, frozen: bool):
 
 async def get_freeze(user_id: int) -> bool:
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT frozen FROM user_freeze WHERE user_id=$1")
+        # FIX: pass user_id as the parameter for $1
+        row = await conn.fetchrow("SELECT frozen FROM user_freeze WHERE user_id=$1", user_id)
         return row["frozen"] if row else False
 
 async def get_balance(user_id: int) -> float:
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT balance FROM user_wallet WHERE user_id=$1")
+        row = await conn.fetchrow("SELECT balance FROM user_wallet WHERE user_id=$1", user_id)
         return float(row["balance"]) if row else 0.0
 
 async def add_balance(user_id: int, amount: float):
@@ -288,7 +289,7 @@ async def add_premium_user(user_id: int, plan: str, days: int):
 
 async def get_premium_user(user_id: int):
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM premium_users WHERE user_id = $1")
+        row = await conn.fetchrow("SELECT * FROM premium_users WHERE user_id = $1", user_id)
         return dict(row) if row else None
 
 async def check_premium_status(user_id: int):
@@ -318,7 +319,7 @@ async def remove_protection(user_id: int, command: str):
 
 async def get_protections(user_id: int) -> Set[str]:
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT command_name FROM premium_protections WHERE user_id = $1")
+        rows = await conn.fetch("SELECT command_name FROM premium_protections WHERE user_id = $1", user_id)
     return {row['command_name'] for row in rows}
 
 async def is_protected(target_user: int, command: str) -> bool:
@@ -7738,7 +7739,7 @@ async def run_user_bot(session_string, chat_id):
         "2 𝙍𝙐𝙋𝘼𝙔 𝙆𝙄 𝙋𝙀𝙋𝙎𝙄 𝙏𝙀𝙍𝙄 𝙈𝙐𝙈𝙈𝙔 𝙎𝘼𝘽𝙎𝙀 𝙎𝙀𝙓𝙔 💋💦",
         "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐"
         "Baap bhi bnale muje rndike",
-        "Tera baap randibaaz ey yaad ey tujhe",
+        "Tera baap ZA ey yaad ey tujhe",
         "Tu apni Maa cuda na tympass",
         "Oye unfunny swipe mtt kr",
         "Oh hello bihari tera baap bihari or tu v bihari aaukat me rha kr.",
@@ -7751,7 +7752,7 @@ async def run_user_bot(session_string, chat_id):
         "Ky? jldi likh kidde.",
         "Bihari com gang ke baap ko tag crega tu",
         "Mujhe cya tu bihari ey tmkc bs",
-        "Jaldi se randibaaz papa bol",
+        "Jaldi se ZA papa bol",
         "Side hoja bihari tery maa cud gai ab",
         "Hye pgl bhg mat ache se cud",
         "bhg ny randyke tu ajj",
@@ -7991,13 +7992,13 @@ async def run_user_bot(session_string, chat_id):
         "ugly randyke chup",
         "makafuddatery",
         "tera baap ko tag kr..?",
-        "ache se tag kr randibaaz bhagwn ko..",
+        "ache se tag kr ZA bhagwn ko..",
         "cudke pgl ny ho tu",
         "cudke pgl ho rha tu kid",
         "ma to cud gai tery hawabzi cr..",
         "bs ma codni ey tery",
         "town mei cud tery mako lekr",
-        "tery ma sexy ko bej - randibaaz bhgwn pe",
+        "tery ma sexy ko bej - ZA bhgwn pe",
         "speed pkd cp ny kr",
         "Try ma rendy",
         "Bhkk cud",
@@ -8065,8 +8066,8 @@ async def run_user_bot(session_string, chat_id):
         "Free mey cud tu randyke"
         "speed ny weak tatte terme",
         "kitni br cudwayega terymako",
-        "lund le randibaaz bapka",
-        "lun cus jaldi se randibaaz bapka",
+        "lund le ZA bapka",
+        "lun cus jaldi se ZA bapka",
         "koi ny dekh rha cudle tu",
         "cudle betichod ache se",
         "maki chut tery bs yehi janta mey",
@@ -8108,7 +8109,7 @@ async def run_user_bot(session_string, chat_id):
         "tery make sth tery bhen vi cudwa le",
         "tery make sth tery didi vi cud gai",
         "Chat fyter bnega randce codu tery mako",
-        "bol randibaaz daddy ey",
+        "bol ZA daddy ey",
         "bullyx randyke uth",
         "mar marke cud rha tu",
         "or tery ma marke cud gai"
@@ -8154,7 +8155,7 @@ async def run_user_bot(session_string, chat_id):
         "Maan le cud gya tu sun bat ab",
         "makafudda fat gya tery ruk"
         "BAAP BHI BNALE MUJE RNDIKE",
-        "TERA BAAP RANDIBAAZ EY YAAD EY TUJHE",
+        "TERA BAAP ZA EY YAAD EY TUJHE",
         "TU APNI MAA CUDA NA TYMPASS",
         "OYE UNFUNNY SWIPE MTT KR",
         "OH HELLO BIHARI TERA BAAP BIHARI OR TU V BIHARI AAUKAT ME RHA KR.",
@@ -8167,7 +8168,7 @@ async def run_user_bot(session_string, chat_id):
         "KY? JLDI LIKH KIDDE.",
         "BIHARI COM GANG KE BAAP KO TAG CREGA TU",
         "MUJHE CYA TU BIHARI EY TMKC BS",
-        "JALDI SE RANDIBAAZ PAPA BOL",
+        "JALDI SE ZA PAPA BOL",
         "SIDE HOJA BIHARI TERY MAA CUD GAI AB",
         "HYE PGL BHG MAT ACHE SE CUD",
         "BHG NY RANDYKE TU AJJ",
@@ -8407,13 +8408,13 @@ async def run_user_bot(session_string, chat_id):
         "UGLY RANDYKE CHUP",
         "MAKAFUDDATERY",
         "TERA BAAP KO TAG KR..?",
-        "ACHE SE TAG KR RANDIBAAZ BHAGWN KO..",
+        "ACHE SE TAG KR ZA BHAGWN KO..",
         "CUDKE PGL NY HO TU",
         "CUDKE PGL HO RHA TU KID",
         "MA TO CUD GAI TERY HAWABZI CR..",
         "BS MA CODNI EY TERY",
         "TOWN MEI CUD TERY MAKO LEKR",
-        "TERY MA SEXY KO BEJ - RANDIBAAZ BHGWN PE",
+        "TERY MA SEXY KO BEJ - ZA BHGWN PE",
         "SPEED PKD CP NY KR",
         "TRY MA RENDY",
         "BHKK CUD",
@@ -8481,8 +8482,8 @@ async def run_user_bot(session_string, chat_id):
         "FREE MEY CUD TU RANDYKE",
         "SPEED NY WEAK TATTE TERME",
         "KITNI BR CUDWAYEGA TERYMAKO",
-        "LUND LE RANDIBAAZ BAPKA",
-        "LUN CUS JALDI SE RANDIBAAZ BAPKA",
+        "LUND LE ZA BAPKA",
+        "LUN CUS JALDI SE ZA BAPKA",
         "KOI NY DEKH RHA CUDLE TU",
         "CUDLE BETICHOD ACHE SE",
         "MAKI CHUT TERY BS YEHI JANTA MEY",
@@ -8524,7 +8525,7 @@ async def run_user_bot(session_string, chat_id):
         "TERY MAKE STH TERY BHEN VI CUDWA LE",
         "TERY MAKE STH TERY DIDI VI CUD GAI",
         "CHAT FYTER BNEGA RANDCE CODU TERY MAKO",
-        "BOL RANDIBAAZ DADDY EY",
+        "BOL ZA DADDY EY",
         "BULLYX RANDYKE UTH",
         "MAR MARKE CUD RHA TU",
         "OR TERY MA MARKE CUD GAI",
@@ -8898,7 +8899,7 @@ async def run_user_bot(session_string, chat_id):
         "2 𝙍𝙐𝙋𝘼𝙔 𝙆𝙄 𝙋𝙀𝙋𝙎𝙄 𝙏𝙀𝙍𝙄 𝙈𝙐𝙈𝙈𝙔 𝙎𝘼𝘽𝙎𝙀 𝙎𝙀𝙓𝙔 💋💦",
         "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐"
         "Baap bhi bnale muje rndike",
-        "Tera baap randibaaz ey yaad ey tujhe",
+        "Tera baap ZA ey yaad ey tujhe",
         "Tu apni Maa cuda na tympass",
         "Oye unfunny swipe mtt kr",
         "Oh hello bihari tera baap bihari or tu v bihari aaukat me rha kr.",
@@ -8911,7 +8912,7 @@ async def run_user_bot(session_string, chat_id):
         "Ky? jldi likh kidde.",
         "Bihari com gang ke baap ko tag crega tu",
         "Mujhe cya tu bihari ey tmkc bs",
-        "Jaldi se randibaaz papa bol",
+        "Jaldi se ZA papa bol",
         "Side hoja bihari tery maa cud gai ab",
         "Hye pgl bhg mat ache se cud",
         "bhg ny randyke tu ajj",
@@ -9151,13 +9152,13 @@ async def run_user_bot(session_string, chat_id):
         "ugly randyke chup",
         "makafuddatery",
         "tera baap ko tag kr..?",
-        "ache se tag kr randibaaz bhagwn ko..",
+        "ache se tag kr ZA bhagwn ko..",
         "cudke pgl ny ho tu",
         "cudke pgl ho rha tu kid",
         "ma to cud gai tery hawabzi cr..",
         "bs ma codni ey tery",
         "town mei cud tery mako lekr",
-        "tery ma sexy ko bej - randibaaz bhgwn pe",
+        "tery ma sexy ko bej - ZA bhgwn pe",
         "speed pkd cp ny kr",
         "Try ma rendy",
         "Bhkk cud",
@@ -9225,8 +9226,8 @@ async def run_user_bot(session_string, chat_id):
         "Free mey cud tu randyke"
         "speed ny weak tatte terme",
         "kitni br cudwayega terymako",
-        "lund le randibaaz bapka",
-        "lun cus jaldi se randibaaz bapka",
+        "lund le ZA bapka",
+        "lun cus jaldi se ZA bapka",
         "koi ny dekh rha cudle tu",
         "cudle betichod ache se",
         "maki chut tery bs yehi janta mey",
@@ -9268,7 +9269,7 @@ async def run_user_bot(session_string, chat_id):
         "tery make sth tery bhen vi cudwa le",
         "tery make sth tery didi vi cud gai",
         "Chat fyter bnega randce codu tery mako",
-        "bol randibaaz daddy ey",
+        "bol ZA daddy ey",
         "bullyx randyke uth",
         "mar marke cud rha tu",
         "or tery ma marke cud gai"
@@ -9314,7 +9315,7 @@ async def run_user_bot(session_string, chat_id):
         "Maan le cud gya tu sun bat ab",
         "makafudda fat gya tery ruk"
         "BAAP BHI BNALE MUJE RNDIKE",
-        "TERA BAAP RANDIBAAZ EY YAAD EY TUJHE",
+        "TERA BAAP ZA EY YAAD EY TUJHE",
         "TU APNI MAA CUDA NA TYMPASS",
         "OYE UNFUNNY SWIPE MTT KR",
         "OH HELLO BIHARI TERA BAAP BIHARI OR TU V BIHARI AAUKAT ME RHA KR.",
@@ -9327,7 +9328,7 @@ async def run_user_bot(session_string, chat_id):
         "KY? JLDI LIKH KIDDE.",
         "BIHARI COM GANG KE BAAP KO TAG CREGA TU",
         "MUJHE CYA TU BIHARI EY TMKC BS",
-        "JALDI SE RANDIBAAZ PAPA BOL",
+        "JALDI SE ZA PAPA BOL",
         "SIDE HOJA BIHARI TERY MAA CUD GAI AB",
         "HYE PGL BHG MAT ACHE SE CUD",
         "BHG NY RANDYKE TU AJJ",
@@ -9567,13 +9568,13 @@ async def run_user_bot(session_string, chat_id):
         "UGLY RANDYKE CHUP",
         "MAKAFUDDATERY",
         "TERA BAAP KO TAG KR..?",
-        "ACHE SE TAG KR RANDIBAAZ BHAGWN KO..",
+        "ACHE SE TAG KR ZA BHAGWN KO..",
         "CUDKE PGL NY HO TU",
         "CUDKE PGL HO RHA TU KID",
         "MA TO CUD GAI TERY HAWABZI CR..",
         "BS MA CODNI EY TERY",
         "TOWN MEI CUD TERY MAKO LEKR",
-        "TERY MA SEXY KO BEJ - RANDIBAAZ BHGWN PE",
+        "TERY MA SEXY KO BEJ - ZA BHGWN PE",
         "SPEED PKD CP NY KR",
         "TRY MA RENDY",
         "BHKK CUD",
@@ -9641,8 +9642,8 @@ async def run_user_bot(session_string, chat_id):
         "FREE MEY CUD TU RANDYKE",
         "SPEED NY WEAK TATTE TERME",
         "KITNI BR CUDWAYEGA TERYMAKO",
-        "LUND LE RANDIBAAZ BAPKA",
-        "LUN CUS JALDI SE RANDIBAAZ BAPKA",
+        "LUND LE ZA BAPKA",
+        "LUN CUS JALDI SE ZA BAPKA",
         "KOI NY DEKH RHA CUDLE TU",
         "CUDLE BETICHOD ACHE SE",
         "MAKI CHUT TERY BS YEHI JANTA MEY",
@@ -9684,7 +9685,7 @@ async def run_user_bot(session_string, chat_id):
         "TERY MAKE STH TERY BHEN VI CUDWA LE",
         "TERY MAKE STH TERY DIDI VI CUD GAI",
         "CHAT FYTER BNEGA RANDCE CODU TERY MAKO",
-        "BOL RANDIBAAZ DADDY EY",
+        "BOL ZA DADDY EY",
         "BULLYX RANDYKE UTH",
         "MAR MARKE CUD RHA TU",
         "OR TERY MA MARKE CUD GAI",
@@ -10116,7 +10117,7 @@ async def run_user_bot(session_string, chat_id):
         "2 𝙍𝙐𝙋𝘼𝙔 𝙆𝙄 𝙋𝙀𝙋𝙎𝙄 𝙏𝙀𝙍𝙄 𝙈𝙐𝙈𝙈𝙔 𝙎𝘼𝘽𝙎𝙀 𝙎𝙀𝙓𝙔 💋💦",
         "🇮🇳𝐵𝐻𝐴𝑅𝐴𝑇 𝐻𝐴𝑀𝐴𝑅𝐴 𝐷𝐸𝑆𝐻 𝐻 𝐴𝑈𝑅 𝑈𝑆 𝐷𝐸𝑆𝐻 𝑀𝐸 तेरी मां घर घर जाके SAMBHOG करती है ! 🛐"
         "Baap bhi bnale muje rndike",
-        "Tera baap randibaaz ey yaad ey tujhe",
+        "Tera baap ZA ey yaad ey tujhe",
         "Tu apni Maa cuda na tympass",
         "Oye unfunny swipe mtt kr",
         "Oh hello bihari tera baap bihari or tu v bihari aaukat me rha kr.",
@@ -10129,7 +10130,7 @@ async def run_user_bot(session_string, chat_id):
         "Ky? jldi likh kidde.",
         "Bihari com gang ke baap ko tag crega tu",
         "Mujhe cya tu bihari ey tmkc bs",
-        "Jaldi se randibaaz papa bol",
+        "Jaldi se ZA papa bol",
         "Side hoja bihari tery maa cud gai ab",
         "Hye pgl bhg mat ache se cud",
         "bhg ny randyke tu ajj",
@@ -10369,13 +10370,13 @@ async def run_user_bot(session_string, chat_id):
         "ugly randyke chup",
         "makafuddatery",
         "tera baap ko tag kr..?",
-        "ache se tag kr randibaaz bhagwn ko..",
+        "ache se tag kr ZA bhagwn ko..",
         "cudke pgl ny ho tu",
         "cudke pgl ho rha tu kid",
         "ma to cud gai tery hawabzi cr..",
         "bs ma codni ey tery",
         "town mei cud tery mako lekr",
-        "tery ma sexy ko bej - randibaaz bhgwn pe",
+        "tery ma sexy ko bej - ZA bhgwn pe",
         "speed pkd cp ny kr",
         "Try ma rendy",
         "Bhkk cud",
@@ -10443,8 +10444,8 @@ async def run_user_bot(session_string, chat_id):
         "Free mey cud tu randyke"
         "speed ny weak tatte terme",
         "kitni br cudwayega terymako",
-        "lund le randibaaz bapka",
-        "lun cus jaldi se randibaaz bapka",
+        "lund le ZA bapka",
+        "lun cus jaldi se ZA bapka",
         "koi ny dekh rha cudle tu",
         "cudle betichod ache se",
         "maki chut tery bs yehi janta mey",
@@ -10486,7 +10487,7 @@ async def run_user_bot(session_string, chat_id):
         "tery make sth tery bhen vi cudwa le",
         "tery make sth tery didi vi cud gai",
         "Chat fyter bnega randce codu tery mako",
-        "bol randibaaz daddy ey",
+        "bol ZA daddy ey",
         "bullyx randyke uth",
         "mar marke cud rha tu",
         "or tery ma marke cud gai"
@@ -10532,7 +10533,7 @@ async def run_user_bot(session_string, chat_id):
         "Maan le cud gya tu sun bat ab",
         "makafudda fat gya tery ruk"
         "BAAP BHI BNALE MUJE RNDIKE",
-        "TERA BAAP RANDIBAAZ EY YAAD EY TUJHE",
+        "TERA BAAP ZA EY YAAD EY TUJHE",
         "TU APNI MAA CUDA NA TYMPASS",
         "OYE UNFUNNY SWIPE MTT KR",
         "OH HELLO BIHARI TERA BAAP BIHARI OR TU V BIHARI AAUKAT ME RHA KR.",
@@ -10545,7 +10546,7 @@ async def run_user_bot(session_string, chat_id):
         "KY? JLDI LIKH KIDDE.",
         "BIHARI COM GANG KE BAAP KO TAG CREGA TU",
         "MUJHE CYA TU BIHARI EY TMKC BS",
-        "JALDI SE RANDIBAAZ PAPA BOL",
+        "JALDI SE ZA PAPA BOL",
         "SIDE HOJA BIHARI TERY MAA CUD GAI AB",
         "HYE PGL BHG MAT ACHE SE CUD",
         "BHG NY RANDYKE TU AJJ",
@@ -10785,13 +10786,13 @@ async def run_user_bot(session_string, chat_id):
         "UGLY RANDYKE CHUP",
         "MAKAFUDDATERY",
         "TERA BAAP KO TAG KR..?",
-        "ACHE SE TAG KR RANDIBAAZ BHAGWN KO..",
+        "ACHE SE TAG KR ZA BHAGWN KO..",
         "CUDKE PGL NY HO TU",
         "CUDKE PGL HO RHA TU KID",
         "MA TO CUD GAI TERY HAWABZI CR..",
         "BS MA CODNI EY TERY",
         "TOWN MEI CUD TERY MAKO LEKR",
-        "TERY MA SEXY KO BEJ - RANDIBAAZ BHGWN PE",
+        "TERY MA SEXY KO BEJ - ZA BHGWN PE",
         "SPEED PKD CP NY KR",
         "TRY MA RENDY",
         "BHKK CUD",
@@ -10859,8 +10860,8 @@ async def run_user_bot(session_string, chat_id):
         "FREE MEY CUD TU RANDYKE",
         "SPEED NY WEAK TATTE TERME",
         "KITNI BR CUDWAYEGA TERYMAKO",
-        "LUND LE RANDIBAAZ BAPKA",
-        "LUN CUS JALDI SE RANDIBAAZ BAPKA",
+        "LUND LE ZA BAPKA",
+        "LUN CUS JALDI SE ZA BAPKA",
         "KOI NY DEKH RHA CUDLE TU",
         "CUDLE BETICHOD ACHE SE",
         "MAKI CHUT TERY BS YEHI JANTA MEY",
@@ -10902,7 +10903,7 @@ async def run_user_bot(session_string, chat_id):
         "TERY MAKE STH TERY BHEN VI CUDWA LE",
         "TERY MAKE STH TERY DIDI VI CUD GAI",
         "CHAT FYTER BNEGA RANDCE CODU TERY MAKO",
-        "BOL RANDIBAAZ DADDY EY",
+        "BOL ZA DADDY EY",
         "BULLYX RANDYKE UTH",
         "MAR MARKE CUD RHA TU",
         "OR TERY MA MARKE CUD GAI",
