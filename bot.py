@@ -14351,79 +14351,81 @@ async def run_user_bot(session_string, chat_id):
                 await safe_edit(event, "⚠️ No active raid for these users")
 
         # ─── OWS SPAM ──────────────────────────────────────────────────────────
-      @register_cmd("ows", needs_reply=True)
-async def cmd_ows(event, arg):
-    chat = event.chat_id
-    targets = await get_targets(event, arg)
-    if not targets:
-        return
+            # ─── OWS SPAM (CONTINUOUS, LIKE DEATHGOD) ─────────────────────
+        @register_cmd("ows", needs_reply=True)
+        async def cmd_ows(event, arg):
+            chat = event.chat_id
+            targets = await get_targets(event, arg)
+            if not targets:
+                return
 
-    # Use the first target (or you could loop for multiple)
-    target = next(iter(targets))
+            # Use the first target
+            target = next(iter(targets))
 
-    # Parse count from argument
-    count = None
-    if arg:
-        parts = arg.strip().split()
-        if parts and parts[-1].isdigit():
-            count = int(parts[-1])
-            if count < 1:
-                count = 1
-            if count > 100:
-                count = 100
+            # Parse count from argument
+            count = None
+            if arg:
+                parts = arg.strip().split()
+                if parts and parts[-1].isdigit():
+                    count = int(parts[-1])
+                    if count < 1:
+                        count = 1
+                    if count > 100:
+                        count = 100
 
-    # Check if already spraying in this chat
-    if chat in user_bot.spray_tasks and not user_bot.spray_tasks[chat].done():
-        return await safe_edit(event, "⚠️ Already spraying in this chat.")
+            # Check if already spraying in this chat
+            if chat in user_bot.spray_tasks and not user_bot.spray_tasks[chat].done():
+                await safe_edit(event, "⚠️ Already spraying in this chat.")
+                return
 
-    # Get reply message ID to reply to (optional)
-    reply_to = None
-    if event.is_reply:
-        reply = await event.get_reply_message()
-        if reply:
-            reply_to = reply.id
+            # Get reply message ID to reply to (optional)
+            reply_to = None
+            if event.is_reply:
+                reply = await event.get_reply_message()
+                if reply:
+                    reply_to = reply.id
 
-    await safe_edit(event, f"💬 OWS spam started for {target}{' (' + str(count) + ' msgs)' if count else ' (infinite)'}...")
+            await safe_edit(event, f"💬 OWS spam started for {target}{' (' + str(count) + ' msgs)' if count else ' (infinite)'}...")
 
-    async def loop():
-        sent = 0
-        idx = 0
-        try:
-            while chat in user_bot.spray_tasks:
-                if count is not None and sent >= count:
-                    break
-                if not ows_texts:
-                    break
-                txt = ows_texts[idx % len(ows_texts)]
-                idx += 1
-                sent += 1
-                await safe_send(chat, txt, reply_to=reply_to)
-                if sent % 30 == 0:
-                    await asyncio.sleep(3)
-                await asyncio.sleep(user_bot.SPRAY_DELAY)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            user_bot.spray_tasks.pop(chat, None)
-            if sent > 0:
-                await safe_send(chat, f"✅ OWS spam done: {sent} messages sent.")
+            async def loop():
+                sent = 0
+                idx = 0
+                try:
+                    while chat in user_bot.spray_tasks:
+                        if count is not None and sent >= count:
+                            break
+                        if not ows_texts:
+                            break
+                        txt = ows_texts[idx % len(ows_texts)]
+                        idx += 1
+                        sent += 1
+                        await safe_send(chat, txt, reply_to=reply_to)
+                        if sent % 30 == 0:
+                            await asyncio.sleep(3)
+                        await asyncio.sleep(user_bot.SPRAY_DELAY)
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    user_bot.spray_tasks.pop(chat, None)
+                    if sent > 0:
+                        await safe_send(chat, f"✅ OWS spam done: {sent} messages sent.")
 
-    user_bot.spray_tasks[chat] = asyncio.create_task(loop())
-    await safe_edit(event, f"💬 OWS spam started for {target}.")
+            user_bot.spray_tasks[chat] = asyncio.create_task(loop())
+            # The edit above already sent a message, so we don't need to edit again
+            # But we can keep it as is.
 
-@register_cmd("sows")
-async def cmd_sows(event, arg):
-    chat = event.chat_id
-    if chat in user_bot.spray_tasks:
-        try:
-            user_bot.spray_tasks[chat].cancel()
-        except:
-            pass
-        user_bot.spray_tasks.pop(chat, None)
-        await safe_edit(event, "🛑 OWS spam stopped.")
-    else:
-        await safe_edit(event, "⚠️ No active OWS spam in this chat.")
-
+        @register_cmd("sows")
+        async def cmd_sows(event, arg):
+            chat = event.chat_id
+            if chat in user_bot.spray_tasks:
+                try:
+                    user_bot.spray_tasks[chat].cancel()
+                except:
+                    pass
+                user_bot.spray_tasks.pop(chat, None)
+                await safe_edit(event, "🛑 OWS spam stopped.")
+            else:
+                await safe_edit(event, "⚠️ No active OWS spam in this chat.")
         # ─── GLOBAL STOP ALL SPRAYS ────────────────────────────────────────────
         @register_cmd("stopallspray")
         async def cmd_stopallspray(event, _):
