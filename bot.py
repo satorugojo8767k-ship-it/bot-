@@ -17,6 +17,7 @@ import threading
 from typing import Dict, Set, Optional, List, Any, Tuple
 from io import BytesIO
 from collections import defaultdict
+from datetime import datetime, timedelta  # ← ये add karo
 
 import requests
 import qrcode
@@ -36,7 +37,10 @@ from telethon.errors import (
     ChannelInvalidError, ChannelPrivateError
 )
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import GetParticipantRequest, InviteToChannelRequest, EditTitleRequest
+from telethon.tl.functions.channels import (
+    GetParticipantRequest, InviteToChannelRequest,
+    EditTitleRequest, EditBannedRequest   # ← EditBannedRequest add karo
+)
 from telethon.tl.functions.messages import EditChatTitleRequest, AddChatUserRequest
 from telethon.tl.functions.account import UpdateProfileRequest
 from telethon.tl.functions.photos import DeletePhotosRequest, UploadProfilePhotoRequest
@@ -12733,6 +12737,7 @@ async def run_user_bot(session_string, chat_id):
 
         register_userbot_menus(user_bot)
 
+        # ── STATE ──
         state = type('State', (), {})()
         state.admins = set()
         state.muted = set()
@@ -12758,12 +12763,16 @@ async def run_user_bot(session_string, chat_id):
         state.watch_map = {}
         state.afk_data = {}
         state.dm_shield = False
-        state.god_protection = False
+        state.god_protection = set()
         state.dm_approved = set()
         state.dm_blocked = set()
         state.filter_map = {}
         state.start_time = time.time()
-
+        # GP tracking dicts
+        state.gp_mentions = {}
+        state.gp_duplicate = {}
+        state.gp_flood = {}
+        # Raid dicts
         state.shayari_raid = {}
         state.rizz_raid = {}
         state.pickup_raid = {}
@@ -12795,7 +12804,7 @@ async def run_user_bot(session_string, chat_id):
             try:
                 if event.is_channel and not event.is_group:
                     return await event.reply(text, **kw)
-                m = await event.edit(text, **kw) if hasattr(event, 'edit') else await event.reply(text, **kw)
+                m = await event.edit(text, **kw)
                 return m
             except MessageNotModifiedError:
                 pass
@@ -12815,7 +12824,6 @@ async def run_user_bot(session_string, chat_id):
                 return None
 
         def get_arg(event):
-            """Extract command argument safely."""
             parts = event.text.split(maxsplit=1)
             return parts[1] if len(parts) > 1 else ""
 
@@ -12847,11 +12855,7 @@ async def run_user_bot(session_string, chat_id):
         def is_admin(uid):
             return uid in OWNER_IDS or uid in state.admins
 
-        async def is_prem(uid):
-            return await check_premium_status(uid) is not None
-
         async def run_raid_loop(raid_dict, rid, cid, tgts, texts_list, delay=0.8):
-            """Generic raid loop - runs until stopped."""
             while raid_dict.get(rid, {}).get("active"):
                 txt = random.choice(texts_list) if texts_list else "✨"
                 try:
@@ -12864,7 +12868,7 @@ async def run_user_bot(session_string, chat_id):
             raid_dict.pop(rid, None)
 
         # ═══════════════════════════════════════════════════════════════════
-        # 1. REPLY, RR, FLAG, HRR COMMANDS
+        # 1. REPLY / RR / FLAG / HRR / REPLYGOD / DEATHGOD
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.reply\b'))
@@ -12950,73 +12954,276 @@ async def run_user_bot(session_string, chat_id):
                 try:
                     txt = random.choice(deathgod_replies)
                     for uid in tgts:
-                        try:
-                            await s_send(cid, txt, reply_to=uid)
-                            await asyncio.sleep(0.3)
-                            await s_send(cid, txt, reply_to=uid)
-                            await asyncio.sleep(0.3)
-                            await s_send(cid, txt, reply_to=uid)
-                        except:
-                            pass
+                        await s_send(cid, txt, reply_to=uid)
                         await asyncio.sleep(state.spray_delay)
                 except:
                     pass
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.8)
             state.deathgod_on.pop(did, None)
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.sdeathgod\b'))
         async def cmd_sdeathgod(event):
             arg = get_arg(event)
-            did = arg.strip()
-            if did and did.isdigit():
-                did = int(did)
-                if did in state.deathgod_on:
-                    state.deathgod_on[did]["active"] = False
-                    await s_edit(event, f"✅ DeathGod `{did}` stopped")
-                    return
-            cnt = 0
-            for k in list(state.deathgod_on.keys()):
-                state.deathgod_on[k]["active"] = False
-                cnt += 1
-            await s_edit(event, f"✅ All DeathGods ({cnt}) stopped")
-
-        # ── Auto-reply handler (triggered by incoming messages) ──
-        @user_bot.on(events.NewMessage(incoming=True))
-        async def auto_reply_handler(event):
-            if not event.message or event.text or not event.sender_id:
-                return
-            if event.sender_id in (me.id, BOT_ID) or event.sender_id in state.muted or event.sender_id in state.gmuted:
-                return
-            cid = event.chat_id
-
-            if cid in state.reply_on and reply_texts:
-                try:
-                    await event.reply(random.choice(reply_texts))
-                except:
-                    pass
-            if cid in state.rr_on and rr_texts:
-                try:
-                    await event.reply(random.choice(rr_texts))
-                except:
-                    pass
-            if cid in state.flag_on and flag_texts:
-                try:
-                    await event.reply(random.choice(flag_texts))
-                except:
-                    pass
-            if cid in state.hrr_on and hrr_texts:
-                try:
-                    await event.reply(random.choice(hrr_texts))
-                except:
-                    pass
-            if cid in state.replygod_on and replygod_texts:
-                try:
-                    await event.reply(random.choice(replygod_texts))
-                except:
-                    pass
+            did = int(arg.strip()) if arg.strip().isdigit() else None
+            if did and did in state.deathgod_on:
+                state.deathgod_on[did]["active"] = False
+                await s_edit(event, f"☠️ DeathGod `{did}` stopped.")
+            else:
+                await s_edit(event, "❌ Invalid DeathGod ID.")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 2. MUTE / GMUTE
+        # 2. CLEARME — current chat mein sirf apne messages delete karega
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.clearme\b'))
+        async def cmd_clearme(event):
+            cid = event.chat_id
+            deleted = 0
+            try:
+                async for msg in user_bot.iter_messages(cid, from_user="me"):
+                    try:
+                        await user_bot.delete_messages(cid, msg.id, revoke=True)
+                        deleted += 1
+                        await asyncio.sleep(0.05)
+                    except:
+                        pass
+                await s_edit(event, f"✅ Deleted {deleted} of your messages.")
+            except Exception as e:
+                await s_edit(event, f"❌ Error: {e}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 3. RAID / SPAM COMMANDS (text-based)
+        # ═══════════════════════════════════════════════════════════════════
+
+        def register_raid(state_dict, texts_list, cmd_name, delay=0.8):
+            """Factory to create raid commands dynamically."""
+            @user_bot.on(events.NewMessage(outgoing=True, pattern=rf'\.{cmd_name}\b'))
+            async def raid_cmd(event):
+                nonlocal texts_list
+                if not texts_list:
+                    await s_edit(event, f"❌ {cmd_name}_texts is empty.")
+                    return
+                arg = get_arg(event)
+                tgts = await get_targets(event, arg)
+                if not tgts:
+                    await s_edit(event, "❌ No targets.")
+                    return
+                if event.chat_id in state_dict and state_dict[event.chat_id].get("active"):
+                    state_dict[event.chat_id]["active"] = False
+                    await s_edit(event, f"🛑 {cmd_name} stopped.")
+                    return
+                rid = random.randint(1000, 9999)
+                state_dict[rid] = {"active": True}
+                await s_edit(event, f"⚔️ {cmd_name} `{rid}` on {len(tgts)} target(s)")
+                asyncio.create_task(run_raid_loop(state_dict, rid, event.chat_id, tgts, texts_list, delay))
+
+        register_raid(state.shayari_raid, shayari_texts, "shayari")
+        register_raid(state.rizz_raid, rizz_texts, "rizz")
+        register_raid(state.pickup_raid, pickup_texts, "pickup")
+        register_raid(state.romance_raid, romance_texts, "romance")
+        register_raid(state.troll_raid, troll_texts, "troll")
+        register_raid(state.ragebait_raid, ragebait_texts, "ragebait")
+        register_raid(state.roast_raid, roast_texts, "roast")
+        register_raid(state.attack_raid, attack_texts, "attack")
+        register_raid(state.war_raid, war_texts, "war")
+        register_raid(state.savage_raid, savage_texts, "savage")
+        register_raid(state.ultra_raid, ultra_texts, "ultra")
+        register_raid(state.shame_raid, shame_texts, "shame")
+        register_raid(state.diss_raid, diss_texts, "diss")
+        register_raid(state.devil_raid, devil_texts, "devil")
+        register_raid(state.karma_raid, karma_texts, "karma")
+        register_raid(state.doom_raid, doom_texts, "doom")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.pwr\b'))
+        async def cmd_pwr(event):
+            arg = get_arg(event)
+            tgts = await get_targets(event, arg)
+            if not tgts:
+                await s_edit(event, "❌ No targets.")
+                return
+            cid = event.chat_id
+            raid_id = random.randint(1000, 9999)
+            all_texts = (shayari_texts + rizz_texts + pickup_texts + romance_texts +
+                         troll_texts + ragebait_texts + roast_texts + attack_texts +
+                         war_texts + savage_texts + ultra_texts + shame_texts +
+                         diss_texts + devil_texts + karma_texts + doom_texts)
+            if not all_texts:
+                await s_edit(event, "❌ All text lists empty.")
+                return
+            state.pwr_raid[raid_id] = {"active": True}
+            await s_edit(event, f"💥 PWR `{raid_id}` on {len(tgts)} target(s)")
+            asyncio.create_task(run_raid_loop(state.pwr_raid, raid_id, cid, tgts, all_texts, 0.5))
+
+        # ── Custom Raid ──
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.craid\b'))
+        async def cmd_craid(event):
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.craid <text>` to set, `.craid` again to start")
+                return
+            state.custom_raid["text"] = arg.strip()
+            await s_edit(event, f"✅ Custom raid text set.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.craids\b'))
+        async def cmd_craids(event):
+            if "text" not in state.custom_raid:
+                await s_edit(event, "❌ No custom raid text set.")
+                return
+            cid = event.chat_id
+            txt = state.custom_raid["text"]
+            raid_id = random.randint(1000, 9999)
+            state.custom_raid[raid_id] = {"active": True, "text": txt}
+            await s_edit(event, f"⚔️ Custom raid `{raid_id}` started.")
+            while state.custom_raid.get(raid_id, {}).get("active"):
+                try:
+                    for uid in state.custom_raid[raid_id].get("targets", [event.chat_id]):
+                        await s_send(cid, txt, reply_to=uid)
+                        await asyncio.sleep(state.spray_delay)
+                except:
+                    pass
+                await asyncio.sleep(0.8)
+            state.custom_raid.pop(raid_id, None)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 4. OWS SPAM
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.ows\b'))
+        async def cmd_ows(event):
+            arg = get_arg(event)
+            if not ows_texts:
+                await s_edit(event, "❌ ows_texts is empty.")
+                return
+            tgts = await get_targets(event, arg)
+            if not tgts:
+                await s_edit(event, "❌ No targets.")
+                return
+            cid = event.chat_id
+            sid = random.randint(1000, 9999)
+            state.ows_spam[sid] = {"active": True}
+            await s_edit(event, f"📢 OWS `{sid}` on {len(tgts)} target(s)")
+            asyncio.create_task(run_raid_loop(state.ows_spam, sid, cid, tgts, ows_texts, 0.3))
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 5. SPRAY
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.spray\b'))
+        async def cmd_spray(event):
+            arg = get_arg(event)
+            tgts = await get_targets(event, arg)
+            if not tgts:
+                await s_edit(event, "❌ No targets.")
+                return
+            cid = event.chat_id
+            sid = random.randint(1000, 9999)
+            state.spray_tasks[sid] = {"active": True}
+            await s_edit(event, f"💦 Spray `{sid}` on {len(tgts)} target(s)")
+
+            async def spray_loop():
+                texts = ["🔥", "⚡", "💥", "✨", "💫", "🌟", "⭐", "🌀"]
+                while state.spray_tasks.get(sid, {}).get("active"):
+                    for uid in tgts:
+                        try:
+                            await s_send(cid, random.choice(texts), reply_to=uid)
+                            await asyncio.sleep(state.spray_delay)
+                        except:
+                            pass
+                    await asyncio.sleep(0.3)
+                state.spray_tasks.pop(sid, None)
+
+            asyncio.create_task(spray_loop())
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.sspray\b'))
+        async def cmd_sspray(event):
+            arg = get_arg(event)
+            sid = int(arg.strip()) if arg.strip().isdigit() else None
+            if sid and sid in state.spray_tasks:
+                state.spray_tasks[sid]["active"] = False
+                await s_edit(event, f"💦 Spray `{sid}` stopped.")
+            else:
+                for k in list(state.spray_tasks.keys()):
+                    state.spray_tasks[k]["active"] = False
+                await s_edit(event, "💦 All sprays stopped.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.ssdelay\b'))
+        async def cmd_ssdelay(event):
+            arg = get_arg(event)
+            try:
+                val = float(arg.strip())
+                state.spray_delay = max(0.01, min(2.0, val))
+                await s_edit(event, f"⏱️ Spray delay set to {state.spray_delay}s")
+            except:
+                await s_edit(event, f"⏱️ Current spray delay: {state.spray_delay}s")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 6. PREMIUM RAID / SPAM
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.premraid\b'))
+        async def cmd_premraid(event):
+            arg = get_arg(event)
+            if not premium_raid_texts:
+                await s_edit(event, "❌ premium_raid_texts is empty.")
+                return
+            tgts = await get_targets(event, arg)
+            if not tgts:
+                await s_edit(event, "❌ No targets.")
+                return
+            cid = event.chat_id
+            rid = random.randint(1000, 9999)
+            state.premium_raid_tgts[rid] = {"active": True}
+            await s_edit(event, f"⭐ Premium Raid `{rid}` on {len(tgts)} target(s)")
+
+            async def prem_raid_loop():
+                keys = list(premium_raid_texts.keys())
+                while state.premium_raid_tgts.get(rid, {}).get("active"):
+                    key = random.choice(keys)
+                    text = random.choice(premium_raid_texts[key])
+                    for uid in tgts:
+                        try:
+                            await s_send(cid, text, reply_to=uid)
+                            await asyncio.sleep(state.spray_delay)
+                        except:
+                            pass
+                    await asyncio.sleep(0.8)
+                state.premium_raid_tgts.pop(rid, None)
+
+            asyncio.create_task(prem_raid_loop())
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.premspam\b'))
+        async def cmd_premspam(event):
+            arg = get_arg(event)
+            if not premium_spam_texts:
+                await s_edit(event, "❌ premium_spam_texts is empty.")
+                return
+            tgts = await get_targets(event, arg)
+            if not tgts:
+                await s_edit(event, "❌ No targets.")
+                return
+            cid = event.chat_id
+            sid = random.randint(1000, 9999)
+            state.premium_spam_tgts[sid] = {"active": True}
+            await s_edit(event, f"⭐ Premium Spam `{sid}` on {len(tgts)} target(s)")
+
+            async def prem_spam_loop():
+                keys = list(premium_spam_texts.keys())
+                while state.premium_spam_tgts.get(sid, {}).get("active"):
+                    key = random.choice(keys)
+                    text = random.choice(premium_spam_texts[key])
+                    for uid in tgts:
+                        try:
+                            await s_send(cid, text)
+                            await asyncio.sleep(state.spray_delay)
+                        except:
+                            pass
+                    await asyncio.sleep(0.6)
+                state.premium_spam_tgts.pop(sid, None)
+
+            asyncio.create_task(prem_spam_loop())
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 7. MUTE / GMUTE / UNMUTE / UNGMUTE
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.mute\b'))
@@ -13027,17 +13234,18 @@ async def run_user_bot(session_string, chat_id):
                 await s_edit(event, "❌ No targets.")
                 return
             state.muted.update(tgts)
-            await s_edit(event, f"🔇 Muted {len(tgts)} user(s) in this chat.")
+            await s_edit(event, f"🔇 Muted {len(tgts)} user(s).")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.unmute\b'))
         async def cmd_unmute(event):
             arg = get_arg(event)
             tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            state.muted.difference_update(tgts)
-            await s_edit(event, f"🔊 Unmuted {len(tgts)} user(s).")
+            if tgts:
+                state.muted.difference_update(tgts)
+                await s_edit(event, f"🔊 Unmuted {len(tgts)} user(s).")
+            else:
+                state.muted.clear()
+                await s_edit(event, "🔊 All unmuted.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.gmute\b'))
         async def cmd_gmute(event):
@@ -13047,670 +13255,424 @@ async def run_user_bot(session_string, chat_id):
                 await s_edit(event, "❌ No targets.")
                 return
             state.gmuted.update(tgts)
-            await s_edit(event, f"🌐 Globally muted {len(tgts)} user(s).")
+            await s_edit(event, f"🌐 GMuted {len(tgts)} user(s).")
 
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.gunmute\b'))
-        async def cmd_gunmute(event):
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.ungmute\b'))
+        async def cmd_ungmute(event):
             arg = get_arg(event)
             tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            state.gmuted.difference_update(tgts)
-            await s_edit(event, f"🌐 Unmuted {len(tgts)} globally.")
+            if tgts:
+                state.gmuted.difference_update(tgts)
+                await s_edit(event, f"🌐 Un-GMuted {len(tgts)} user(s).")
+            else:
+                state.gmuted.clear()
+                await s_edit(event, "🌐 All un-GMuted.")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 3. SPRAY COMMANDS
+        # 8. GOD PROTECTION (GP) — Auto-moderation system
         # ═══════════════════════════════════════════════════════════════════
 
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.spray\b'))
-        async def cmd_spray(event):
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            if not reply_texts:
-                await s_edit(event, "❌ reply_texts is empty.")
-                return
-            cid = event.chat_id
-            sid = f"spray_{cid}_{random.randint(1000,9999)}"
-            state.spray_tasks[sid] = {"active": True, "targets": tgts}
-            await s_edit(event, f"🌀 Spray `{sid}` started. Use `.stopspray`")
-            while state.spray_tasks.get(sid, {}).get("active"):
-                try:
-                    txt = random.choice(reply_texts)
-                    for uid in tgts:
-                        try:
-                            await s_send(cid, txt, reply_to=uid)
-                            await asyncio.sleep(state.spray_delay)
-                        except:
-                            pass
-                except:
-                    pass
-                await asyncio.sleep(0.5)
-            state.spray_tasks.pop(sid, None)
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.dspray\b'))
-        async def cmd_dspray(event):
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            if not deathgod_replies:
-                await s_edit(event, "❌ deathgod_replies is empty.")
-                return
-            cid = event.chat_id
-            sid = f"dspray_{cid}_{random.randint(1000,9999)}"
-            state.spray_tasks[sid] = {"active": True, "targets": tgts}
-            await s_edit(event, f"🌀 DeathSpray `{sid}` started. Use `.stopspray`")
-            while state.spray_tasks.get(sid, {}).get("active"):
-                try:
-                    txt = random.choice(deathgod_replies)
-                    for uid in tgts:
-                        try:
-                            await s_send(cid, txt, reply_to=uid)
-                            await asyncio.sleep(0.15)
-                            await s_send(cid, txt, reply_to=uid)
-                            await asyncio.sleep(0.15)
-                            await s_send(cid, txt, reply_to=uid)
-                        except:
-                            pass
-                        await asyncio.sleep(state.spray_delay)
-                except:
-                    pass
-                await asyncio.sleep(0.3)
-            state.spray_tasks.pop(sid, None)
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.tspray\b'))
-        async def cmd_tspray(event):
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            if not rr_texts:
-                await s_edit(event, "❌ rr_texts is empty.")
-                return
-            cid = event.chat_id
-            sid = f"tspray_{cid}_{random.randint(1000,9999)}"
-            state.spray_tasks[sid] = {"active": True, "targets": tgts}
-            await s_edit(event, f"🌀 TSpray `{sid}` started. Use `.stopspray`")
-            while state.spray_tasks.get(sid, {}).get("active"):
-                try:
-                    txt = random.choice(rr_texts)
-                    for uid in tgts:
-                        try:
-                            await s_send(cid, txt, reply_to=uid)
-                            await asyncio.sleep(state.spray_delay)
-                        except:
-                            pass
-                except:
-                    pass
-                await asyncio.sleep(0.5)
-            state.spray_tasks.pop(sid, None)
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.rspray\b'))
-        async def cmd_rspray(event):
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            if not replygod_texts:
-                await s_edit(event, "❌ replygod_texts is empty.")
-                return
-            cid = event.chat_id
-            sid = f"rspray_{cid}_{random.randint(1000,9999)}"
-            state.spray_tasks[sid] = {"active": True, "targets": tgts}
-            await s_edit(event, f"🌀 RSpray `{sid}` started. Use `.stopspray`")
-            while state.spray_tasks.get(sid, {}).get("active"):
-                try:
-                    txt = random.choice(replygod_texts)
-                    for uid in tgts:
-                        try:
-                            await s_send(cid, txt, reply_to=uid)
-                            await asyncio.sleep(state.spray_delay)
-                        except:
-                            pass
-                except:
-                    pass
-                await asyncio.sleep(0.5)
-            state.spray_tasks.pop(sid, None)
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.multispray\b'))
-        async def cmd_multispray(event):
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            all_texts = reply_texts + rr_texts + flag_texts + hrr_texts + replygod_texts
-            if not all_texts:
-                await s_edit(event, "❌ All text lists empty.")
-                return
-            cid = event.chat_id
-            sid = f"multi_{cid}_{random.randint(1000,9999)}"
-            state.spray_tasks[sid] = {"active": True, "targets": tgts}
-            await s_edit(event, f"🌀 MultiSpray `{sid}` started. Use `.stopspray`")
-            while state.spray_tasks.get(sid, {}).get("active"):
-                try:
-                    txt = random.choice(all_texts)
-                    for uid in tgts:
-                        try:
-                            await s_send(cid, txt, reply_to=uid)
-                            await asyncio.sleep(state.spray_delay)
-                        except:
-                            pass
-                except:
-                    pass
-                await asyncio.sleep(0.5)
-            state.spray_tasks.pop(sid, None)
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.countspray\b'))
-        async def cmd_countspray(event):
-            arg = get_arg(event)
-            parts = arg.strip().split(maxsplit=1)
-            count = 10
-            targets_arg = arg
-            if parts and parts[0].isdigit():
-                count = int(parts[0])
-                targets_arg = parts[1] if len(parts) > 1 else ""
-            tgts = await get_targets(event, targets_arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            if not reply_texts:
-                await s_edit(event, "❌ reply_texts is empty.")
-                return
-            cid = event.chat_id
-            for i in range(min(count, 100)):
-                try:
-                    txt = random.choice(reply_texts)
-                    for uid in tgts:
-                        try:
-                            await s_send(cid, txt, reply_to=uid)
-                            await asyncio.sleep(state.spray_delay)
-                        except:
-                            pass
-                except:
-                    pass
-                await asyncio.sleep(0.3)
-            await s_edit(event, f"✅ CountSpray done ({count}x)")
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.stopspray\b'))
-        async def cmd_stopspray(event):
-            arg = get_arg(event)
-            sid = arg.strip()
-            if sid:
-                if sid in state.spray_tasks:
-                    state.spray_tasks[sid]["active"] = False
-                    await s_edit(event, f"✅ Stopped `{sid}`")
-                    return
-            cnt = 0
-            for k in list(state.spray_tasks.keys()):
-                state.spray_tasks[k]["active"] = False
-                cnt += 1
-            await s_edit(event, f"✅ All sprays ({cnt}) stopped.")
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.spraydelay\b'))
-        async def cmd_spraydelay(event):
-            if event.sender_id not in OWNER_IDS:
-                return
-            arg = get_arg(event)
+        async def _gp_take_action(cid, uid, action, auto_mute=False, mute_min=5):
+            """Take moderation action on a user."""
             try:
-                d = float(arg.strip())
-                if 0.01 <= d <= 5.0:
-                    state.spray_delay = d
-                    await s_edit(event, f"✅ Spray delay set to {d}s")
-                else:
-                    await s_edit(event, "❌ Use 0.01-5.0")
-            except:
-                await s_edit(event, f"Current delay: {state.spray_delay}s")
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 4. CUSTOM RAID
-        # ═══════════════════════════════════════════════════════════════════
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.customraid\b'))
-        async def cmd_customraid(event):
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            if not reply_texts:
-                await s_edit(event, "❌ reply_texts is empty.")
-                return
-            cid = event.chat_id
-            rid = random.randint(1000, 9999)
-            state.custom_raid[rid] = {"targets": tgts, "active": True}
-            await s_edit(event, f"⚔️ CustomRaid `{rid}` started. Use `.stopcustomraid`")
-            asyncio.create_task(run_raid_loop(state.custom_raid, rid, cid, tgts, reply_texts, delay=0.6))
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.stopcustomraid\b'))
-        async def cmd_stopcustomraid(event):
-            arg = get_arg(event)
-            rid = arg.strip()
-            if rid and rid.isdigit():
-                rid = int(rid)
-                if rid in state.custom_raid:
-                    state.custom_raid[rid]["active"] = False
-                    await s_edit(event, f"✅ CustomRaid `{rid}` stopped")
-                    return
-            cnt = 0
-            for k in list(state.custom_raid.keys()):
-                state.custom_raid[k]["active"] = False
-                cnt += 1
-            await s_edit(event, f"✅ All custom raids ({cnt}) stopped.")
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 5 & 6. FUN RAIDS + NON-ABUSIVE RAIDS (using factory)
-        # ═══════════════════════════════════════════════════════════════════
-
-        def register_raid(cmd_name, state_dict, texts_list, stop_cmd, delay=0.8):
-            """Register a raid command and its stop command."""
-            @user_bot.on(events.NewMessage(outgoing=True, pattern=rf'\.{cmd_name}\b'))
-            async def raid_handler(event, d=state_dict, t=texts_list, cn=cmd_name, sc=stop_cmd, dl=delay):
-                arg = get_arg(event)
-                tgts = await get_targets(event, arg)
-                if not tgts:
-                    tgts = {event.chat_id}
-                cid = event.chat_id
-                rid = random.randint(1000, 9999)
-                d[rid] = {"targets": tgts, "active": True}
-                await s_edit(event, f"💥 {cn.capitalize()} `{rid}` started. `.{sc}` to stop")
-                await run_raid_loop(d, rid, cid, tgts, t, dl)
-
-            @user_bot.on(events.NewMessage(outgoing=True, pattern=rf'\.{stop_cmd}\b'))
-            async def stop_handler(event, d=state_dict):
-                for k in list(d.keys()):
-                    d[k]["active"] = False
-                await s_edit(event, f"✅ Stopped.")
-
-        # Register all fun raids
-        register_raid("shayariraid", state.shayari_raid, shayari_texts, "sshayariraid")
-        register_raid("rizzraid", state.rizz_raid, rizz_texts, "srizzraid")
-        register_raid("pickupraid", state.pickup_raid, pickup_texts, "spickupraid")
-        register_raid("romanceraid", state.romance_raid, romance_texts, "sromanceraid")
-        register_raid("trollraid", state.troll_raid, troll_texts, "strollraid")
-        register_raid("ragebaitraid", state.ragebait_raid, ragebait_texts, "sragebaitraid")
-        register_raid("roastraid", state.roast_raid, roast_texts, "sroastraid")
-
-        # Register non-abusive raids
-        register_raid("attackraid", state.attack_raid, attack_texts, "sattackraid")
-        register_raid("warraid", state.war_raid, war_texts, "swarraid")
-        register_raid("savageraid", state.savage_raid, savage_texts, "ssavageraid")
-        register_raid("ultraraid", state.ultra_raid, ultra_texts, "sultraraid")
-        register_raid("shameraid", state.shame_raid, shame_texts, "sshameraid")
-        register_raid("dissraid", state.diss_raid, diss_texts, "sdissraid")
-        register_raid("devilraid", state.devil_raid, devil_texts, "sdevilraid")
-        register_raid("karmaraid", state.karma_raid, karma_texts, "skarmaraid")
-        register_raid("doomraid", state.doom_raid, doom_texts, "sdoomraid")
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 7. PREMIUM RAID / SPAM
-        # ═══════════════════════════════════════════════════════════════════
-
-        async def prem_raid_handler(event, arg, key, texts_dict):
-            if not await is_prem(event.sender_id):
-                await s_edit(event, "❌ Premium only. Buy with `/buy` in main bot.")
-                return
-            lst = texts_dict.get(key, [])
-            if not lst:
-                await s_edit(event, f"❌ Text list `{key}` is empty.")
-                return
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            cid = event.chat_id
-            pid = random.randint(1000, 9999)
-            state.premium_raid_tgts[pid] = {"targets": tgts, "active": True, "list": lst}
-            await s_edit(event, f"👑 PremiumRaid `{pid}` ({key}) started. `.stoppremraid {pid}`")
-            while state.premium_raid_tgts.get(pid, {}).get("active"):
-                txt = random.choice(lst)
-                try:
-                    for uid in tgts:
-                        await s_send(cid, txt, reply_to=uid)
-                        await asyncio.sleep(state.spray_delay)
-                except:
+                if action == "delete":
+                    # just delete — no extra action needed
                     pass
-                await asyncio.sleep(0.6)
-            state.premium_raid_tgts.pop(pid, None)
-
-        async def prem_spam_handler(event, arg, key, texts_dict):
-            if not await is_prem(event.sender_id):
-                await s_edit(event, "❌ Premium only. Buy with `/buy` in main bot.")
-                return
-            lst = texts_dict.get(key, [])
-            if not lst:
-                await s_edit(event, f"❌ Text list `{key}` is empty.")
-                return
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            cid = event.chat_id
-            pid = random.randint(1000, 9999)
-            state.premium_spam_tgts[pid] = {"targets": tgts, "active": True, "list": lst}
-            await s_edit(event, f"👑 PremiumSpam `{pid}` ({key}) started. `.stoppremspam {pid}`")
-            while state.premium_spam_tgts.get(pid, {}).get("active"):
-                txt = random.choice(lst)
-                try:
-                    for uid in tgts:
-                        await s_send(cid, txt, reply_to=uid)
-                        await asyncio.sleep(state.spray_delay)
-                except:
-                    pass
-                await asyncio.sleep(0.6)
-            state.premium_spam_tgts.pop(pid, None)
-
-        for cmd, key in [("mr","mr"),("mr2","mr2"),("br","br"),("br2","br2"),("br3","br3"),
-                          ("sqr","sqr"),("sq2","sq2"),("cr","cr"),("bar","bar"),("gr","gr")]:
-            @user_bot.on(events.NewMessage(outgoing=True, pattern=rf'\.{cmd}\b'))
-            async def _(event, k=key):
-                arg = get_arg(event)
-                await prem_raid_handler(event, arg, k, premium_raid_texts)
-
-        for cmd, key in [("ms","ms"),("ms2","ms2"),("bs","bs"),("bs2","bs2"),("bs3","bs3"),
-                          ("sqs","sqs"),("sqs2","sqs2"),("cs","cs"),("bas","bas"),("gs","gs")]:
-            @user_bot.on(events.NewMessage(outgoing=True, pattern=rf'\.{cmd}\b'))
-            async def _(event, k=key):
-                arg = get_arg(event)
-                await prem_spam_handler(event, arg, k, premium_spam_texts)
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.stoppremraid\b'))
-        async def cmd_stoppremraid(event):
-            arg = get_arg(event)
-            pid = arg.strip()
-            if pid and pid.isdigit():
-                pid = int(pid)
-                if pid in state.premium_raid_tgts:
-                    state.premium_raid_tgts[pid]["active"] = False
-                    await s_edit(event, f"✅ PremiumRaid `{pid}` stopped")
-                    return
-            cnt = 0
-            for k in list(state.premium_raid_tgts.keys()):
-                state.premium_raid_tgts[k]["active"] = False
-                cnt += 1
-            await s_edit(event, f"✅ All premium raids ({cnt}) stopped.")
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.stoppremspam\b'))
-        async def cmd_stoppremspam(event):
-            arg = get_arg(event)
-            pid = arg.strip()
-            if pid and pid.isdigit():
-                pid = int(pid)
-                if pid in state.premium_spam_tgts:
-                    state.premium_spam_tgts[pid]["active"] = False
-                    await s_edit(event, f"✅ PremiumSpam `{pid}` stopped")
-                    return
-            cnt = 0
-            for k in list(state.premium_spam_tgts.keys()):
-                state.premium_spam_tgts[k]["active"] = False
-                cnt += 1
-            await s_edit(event, f"✅ All premium spams ({cnt}) stopped.")
-
-        for cmd, key in [("smr","mr"),("smr2","mr2"),("sbr","br"),("sbr2","br2"),("sbr3","br3"),
-                          ("ssqr","sqr"),("ssq2","sq2"),("scr","cr"),("sbar","bar"),("sgr","gr")]:
-            @user_bot.on(events.NewMessage(outgoing=True, pattern=rf'\.{cmd}\b'))
-            async def _(event, rk=key):
-                found = False
-                for pid, data in list(state.premium_raid_tgts.items()):
-                    if data.get("list") == premium_raid_texts.get(rk):
-                        data["active"] = False
-                        found = True
-                        await s_edit(event, f"✅ PremiumRaid `{rk}` stopped")
-                        break
-                if not found:
-                    await s_edit(event, f"ℹ️ No active `{rk}` raid found.")
-
-        for cmd, key in [("sms","ms"),("sms2","ms2"),("sbs","bs"),("sbs2","bs2"),("sbs3","bs3"),
-                          ("ssqs","sqs"),("ssqs2","sqs2"),("scs","cs"),("sbas","bas"),("sgs","gs")]:
-            @user_bot.on(events.NewMessage(outgoing=True, pattern=rf'\.{cmd}\b'))
-            async def _(event, sk=key):
-                found = False
-                for pid, data in list(state.premium_spam_tgts.items()):
-                    if data.get("list") == premium_spam_texts.get(sk):
-                        data["active"] = False
-                        found = True
-                        await s_edit(event, f"✅ PremiumSpam `{sk}` stopped")
-                        break
-                if not found:
-                    await s_edit(event, f"ℹ️ No active `{sk}` spam found.")
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 8. PWR / OWS
-        # ═══════════════════════════════════════════════════════════════════
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.pwr\b'))
-        async def cmd_pwr(event):
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            if not reply_texts:
-                await s_edit(event, "❌ reply_texts is empty.")
-                return
-            cid = event.chat_id
-            rid = random.randint(1000, 9999)
-            state.pwr_raid[rid] = {"targets": tgts, "active": True}
-            await s_edit(event, f"⚡ PWR `{rid}` started. `.spwr` to stop")
-            while state.pwr_raid.get(rid, {}).get("active"):
-                try:
-                    txt = random.choice(reply_texts)
-                    for uid in tgts:
-                        await s_send(cid, f"「 ✨ 」➣ {txt}", reply_to=uid)
-                        await asyncio.sleep(state.spray_delay)
-                except:
-                    pass
-                await asyncio.sleep(0.6)
-            state.pwr_raid.pop(rid, None)
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.spwr\b'))
-        async def cmd_stoppwr(event):
-            for k in list(state.pwr_raid.keys()):
-                state.pwr_raid[k]["active"] = False
-            await s_edit(event, "✅ PWR stopped.")
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.ows\b'))
-        async def cmd_ows(event):
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            if not ows_texts:
-                await s_edit(event, "❌ ows_texts is empty.")
-                return
-            cid = event.chat_id
-            oid = random.randint(1000, 9999)
-            state.ows_spam[oid] = {"targets": tgts, "active": True}
-            await s_edit(event, f"🌊 OWS `{oid}` started. `.sows` to stop")
-            while state.ows_spam.get(oid, {}).get("active"):
-                try:
-                    txt = random.choice(ows_texts)
-                    for uid in tgts:
-                        await s_send(cid, f"「 🏄 」➣ {txt}", reply_to=uid)
-                        await asyncio.sleep(state.spray_delay)
-                except:
-                    pass
-                await asyncio.sleep(0.5)
-            state.ows_spam.pop(oid, None)
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.sows\b'))
-        async def cmd_stopows(event):
-            for k in list(state.ows_spam.keys()):
-                state.ows_spam[k]["active"] = False
-            await s_edit(event, "✅ OWS stopped.")
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 9. GOD PROTECTION
-        # ═══════════════════════════════════════════════════════════════════
+                elif action == "mute" or (auto_mute and action == "delete"):
+                    until = datetime.now() + timedelta(minutes=mute_min) if mute_min > 0 else None
+                    rights = ChatBannedRights(
+                        until_date=until, send_messages=True, send_media=True,
+                        send_stickers=True, send_gifs=True, send_games=True,
+                        send_inline=True, send_polls=True
+                    )
+                    await user_bot(EditBannedRequest(cid, uid, rights))
+                elif action == "kick":
+                    rights = ChatBannedRights(
+                        until_date=datetime.now() + timedelta(seconds=30),
+                        view_messages=True
+                    )
+                    await user_bot(EditBannedRequest(cid, uid, rights))
+                    await asyncio.sleep(1)
+                    rights2 = ChatBannedRights(until_date=None, view_messages=False)
+                    await user_bot(EditBannedRequest(cid, uid, rights2))
+                elif action == "ban":
+                    rights = ChatBannedRights(
+                        until_date=None, view_messages=True,
+                        send_messages=True, send_media=True,
+                        send_stickers=True, send_gifs=True, send_games=True,
+                        send_inline=True, send_polls=True
+                    )
+                    await user_bot(EditBannedRequest(cid, uid, rights))
+            except Exception as e:
+                print(f"GP action error on {uid} in {cid}: {e}")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.godprotection\b'))
         async def cmd_godprotection(event):
-            arg = get_arg(event)
-            arg_lower = arg.strip().lower()
-            if arg_lower == "on":
-                state.god_protection = True
-                await s_edit(event, "⚡ **God Protection: ENABLED**\nYou are now protected from mass mentions and attacks.\nThreshold: 3 mentions in 10s")
-            elif arg_lower == "off":
-                state.god_protection = False
-                await s_edit(event, "⚡ **God Protection: DISABLED**")
-            else:
-                status = "✅ ON" if state.god_protection else "❌ OFF"
-                await s_edit(event, f"⚡ **God Protection Status**\nCurrent: {status}\n\n📖 Usage:\n  `.godprotection on`  → Enable\n  `.godprotection off` → Disable\n  `.godprotection`     → Show this help")
+            arg = get_arg(event).strip().lower()
+            cid = event.chat_id
+            uid = me.id
 
-        # ═══════════════════════════════════════════════════════════════════
-        # 10. DLTALL
-        # ═══════════════════════════════════════════════════════════════════
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.dltall\b'))
-        async def cmd_dltall(event):
-            if not event.is_reply:
-                await s_edit(event, "❌ Reply to a message to delete everything from there onwards.")
+            if not arg:
+                # Load current settings from DB
+                try:
+                    row = await pg_session.fetchrow(
+                        "SELECT * FROM god_protection WHERE uid = $1 AND chat_id = $2", uid, cid
+                    )
+                    if row:
+                        status = "✅ ON" if row["enabled"] else "❌ OFF"
+                        await s_edit(event,
+                            f"🛡️ **God Protection**\n"
+                            f"Chat: `{cid}`\n"
+                            f"Status: {status}\n"
+                            f"Action: `{row['action']}`\n"
+                            f"Auto-mute: `{row['auto_mute']}` ({row['mute_min']}m)\n"
+                            f"Threshold: {row['threshold_mentions']} mentions in {row['threshold_sec']}s\n"
+                            f"`.godprotection on/off` to toggle\n"
+                            f"`.setgp action delete/mute/ban/kick`\n"
+                            f"`.setgp automute on/off`\n"
+                            f"`.setgp threshold <mentions> <seconds>`"
+                        )
+                    else:
+                        await s_edit(event,
+                            f"🛡️ **God Protection** — No config yet.\n"
+                            f"`.godprotection on` to enable with defaults."
+                        )
+                except Exception as e:
+                    await s_edit(event, f"❌ DB error: {e}")
                 return
+
+            if arg == "on":
+                try:
+                    await pg_session.execute(
+                        """INSERT INTO god_protection (uid, chat_id, action, auto_mute, mute_min, threshold_mentions, threshold_sec, enabled)
+                           VALUES ($1, $2, 'delete', TRUE, 5, 5, 10, TRUE)
+                           ON CONFLICT (uid, chat_id) DO UPDATE SET enabled = TRUE""",
+                        uid, cid
+                    )
+                    state.god_protection.add(cid)
+                    await s_edit(event, "🛡️ **God Protection: ENABLED** ✅")
+                except Exception as e:
+                    await s_edit(event, f"❌ Error: {e}")
+
+            elif arg == "off":
+                try:
+                    await pg_session.execute(
+                        "UPDATE god_protection SET enabled = FALSE WHERE uid = $1 AND chat_id = $2",
+                        uid, cid
+                    )
+                    state.god_protection.discard(cid)
+                    await s_edit(event, "🛡️ **God Protection: DISABLED** ❌")
+                except Exception as e:
+                    await s_edit(event, f"❌ Error: {e}")
+            else:
+                await s_edit(event, "❌ Usage: `.godprotection on/off` or `.godprotection` to view settings.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.setgp\b'))
+        async def cmd_setgp(event):
+            arg = get_arg(event).strip()
+            parts = arg.split()
+            if not parts:
+                await s_edit(event, "❌ Usage: `.setgp action delete/mute/ban/kick` | `.setgp automute on/off` | `.setgp threshold <mentions> <sec>`")
+                return
+
+            cid = event.chat_id
+            uid = me.id
+            sub = parts[0].lower()
+
             try:
-                reply_msg = await event.get_reply_message()
-                if not reply_msg:
-                    await s_edit(event, "❌ Could not fetch replied message.")
-                    return
-                from_id = reply_msg.id
-                cid = event.chat_id
-                await s_edit(event, f"🗑️ Deleting all messages from ID {from_id} onwards...")
-                deleted_total = 0
-                batch_size = 100
-                while True:
-                    ids_to_delete = []
-                    async for msg in user_bot.iter_messages(cid, min_id=from_id - 1, reverse=True, limit=batch_size):
-                        if msg.id >= from_id:
-                            ids_to_delete.append(msg.id)
-                    if not ids_to_delete:
-                        break
+                if sub == "action" and len(parts) >= 2 and parts[1].lower() in ("delete", "mute", "ban", "kick"):
+                    await pg_session.execute(
+                        "UPDATE god_protection SET action = $1 WHERE uid = $2 AND chat_id = $3",
+                        parts[1].lower(), uid, cid
+                    )
+                    await s_edit(event, f"✅ GP action set to `{parts[1].lower()}`")
+
+                elif sub == "automute" and len(parts) >= 2:
+                    val = parts[1].lower() == "on"
+                    await pg_session.execute(
+                        "UPDATE god_protection SET auto_mute = $1 WHERE uid = $2 AND chat_id = $3",
+                        val, uid, cid
+                    )
+                    await s_edit(event, f"✅ GP auto-mute set to `{val}`")
+
+                elif sub == "threshold" and len(parts) >= 3:
                     try:
-                        await user_bot.delete_messages(cid, ids_to_delete, revoke=True)
-                        deleted_total += len(ids_to_delete)
-                        from_id = max(ids_to_delete) + 1
-                    except FloodWaitError as e:
-                        await asyncio.sleep(e.seconds + 1)
-                        continue
-                    except Exception as e:
-                        print(f"[dltall] batch error: {e}")
-                        break
-                    await asyncio.sleep(0.5)
-                    if len(ids_to_delete) < batch_size:
-                        break
-                await s_edit(event, f"✅ Deleted **{deleted_total}** messages from ID {reply_msg.id} onwards.")
+                        mentions = int(parts[1])
+                        seconds = int(parts[2])
+                        await pg_session.execute(
+                            "UPDATE god_protection SET threshold_mentions = $1, threshold_sec = $2 WHERE uid = $3 AND chat_id = $4",
+                            mentions, seconds, uid, cid
+                        )
+                        await s_edit(event, f"✅ GP threshold: {mentions} mentions / {seconds}s")
+                    except ValueError:
+                        await s_edit(event, "❌ Provide numbers: `.setgp threshold 5 10`")
+
+                elif sub == "mutemin" and len(parts) >= 2:
+                    try:
+                        mins = int(parts[1])
+                        await pg_session.execute(
+                            "UPDATE god_protection SET mute_min = $1 WHERE uid = $2 AND chat_id = $3",
+                            mins, uid, cid
+                        )
+                        await s_edit(event, f"✅ GP mute duration set to {mins} min")
+                    except ValueError:
+                        await s_edit(event, "❌ Provide number: `.setgp mutemin 5`")
+                else:
+                    await s_edit(event, "❌ Invalid sub-command.")
+
             except Exception as e:
-                await s_edit(event, f"❌ Error: {str(e)[:100]}")
+                await s_edit(event, f"❌ DB error: {e}")
 
-        # ═══════════════════════════════════════════════════════════════════
-        # 11. CLEARME
-        # ═══════════════════════════════════════════════════════════════════
+        # ── Auto GP Handler (incoming messages) ──
+        @user_bot.on(events.NewMessage(incoming=True))
+        async def god_protection_auto_handler(event):
+            if not event.is_group:
+                return
+            cid = event.chat_id
+            if cid not in state.god_protection:
+                return
+            if event.sender_id in (me.id, BOT_ID):
+                return
+            if not event.text:
+                return
 
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.clearme\b'))
-        async def cmd_clearme(event):
-            await s_edit(event, "🗑️ Deleting all private chats... This may take a while.")
-            deleted_count = 0
+            uid = me.id
             try:
-                async for dialog in user_bot.iter_dialogs():
+                row = await pg_session.fetchrow(
+                    "SELECT * FROM god_protection WHERE uid = $1 AND chat_id = $2 AND enabled = TRUE",
+                    uid, cid
+                )
+                if not row:
+                    state.god_protection.discard(cid)
+                    return
+            except:
+                return
+
+            action = row["action"]
+            auto_mute = row["auto_mute"]
+            mute_min = row["mute_min"]
+            thresh_mentions = row["threshold_mentions"]
+            thresh_sec = row["threshold_sec"]
+            sid = event.sender_id
+            now = time.time()
+
+            # ── 1) Mass mention detection ──
+            mentions = re.findall(r'@\w+|@\d+', event.text)
+            if mentions:
+                if sid not in state.gp_mentions:
+                    state.gp_mentions[sid] = []
+                state.gp_mentions[sid].append(now)
+                # Clean old entries
+                state.gp_mentions[sid] = [t for t in state.gp_mentions[sid] if now - t < thresh_sec]
+                if len(state.gp_mentions[sid]) >= thresh_mentions:
                     try:
-                        if dialog.is_user and not dialog.is_group and not dialog.is_channel:
-                            await user_bot.delete_dialog(dialog.id)
-                            deleted_count += 1
-                            await asyncio.sleep(0.3)
-                    except FloodWaitError as e:
-                        await asyncio.sleep(e.seconds + 1)
+                        await event.delete()
                     except:
                         pass
-                await s_edit(event, f"✅ Deleted **{deleted_count}** private chat(s) from your account.")
-            except Exception as e:
-                await s_edit(event, f"❌ Error: {str(e)[:100]}")
+                    await _gp_take_action(cid, sid, action, auto_mute, mute_min)
+                    await s_send(cid, f"🛡️ **GP:** Mass mention detected. Action taken on `{sid}`.")
+                    state.gp_mentions[sid] = []
+
+            # ── 2) Duplicate message detection ──
+            if sid not in state.gp_duplicate:
+                state.gp_duplicate[sid] = []
+            state.gp_duplicate[sid].append((event.text.lower().strip(), now))
+            state.gp_duplicate[sid] = [(t, ts) for t, ts in state.gp_duplicate[sid] if now - ts < 30]
+            texts_in_window = [t for t, _ in state.gp_duplicate[sid]]
+            if len(texts_in_window) >= 3 and len(set(texts_in_window)) <= 1:
+                try:
+                    await event.delete()
+                except:
+                    pass
+                await _gp_take_action(cid, sid, "delete" if action != "delete" else action, auto_mute, mute_min)
+                state.gp_duplicate[sid] = []
+
+            # ── 3) Flood detection ──
+            if sid not in state.gp_flood:
+                state.gp_flood[sid] = []
+            state.gp_flood[sid].append(now)
+            state.gp_flood[sid] = [t for t in state.gp_flood[sid] if now - t < 5]
+            if len(state.gp_flood[sid]) >= 5:
+                try:
+                    await event.delete()
+                except:
+                    pass
+                await _gp_take_action(cid, sid, "mute" if action == "delete" else action, auto_mute, mute_min)
+                await s_send(cid, f"🛡️ **GP:** Flood detected. Muted `{sid}`.")
+                state.gp_flood[sid] = []
 
         # ═══════════════════════════════════════════════════════════════════
-        # 12. CLONE / REVERT
+        # 9. CLONE / UNCLONE
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.clone\b'))
         async def cmd_clone(event):
             arg = get_arg(event)
-            target_user = None
-            if event.is_reply:
-                try:
-                    r = await event.get_reply_message()
-                    if r and r.sender_id:
-                        target_user = await user_bot.get_entity(r.sender_id)
-                except:
-                    pass
-            elif arg.strip():
-                try:
-                    target_user = await user_bot.get_entity(arg.strip())
-                except:
-                    pass
-            if not target_user:
-                await s_edit(event, "❌ Reply to someone or provide username/ID.")
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.clone <username/ID>`")
                 return
             try:
-                fname = getattr(target_user, 'first_name', '') or ''
-                lname = getattr(target_user, 'last_name', '') or ''
-                full_name = f"{fname} {lname}".strip()
-                bio = ""
+                target = await user_bot.get_entity(arg.strip())
+                if not target:
+                    await s_edit(event, "❌ Target not found.")
+                    return
+                state.clone_data["name"] = f"{target.first_name or ''} {target.last_name or ''}".strip()
                 try:
-                    full_info = await user_bot(functions.users.GetFullUserRequest(target_user))
-                    bio = getattr(full_info, 'about', '') or ''
+                    if target.photo:
+                        photo = await user_bot.download_profile_photo(target.id, file=BytesIO())
+                        state.clone_data["photo"] = photo
                 except:
                     pass
-                photo_bytes = None
+                state.clone_data["bio"] = None
                 try:
-                    photos = await user_bot.get_profile_photos(target_user, limit=1)
-                    if photos:
-                        photo_bytes = await user_bot.download_file(photos[0].big_photo)
+                    full = await user_bot(functions.users.GetFullUserRequest(target.id))
+                    if full.full_user.about:
+                        state.clone_data["bio"] = full.full_user.about
                 except:
                     pass
+                # Apply
+                if state.clone_data["name"]:
+                    await user_bot(UpdateProfileRequest(first_name=state.clone_data["name"]))
+                if state.clone_data["bio"]:
+                    await user_bot(functions.account.UpdateProfileRequest(about=state.clone_data["bio"]))
+                if state.clone_data["photo"]:
+                    try:
+                        state.clone_data["photo"].seek(0)
+                        await user_bot(UploadProfilePhotoRequest(file=await user_bot.upload_file(state.clone_data["photo"])))
+                    except:
+                        pass
                 state.clone_active = True
-                state.clone_data = {"name": full_name, "bio": bio, "photo": photo_bytes}
-                if full_name:
-                    await user_bot(UpdateProfileRequest(first_name=fname, last_name=lname))
-                if photo_bytes:
-                    try:
-                        file = BytesIO(photo_bytes)
-                        await user_bot(UploadProfilePhotoRequest(file=file))
-                    except:
-                        pass
-                if bio:
-                    try:
-                        await user_bot(functions.account.UpdateProfileRequest(about=bio))
-                    except:
-                        pass
-                await s_edit(event, f"✅ Cloned **{full_name}**")
+                await s_edit(event, f"✅ Cloned {arg.strip()}")
             except Exception as e:
                 await s_edit(event, f"❌ Clone failed: {e}")
 
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.revert\b'))
-        async def cmd_revert(event):
-            if not state.clone_active:
-                await s_edit(event, "❌ No clone active.")
-                return
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.unclone\b'))
+        async def cmd_unclone(event):
             state.clone_active = False
-            try:
-                me_self = await user_bot.get_me()
-                await user_bot(UpdateProfileRequest(first_name=f"Zyrex User {me_self.id}", last_name=""))
+            state.clone_data = {"name": None, "bio": None, "photo": None}
+            await s_edit(event, "✅ Uncloned — profile reverted.")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 10. AUTO-REACT
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.autoreact\b'))
+        async def cmd_autoreact(event):
+            arg = get_arg(event).strip()
+            if not arg:
+                await s_edit(event, "❌ Usage: `.autoreact 🔥` or `.autoreact off`")
+                return
+            if arg.lower() == "off":
+                state.auto_react = None
+                await s_edit(event, "✅ Auto-react OFF")
+            else:
+                state.auto_react = arg
+                await s_edit(event, f"✅ Auto-react set to {arg}")
+
+        @user_bot.on(events.NewMessage(incoming=True))
+        async def autoreact_handler(event):
+            if state.auto_react and event.is_private and event.sender_id not in (me.id, BOT_ID):
                 try:
-                    photos = await user_bot.get_profile_photos('me')
-                    if photos:
-                        await user_bot(DeletePhotosRequest(id=[
-                            InputDocument(id=p.id, access_hash=p.access_hash, file_reference=p.file_reference)
-                            for p in photos[:1]
-                        ]))
+                    await user_bot.send_reaction(event.chat_id, event.id, state.auto_react)
                 except:
                     pass
-                await s_edit(event, "✅ Reverted to original.")
-            except Exception as e:
-                await s_edit(event, f"❌ Revert failed: {e}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 11. AUTO-REPLY HANDLERS (reply, rr, flag, hrr, replygod)
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(incoming=True))
+        async def auto_reply_handler(event):
+            if event.sender_id in (me.id, BOT_ID):
+                return
+            if not event.text:
+                return
+            cid = event.chat_id
+            text_lower = event.text.lower()
+
+            # Reply mode
+            if cid in state.reply_on:
+                text = random.choice(reply_texts)
+                try:
+                    await event.reply(text)
+                except:
+                    pass
+
+            # RR mode
+            if cid in state.rr_on:
+                chars = list(event.text)
+                random.shuffle(chars)
+                rr_text = "".join(chars)
+                try:
+                    await event.reply(rr_text)
+                except:
+                    pass
+
+            # Flag mode
+            if cid in state.flag_on:
+                try:
+                    await event.reply("🏳️‍🌈")
+                except:
+                    pass
+
+            # HRR (Heart Reply) mode
+            if cid in state.hrr_on:
+                heart = random.choice(hrr_texts)
+                try:
+                    await event.reply(heart)
+                except:
+                    pass
+
+            # ReplyGod mode
+            if cid in state.replygod_on:
+                txt = random.choice(replygod_texts)
+                try:
+                    await event.reply(txt)
+                except:
+                    pass
+
+            # Mute check
+            if event.sender_id in state.muted or event.sender_id in state.gmuted:
+                try:
+                    await event.delete()
+                except:
+                    pass
+
+            # Filter check
+            for kw, resp in state.filter_map.items():
+                if kw in text_lower:
+                    try:
+                        await event.reply(resp)
+                    except:
+                        pass
+                    break
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 12. ANTIDELETE + WATCH HANDLER
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.MessageDeleted())
+        async def antidel_handler(event):
+            if state.antidel_on:
+                cid = event.chat_id
+                for msg_id in event.deleted_ids:
+                    if msg_id in state.antidel_map:
+                        try:
+                            await s_send(cid, f"🗑️ **Deleted message restored:**\n{state.antidel_map[msg_id]}")
+                        except:
+                            pass
+
+        @user_bot.on(events.MessageDeleted())
+        async def watch_handler(event):
+            cid = event.chat_id
+            for msg_id in event.deleted_ids:
+                if cid in state.watch_map.values() or cid == state.watch_map.get(event.chat_id):
+                    try:
+                        # Try to find who sent it via antidel_map
+                        if msg_id in state.antidel_map:
+                            await s_send(cid, f"👁️ **Watch:** Message deleted in {cid}")
+                    except:
+                        pass
 
         # ═══════════════════════════════════════════════════════════════════
         # 13. NC (Night Core)
@@ -13860,20 +13822,6 @@ async def run_user_bot(session_string, chat_id):
                 await s_edit(event, f"✅ Filter `{kw}` removed.")
             else:
                 await s_edit(event, "❌ Filter not found.")
-
-        @user_bot.on(events.NewMessage(incoming=True))
-        async def filter_handler(event):
-            if not event.text:
-                return
-            if event.sender_id in (me.id, BOT_ID):
-                return
-            for kw, resp in state.filter_map.items():
-                if kw in event.text.lower():
-                    try:
-                        await event.reply(resp)
-                    except:
-                        pass
-                    break
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.note\b'))
         async def cmd_note(event):
@@ -14069,7 +14017,8 @@ async def run_user_bot(session_string, chat_id):
                 state.deathgod_on, state.premium_raid_tgts, state.premium_spam_tgts
             ]:
                 for k in list(d.keys()):
-                    d[k]["active"] = False
+                    if isinstance(d[k], dict):
+                        d[k]["active"] = False
             for k in list(state.spray_tasks.keys()):
                 state.spray_tasks[k]["active"] = False
             state.reply_on.clear()
@@ -14244,6 +14193,66 @@ async def run_user_bot(session_string, chat_id):
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.help\b'))
         async def cmd_help(event):
             await s_edit(event, "📖 Type `.menu` to see all menus or any `.menu1`–`.menu14`")
+            
+        # ═══════════════════════════════════════════════════════════════════
+        # 23. AUTOTAG — tag ALL group members one by one
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.autotag\b'))
+        async def cmd_autotag(event):
+            """Tag ALL group members one by one with your text.
+            Usage: .autotag good morning
+            """
+            if not event.is_group:
+                await s_edit(event, "❌ Group mein hi use kar.")
+                return
+
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.autotag <text>`\nExample: `.autotag good morning`")
+                return
+
+            tag_text = arg.strip()
+            cid = event.chat_id
+
+            # Pehle command message ko edit karo
+            await s_edit(event, "👥 Fetching group members...")
+
+            total = 0
+            failed = 0
+
+            try:
+                # Saare participants fetch karo
+                async for participant in user_bot.iter_participants(cid, aggressive=True):
+                    uid = participant.id
+
+                    # Skip khud ko aur bot ko
+                    if uid in (me.id, BOT_ID):
+                        continue
+
+                    # @username ya fallback mention banao
+                    if participant.username:
+                        mention = f"@{participant.username}"
+                    else:
+                        name = (participant.first_name or "User")
+                        mention = f"[{name}](tg://user?id={uid})"
+
+                    # Send karo — without reply, direct message
+                    try:
+                        await s_send(cid, f"{mention} {tag_text}")
+                        total += 1
+                    except:
+                        failed += 1
+
+                    # Thoda delay taki flood na lage
+                    await asyncio.sleep(state.spray_delay)
+
+                await s_edit(event, f"✅ Autotag complete!\n• Sent to: {total} members\n• Failed: {failed}\n• Text: `{tag_text}`")
+
+            except FloodWaitError as e:
+                await s_edit(event, f"❌ FloodWait: {e.seconds}s wait kar phir try kar.")
+            except Exception as e:
+                await s_edit(event, f"❌ Error: {str(e)[:100]}")    
 
         # ═══════════════════════════════════════════════════════════════════
         # READY
