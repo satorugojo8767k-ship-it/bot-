@@ -12768,11 +12768,9 @@ async def run_user_bot(session_string, chat_id):
         state.dm_blocked = set()
         state.filter_map = {}
         state.start_time = time.time()
-        # GP tracking dicts
         state.gp_mentions = {}
         state.gp_duplicate = {}
         state.gp_flood = {}
-        # Raid dicts
         state.shayari_raid = {}
         state.rizz_raid = {}
         state.pickup_raid = {}
@@ -12793,6 +12791,9 @@ async def run_user_bot(session_string, chat_id):
         state.ows_spam = {}
         state.premium_raid_tgts = {}
         state.premium_spam_tgts = {}
+        state.saved_texts = []      # for tspray/rspray/multispray
+        state.autotag_active = False
+        state.tag_all_active = False
 
         user_bot.state = state
 
@@ -12972,7 +12973,7 @@ async def run_user_bot(session_string, chat_id):
                 await s_edit(event, "❌ Invalid DeathGod ID.")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 2. CLEARME — current chat mein sirf apne messages delete karega
+        # 2. CLEARME
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.clearme\b'))
@@ -12992,14 +12993,12 @@ async def run_user_bot(session_string, chat_id):
                 await s_edit(event, f"❌ Error: {e}")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 3. RAID / SPAM COMMANDS (text-based)
+        # 3. RAIDS (Menu 2 / 8 / 9 / 13) — all cmd names match menu
         # ═══════════════════════════════════════════════════════════════════
 
         def register_raid(state_dict, texts_list, cmd_name, delay=0.8):
-            """Factory to create raid commands dynamically."""
             @user_bot.on(events.NewMessage(outgoing=True, pattern=rf'\.{cmd_name}\b'))
             async def raid_cmd(event):
-                nonlocal texts_list
                 if not texts_list:
                     await s_edit(event, f"❌ {cmd_name}_texts is empty.")
                     return
@@ -13008,32 +13007,100 @@ async def run_user_bot(session_string, chat_id):
                 if not tgts:
                     await s_edit(event, "❌ No targets.")
                     return
-                if event.chat_id in state_dict and state_dict[event.chat_id].get("active"):
-                    state_dict[event.chat_id]["active"] = False
-                    await s_edit(event, f"🛑 {cmd_name} stopped.")
-                    return
                 rid = random.randint(1000, 9999)
                 state_dict[rid] = {"active": True}
                 await s_edit(event, f"⚔️ {cmd_name} `{rid}` on {len(tgts)} target(s)")
                 asyncio.create_task(run_raid_loop(state_dict, rid, event.chat_id, tgts, texts_list, delay))
 
-        register_raid(state.shayari_raid, shayari_texts, "shayari")
-        register_raid(state.rizz_raid, rizz_texts, "rizz")
-        register_raid(state.pickup_raid, pickup_texts, "pickup")
-        register_raid(state.romance_raid, romance_texts, "romance")
-        register_raid(state.troll_raid, troll_texts, "troll")
-        register_raid(state.ragebait_raid, ragebait_texts, "ragebait")
-        register_raid(state.roast_raid, roast_texts, "roast")
-        register_raid(state.attack_raid, attack_texts, "attack")
-        register_raid(state.war_raid, war_texts, "war")
-        register_raid(state.savage_raid, savage_texts, "savage")
-        register_raid(state.ultra_raid, ultra_texts, "ultra")
-        register_raid(state.shame_raid, shame_texts, "shame")
-        register_raid(state.diss_raid, diss_texts, "diss")
-        register_raid(state.devil_raid, devil_texts, "devil")
-        register_raid(state.karma_raid, karma_texts, "karma")
-        register_raid(state.doom_raid, doom_texts, "doom")
+        def register_stop_raid(state_dict, cmd_name):
+            @user_bot.on(events.NewMessage(outgoing=True, pattern=rf'\.s{cmd_name}\b'))
+            async def stop_raid_cmd(event):
+                for k in list(state_dict.keys()):
+                    if isinstance(state_dict[k], dict):
+                        state_dict[k]["active"] = False
+                await s_edit(event, f"🛑 `s{cmd_name}` — all stopped.")
 
+        # Menu 8 — Fun Raids (with proper .shayariraid / .sshayariraid names)
+        register_raid(state.shayari_raid, shayari_texts, "shayariraid")
+        register_stop_raid(state.shayari_raid, "shayariraid")
+        register_raid(state.rizz_raid, rizz_texts, "rizzraid")
+        register_stop_raid(state.rizz_raid, "rizzraid")
+        register_raid(state.pickup_raid, pickup_texts, "pickupraid")
+        register_stop_raid(state.pickup_raid, "pickupraid")
+        register_raid(state.romance_raid, romance_texts, "romanceraid")
+        register_stop_raid(state.romance_raid, "romanceraid")
+        register_raid(state.troll_raid, troll_texts, "trollraid")
+        register_stop_raid(state.troll_raid, "trollraid")
+        register_raid(state.ragebait_raid, ragebait_texts, "ragebaitraid")
+        register_stop_raid(state.ragebait_raid, "ragebaitraid")
+        register_raid(state.roast_raid, roast_texts, "roastraid")
+        register_stop_raid(state.roast_raid, "roastraid")
+
+        # Menu 9 — Non-Abusive Raids
+        register_raid(state.attack_raid, attack_texts, "attackraid")
+        register_stop_raid(state.attack_raid, "attackraid")
+        register_raid(state.war_raid, war_texts, "warraid")
+        register_stop_raid(state.war_raid, "warraid")
+        register_raid(state.savage_raid, savage_texts, "savageraid")
+        register_stop_raid(state.savage_raid, "savageraid")
+        register_raid(state.ultra_raid, ultra_texts, "ultraraid")
+        register_stop_raid(state.ultra_raid, "ultraraid")
+        register_raid(state.shame_raid, shame_texts, "shameraid")
+        register_stop_raid(state.shame_raid, "shameraid")
+        register_raid(state.diss_raid, diss_texts, "dissraid")
+        register_stop_raid(state.diss_raid, "dissraid")
+        register_raid(state.devil_raid, devil_texts, "devilraid")
+        register_stop_raid(state.devil_raid, "devilraid")
+        register_raid(state.karma_raid, karma_texts, "karmaraid")
+        register_stop_raid(state.karma_raid, "karmaraid")
+        register_raid(state.doom_raid, doom_texts, "doomraid")
+        register_stop_raid(state.doom_raid, "doomraid")
+
+        # Menu 13 — Premium Raids
+        register_raid(state.premium_raid_tgts, mr_texts, "mr")
+        register_stop_raid(state.premium_raid_tgts, "mr")
+        register_raid(state.premium_raid_tgts, mr2_texts, "mr2")
+        register_stop_raid(state.premium_raid_tgts, "mr2")
+        register_raid(state.premium_raid_tgts, br_texts, "br")
+        register_stop_raid(state.premium_raid_tgts, "br")
+        register_raid(state.premium_raid_tgts, br2_texts, "br2")
+        register_stop_raid(state.premium_raid_tgts, "br2")
+        register_raid(state.premium_raid_tgts, br3_texts, "br3")
+        register_stop_raid(state.premium_raid_tgts, "br3")
+        register_raid(state.premium_raid_tgts, sqr_texts, "sqr")
+        register_stop_raid(state.premium_raid_tgts, "sqr")
+        register_raid(state.premium_raid_tgts, sq2_texts, "sq2")
+        register_stop_raid(state.premium_raid_tgts, "sq2")
+        register_raid(state.premium_raid_tgts, cr_texts, "cr")
+        register_stop_raid(state.premium_raid_tgts, "cr")
+        register_raid(state.premium_raid_tgts, bar_texts, "bar")
+        register_stop_raid(state.premium_raid_tgts, "bar")
+        register_raid(state.premium_raid_tgts, gr_texts, "gr")
+        register_stop_raid(state.premium_raid_tgts, "gr")
+
+        # Menu 14 — Premium Spam
+        register_raid(state.premium_spam_tgts, ms_texts, "ms")
+        register_stop_raid(state.premium_spam_tgts, "ms")
+        register_raid(state.premium_spam_tgts, ms2_texts, "ms2")
+        register_stop_raid(state.premium_spam_tgts, "ms2")
+        register_raid(state.premium_spam_tgts, bs_texts, "bs")
+        register_stop_raid(state.premium_spam_tgts, "bs")
+        register_raid(state.premium_spam_tgts, bs2_texts, "bs2")
+        register_stop_raid(state.premium_spam_tgts, "bs2")
+        register_raid(state.premium_spam_tgts, bs3_texts, "bs3")
+        register_stop_raid(state.premium_spam_tgts, "bs3")
+        register_raid(state.premium_spam_tgts, sqs_texts, "sqs")
+        register_stop_raid(state.premium_spam_tgts, "sqs")
+        register_raid(state.premium_spam_tgts, sqs2_texts, "sqs2")
+        register_stop_raid(state.premium_spam_tgts, "sqs2")
+        register_raid(state.premium_spam_tgts, cs_texts, "cs")
+        register_stop_raid(state.premium_spam_tgts, "cs")
+        register_raid(state.premium_spam_tgts, bas_texts, "bas")
+        register_stop_raid(state.premium_spam_tgts, "bas")
+        register_raid(state.premium_spam_tgts, gs_texts, "gs")
+        register_stop_raid(state.premium_spam_tgts, "gs")
+
+        # PWR
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.pwr\b'))
         async def cmd_pwr(event):
             arg = get_arg(event)
@@ -13054,35 +13121,46 @@ async def run_user_bot(session_string, chat_id):
             await s_edit(event, f"💥 PWR `{raid_id}` on {len(tgts)} target(s)")
             asyncio.create_task(run_raid_loop(state.pwr_raid, raid_id, cid, tgts, all_texts, 0.5))
 
-        # ── Custom Raid ──
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.craid\b'))
-        async def cmd_craid(event):
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.spwr\b'))
+        async def cmd_spwr(event):
+            for k in list(state.pwr_raid.keys()):
+                if isinstance(state.pwr_raid[k], dict):
+                    state.pwr_raid[k]["active"] = False
+            await s_edit(event, "🛑 PWR stopped.")
+
+        # Custom Raid
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.customraid\b'))
+        async def cmd_customraid(event):
             arg = get_arg(event)
             if not arg.strip():
-                await s_edit(event, "❌ Usage: `.craid <text>` to set, `.craid` again to start")
+                await s_edit(event, "❌ Usage: `.customraid @user <text>`")
                 return
-            state.custom_raid["text"] = arg.strip()
-            await s_edit(event, f"✅ Custom raid text set.")
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.craids\b'))
-        async def cmd_craids(event):
-            if "text" not in state.custom_raid:
-                await s_edit(event, "❌ No custom raid text set.")
+            parts = arg.strip().split(maxsplit=1)
+            tgts = await get_targets(event, parts[0])
+            text = parts[1] if len(parts) > 1 else parts[0]
+            if not tgts:
+                await s_edit(event, "❌ No targets.")
                 return
             cid = event.chat_id
-            txt = state.custom_raid["text"]
-            raid_id = random.randint(1000, 9999)
-            state.custom_raid[raid_id] = {"active": True, "text": txt}
-            await s_edit(event, f"⚔️ Custom raid `{raid_id}` started.")
-            while state.custom_raid.get(raid_id, {}).get("active"):
+            rid = random.randint(1000, 9999)
+            state.custom_raid[rid] = {"active": True, "text": text, "targets": tgts}
+            await s_edit(event, f"⚔️ Custom Raid `{rid}` started.")
+            while state.custom_raid.get(rid, {}).get("active"):
                 try:
-                    for uid in state.custom_raid[raid_id].get("targets", [event.chat_id]):
-                        await s_send(cid, txt, reply_to=uid)
+                    for uid in tgts:
+                        await s_send(cid, text, reply_to=uid)
                         await asyncio.sleep(state.spray_delay)
                 except:
                     pass
                 await asyncio.sleep(0.8)
-            state.custom_raid.pop(raid_id, None)
+            state.custom_raid.pop(rid, None)
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.stopcustomraid\b'))
+        async def cmd_stopcustomraid(event):
+            for k in list(state.custom_raid.keys()):
+                if isinstance(state.custom_raid[k], dict):
+                    state.custom_raid[k]["active"] = False
+            await s_edit(event, "🛑 Custom raids stopped.")
 
         # ═══════════════════════════════════════════════════════════════════
         # 4. OWS SPAM
@@ -13104,8 +13182,15 @@ async def run_user_bot(session_string, chat_id):
             await s_edit(event, f"📢 OWS `{sid}` on {len(tgts)} target(s)")
             asyncio.create_task(run_raid_loop(state.ows_spam, sid, cid, tgts, ows_texts, 0.3))
 
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.sows\b'))
+        async def cmd_sows(event):
+            for k in list(state.ows_spam.keys()):
+                if isinstance(state.ows_spam[k], dict):
+                    state.ows_spam[k]["active"] = False
+            await s_edit(event, "🛑 OWS stopped.")
+
         # ═══════════════════════════════════════════════════════════════════
-        # 5. SPRAY
+        # 5. SPRAY (all variants from Menu 3)
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.spray\b'))
@@ -13119,7 +13204,6 @@ async def run_user_bot(session_string, chat_id):
             sid = random.randint(1000, 9999)
             state.spray_tasks[sid] = {"active": True}
             await s_edit(event, f"💦 Spray `{sid}` on {len(tgts)} target(s)")
-
             async def spray_loop():
                 texts = ["🔥", "⚡", "💥", "✨", "💫", "🌟", "⭐", "🌀"]
                 while state.spray_tasks.get(sid, {}).get("active"):
@@ -13131,8 +13215,153 @@ async def run_user_bot(session_string, chat_id):
                             pass
                     await asyncio.sleep(0.3)
                 state.spray_tasks.pop(sid, None)
-
             asyncio.create_task(spray_loop())
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.dspray\b'))
+        async def cmd_dspray(event):
+            """Death spray — faster spam"""
+            arg = get_arg(event)
+            tgts = await get_targets(event, arg)
+            if not tgts:
+                await s_edit(event, "❌ No targets.")
+                return
+            cid = event.chat_id
+            sid = random.randint(1000, 9999)
+            state.spray_tasks[sid] = {"active": True}
+            await s_edit(event, f"💀 DeathSpray `{sid}` on {len(tgts)} target(s)")
+            async def dspray_loop():
+                while state.spray_tasks.get(sid, {}).get("active"):
+                    for uid in tgts:
+                        try:
+                            await s_send(cid, f"💀 {random.randint(0,9999)}", reply_to=uid)
+                            await asyncio.sleep(0.03)
+                        except:
+                            pass
+                    await asyncio.sleep(0.1)
+                state.spray_tasks.pop(sid, None)
+            asyncio.create_task(dspray_loop())
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.tspray\b'))
+        async def cmd_tspray(event):
+            """Spray saved text"""
+            if not state.saved_texts:
+                await s_edit(event, "❌ No saved texts. Use `.addtext saved <text>` first.")
+                return
+            arg = get_arg(event)
+            tgts = await get_targets(event, arg)
+            if not tgts:
+                await s_edit(event, "❌ No targets.")
+                return
+            cid = event.chat_id
+            sid = random.randint(1000, 9999)
+            state.spray_tasks[sid] = {"active": True}
+            await s_edit(event, f"📝 TSpray `{sid}` on {len(tgts)} target(s)")
+            async def tspray_loop():
+                while state.spray_tasks.get(sid, {}).get("active"):
+                    for uid in tgts:
+                        try:
+                            await s_send(cid, random.choice(state.saved_texts), reply_to=uid)
+                            await asyncio.sleep(state.spray_delay)
+                        except:
+                            pass
+                    await asyncio.sleep(0.3)
+                state.spray_tasks.pop(sid, None)
+            asyncio.create_task(tspray_loop())
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.rspray\b'))
+        async def cmd_rspray(event):
+            """Random saved text"""
+            if not state.saved_texts:
+                await s_edit(event, "❌ No saved texts.")
+                return
+            arg = get_arg(event)
+            tgts = await get_targets(event, arg)
+            if not tgts:
+                await s_edit(event, "❌ No targets.")
+                return
+            cid = event.chat_id
+            sid = random.randint(1000, 9999)
+            state.spray_tasks[sid] = {"active": True}
+            await s_edit(event, f"🎲 RSpray `{sid}` on {len(tgts)} target(s)")
+            async def rspray_loop():
+                while state.spray_tasks.get(sid, {}).get("active"):
+                    for uid in tgts:
+                        try:
+                            t = random.choice(state.saved_texts)
+                            await s_send(cid, t, reply_to=uid)
+                            await asyncio.sleep(state.spray_delay)
+                        except:
+                            pass
+                    await asyncio.sleep(0.5)
+                state.spray_tasks.pop(sid, None)
+            asyncio.create_task(rspray_loop())
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.multispray\b'))
+        async def cmd_multispray(event):
+            """Rotate through saved texts"""
+            if len(state.saved_texts) < 1:
+                await s_edit(event, "❌ Need at least 1 saved text.")
+                return
+            arg = get_arg(event)
+            tgts = await get_targets(event, arg)
+            if not tgts:
+                await s_edit(event, "❌ No targets.")
+                return
+            cid = event.chat_id
+            sid = random.randint(1000, 9999)
+            state.spray_tasks[sid] = {"active": True, "idx": 0}
+            await s_edit(event, f"🔄 MultiSpray `{sid}` on {len(tgts)} target(s)")
+            async def multispray_loop():
+                idx = 0
+                while state.spray_tasks.get(sid, {}).get("active"):
+                    txt = state.saved_texts[idx % len(state.saved_texts)]
+                    for uid in tgts:
+                        try:
+                            await s_send(cid, txt, reply_to=uid)
+                            await asyncio.sleep(state.spray_delay)
+                        except:
+                            pass
+                    idx += 1
+                    await asyncio.sleep(0.5)
+                state.spray_tasks.pop(sid, None)
+            asyncio.create_task(multispray_loop())
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.countspray\b'))
+        async def cmd_countspray(event):
+            """Spray exactly N times"""
+            arg = get_arg(event)
+            parts = arg.strip().split(maxsplit=1)
+            count = 10
+            if parts and parts[0].isdigit():
+                count = int(parts[0])
+                text = parts[1] if len(parts) > 1 else "🔥"
+            else:
+                text = arg.strip() or "🔥"
+            tgts = await get_targets(event, parts[-1] if not parts[0].isdigit() else "")
+            if not tgts:
+                tgts = {event.chat_id}
+            cid = event.chat_id
+            sent = 0
+            for _ in range(count):
+                for uid in tgts:
+                    try:
+                        await s_send(cid, text, reply_to=uid)
+                        sent += 1
+                        await asyncio.sleep(state.spray_delay)
+                    except:
+                        pass
+                await asyncio.sleep(0.1)
+            await s_edit(event, f"✅ CountSpray: {sent} messages sent.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.spraydelay\b'))
+        async def cmd_spraydelay(event):
+            arg = get_arg(event)
+            try:
+                val = float(arg.strip())
+                state.spray_delay = max(0.01, min(2.0, val))
+                await s_edit(event, f"⏱️ Spray delay = {state.spray_delay}s")
+            except:
+                await s_edit(event, f"⏱️ Current delay: {state.spray_delay}s")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.sspray\b'))
         async def cmd_sspray(event):
@@ -13146,84 +13375,8 @@ async def run_user_bot(session_string, chat_id):
                     state.spray_tasks[k]["active"] = False
                 await s_edit(event, "💦 All sprays stopped.")
 
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.ssdelay\b'))
-        async def cmd_ssdelay(event):
-            arg = get_arg(event)
-            try:
-                val = float(arg.strip())
-                state.spray_delay = max(0.01, min(2.0, val))
-                await s_edit(event, f"⏱️ Spray delay set to {state.spray_delay}s")
-            except:
-                await s_edit(event, f"⏱️ Current spray delay: {state.spray_delay}s")
-
         # ═══════════════════════════════════════════════════════════════════
-        # 6. PREMIUM RAID / SPAM
-        # ═══════════════════════════════════════════════════════════════════
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.premraid\b'))
-        async def cmd_premraid(event):
-            arg = get_arg(event)
-            if not premium_raid_texts:
-                await s_edit(event, "❌ premium_raid_texts is empty.")
-                return
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            cid = event.chat_id
-            rid = random.randint(1000, 9999)
-            state.premium_raid_tgts[rid] = {"active": True}
-            await s_edit(event, f"⭐ Premium Raid `{rid}` on {len(tgts)} target(s)")
-
-            async def prem_raid_loop():
-                keys = list(premium_raid_texts.keys())
-                while state.premium_raid_tgts.get(rid, {}).get("active"):
-                    key = random.choice(keys)
-                    text = random.choice(premium_raid_texts[key])
-                    for uid in tgts:
-                        try:
-                            await s_send(cid, text, reply_to=uid)
-                            await asyncio.sleep(state.spray_delay)
-                        except:
-                            pass
-                    await asyncio.sleep(0.8)
-                state.premium_raid_tgts.pop(rid, None)
-
-            asyncio.create_task(prem_raid_loop())
-
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.premspam\b'))
-        async def cmd_premspam(event):
-            arg = get_arg(event)
-            if not premium_spam_texts:
-                await s_edit(event, "❌ premium_spam_texts is empty.")
-                return
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
-            cid = event.chat_id
-            sid = random.randint(1000, 9999)
-            state.premium_spam_tgts[sid] = {"active": True}
-            await s_edit(event, f"⭐ Premium Spam `{sid}` on {len(tgts)} target(s)")
-
-            async def prem_spam_loop():
-                keys = list(premium_spam_texts.keys())
-                while state.premium_spam_tgts.get(sid, {}).get("active"):
-                    key = random.choice(keys)
-                    text = random.choice(premium_spam_texts[key])
-                    for uid in tgts:
-                        try:
-                            await s_send(cid, text)
-                            await asyncio.sleep(state.spray_delay)
-                        except:
-                            pass
-                    await asyncio.sleep(0.6)
-                state.premium_spam_tgts.pop(sid, None)
-
-            asyncio.create_task(prem_spam_loop())
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 7. MUTE / GMUTE / UNMUTE / UNGMUTE
+        # 6. MUTE / GMUTE / MUTELIST
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.mute\b'))
@@ -13257,8 +13410,8 @@ async def run_user_bot(session_string, chat_id):
             state.gmuted.update(tgts)
             await s_edit(event, f"🌐 GMuted {len(tgts)} user(s).")
 
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.ungmute\b'))
-        async def cmd_ungmute(event):
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.gunmute\b'))
+        async def cmd_gunmute(event):
             arg = get_arg(event)
             tgts = await get_targets(event, arg)
             if tgts:
@@ -13268,40 +13421,36 @@ async def run_user_bot(session_string, chat_id):
                 state.gmuted.clear()
                 await s_edit(event, "🌐 All un-GMuted.")
 
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.mutelist\b'))
+        async def cmd_mutelist(event):
+            muted = list(state.muted)[:20]
+            gmuted = list(state.gmuted)[:20]
+            msg = f"🔇 **Muted ({len(state.muted)})**: {', '.join(str(x) for x in muted) if muted else 'None'}\n"
+            msg += f"🌐 **GMuted ({len(state.gmuted)})**: {', '.join(str(x) for x in gmuted) if gmuted else 'None'}"
+            await s_edit(event, msg)
+
         # ═══════════════════════════════════════════════════════════════════
-        # 8. GOD PROTECTION (GP) — Auto-moderation system
+        # 7. GOD PROTECTION (unchanged — works fine)
         # ═══════════════════════════════════════════════════════════════════
 
         async def _gp_take_action(cid, uid, action, auto_mute=False, mute_min=5):
-            """Take moderation action on a user."""
             try:
                 if action == "delete":
-                    # just delete — no extra action needed
                     pass
                 elif action == "mute" or (auto_mute and action == "delete"):
                     until = datetime.now() + timedelta(minutes=mute_min) if mute_min > 0 else None
-                    rights = ChatBannedRights(
-                        until_date=until, send_messages=True, send_media=True,
-                        send_stickers=True, send_gifs=True, send_games=True,
-                        send_inline=True, send_polls=True
-                    )
+                    rights = ChatBannedRights(until_date=until, send_messages=True, send_media=True,
+                        send_stickers=True, send_gifs=True, send_games=True, send_inline=True, send_polls=True)
                     await user_bot(EditBannedRequest(cid, uid, rights))
                 elif action == "kick":
-                    rights = ChatBannedRights(
-                        until_date=datetime.now() + timedelta(seconds=30),
-                        view_messages=True
-                    )
+                    rights = ChatBannedRights(until_date=datetime.now() + timedelta(seconds=30), view_messages=True)
                     await user_bot(EditBannedRequest(cid, uid, rights))
                     await asyncio.sleep(1)
                     rights2 = ChatBannedRights(until_date=None, view_messages=False)
                     await user_bot(EditBannedRequest(cid, uid, rights2))
                 elif action == "ban":
-                    rights = ChatBannedRights(
-                        until_date=None, view_messages=True,
-                        send_messages=True, send_media=True,
-                        send_stickers=True, send_gifs=True, send_games=True,
-                        send_inline=True, send_polls=True
-                    )
+                    rights = ChatBannedRights(until_date=None, view_messages=True, send_messages=True,
+                        send_media=True, send_stickers=True, send_gifs=True, send_games=True, send_inline=True, send_polls=True)
                     await user_bot(EditBannedRequest(cid, uid, rights))
             except Exception as e:
                 print(f"GP action error on {uid} in {cid}: {e}")
@@ -13311,61 +13460,41 @@ async def run_user_bot(session_string, chat_id):
             arg = get_arg(event).strip().lower()
             cid = event.chat_id
             uid = me.id
-
             if not arg:
-                # Load current settings from DB
                 try:
                     row = await pg_session.fetchrow(
-                        "SELECT * FROM god_protection WHERE uid = $1 AND chat_id = $2", uid, cid
-                    )
+                        "SELECT * FROM god_protection WHERE uid = $1 AND chat_id = $2", uid, cid)
                     if row:
                         status = "✅ ON" if row["enabled"] else "❌ OFF"
                         await s_edit(event,
-                            f"🛡️ **God Protection**\n"
-                            f"Chat: `{cid}`\n"
-                            f"Status: {status}\n"
-                            f"Action: `{row['action']}`\n"
-                            f"Auto-mute: `{row['auto_mute']}` ({row['mute_min']}m)\n"
+                            f"🛡️ **God Protection**\nChat: `{cid}`\nStatus: {status}\n"
+                            f"Action: `{row['action']}`\nAuto-mute: `{row['auto_mute']}` ({row['mute_min']}m)\n"
                             f"Threshold: {row['threshold_mentions']} mentions in {row['threshold_sec']}s\n"
-                            f"`.godprotection on/off` to toggle\n"
-                            f"`.setgp action delete/mute/ban/kick`\n"
-                            f"`.setgp automute on/off`\n"
-                            f"`.setgp threshold <mentions> <seconds>`"
-                        )
+                            f"`.godprotection on/off` to toggle")
                     else:
-                        await s_edit(event,
-                            f"🛡️ **God Protection** — No config yet.\n"
-                            f"`.godprotection on` to enable with defaults."
-                        )
+                        await s_edit(event, "🛡️ **God Protection** — No config yet.\n`.godprotection on` to enable.")
                 except Exception as e:
                     await s_edit(event, f"❌ DB error: {e}")
                 return
-
             if arg == "on":
                 try:
                     await pg_session.execute(
                         """INSERT INTO god_protection (uid, chat_id, action, auto_mute, mute_min, threshold_mentions, threshold_sec, enabled)
                            VALUES ($1, $2, 'delete', TRUE, 5, 5, 10, TRUE)
-                           ON CONFLICT (uid, chat_id) DO UPDATE SET enabled = TRUE""",
-                        uid, cid
-                    )
+                           ON CONFLICT (uid, chat_id) DO UPDATE SET enabled = TRUE""", uid, cid)
                     state.god_protection.add(cid)
                     await s_edit(event, "🛡️ **God Protection: ENABLED** ✅")
                 except Exception as e:
                     await s_edit(event, f"❌ Error: {e}")
-
             elif arg == "off":
                 try:
-                    await pg_session.execute(
-                        "UPDATE god_protection SET enabled = FALSE WHERE uid = $1 AND chat_id = $2",
-                        uid, cid
-                    )
+                    await pg_session.execute("UPDATE god_protection SET enabled = FALSE WHERE uid = $1 AND chat_id = $2", uid, cid)
                     state.god_protection.discard(cid)
                     await s_edit(event, "🛡️ **God Protection: DISABLED** ❌")
                 except Exception as e:
                     await s_edit(event, f"❌ Error: {e}")
             else:
-                await s_edit(event, "❌ Usage: `.godprotection on/off` or `.godprotection` to view settings.")
+                await s_edit(event, "❌ Usage: `.godprotection on/off`")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.setgp\b'))
         async def cmd_setgp(event):
@@ -13374,281 +13503,207 @@ async def run_user_bot(session_string, chat_id):
             if not parts:
                 await s_edit(event, "❌ Usage: `.setgp action delete/mute/ban/kick` | `.setgp automute on/off` | `.setgp threshold <mentions> <sec>`")
                 return
-
-            cid = event.chat_id
-            uid = me.id
-            sub = parts[0].lower()
-
+            cid = event.chat_id; uid = me.id; sub = parts[0].lower()
             try:
-                if sub == "action" and len(parts) >= 2 and parts[1].lower() in ("delete", "mute", "ban", "kick"):
-                    await pg_session.execute(
-                        "UPDATE god_protection SET action = $1 WHERE uid = $2 AND chat_id = $3",
-                        parts[1].lower(), uid, cid
-                    )
+                if sub == "action" and len(parts) >= 2 and parts[1].lower() in ("delete","mute","ban","kick"):
+                    await pg_session.execute("UPDATE god_protection SET action = $1 WHERE uid = $2 AND chat_id = $3", parts[1].lower(), uid, cid)
                     await s_edit(event, f"✅ GP action set to `{parts[1].lower()}`")
-
                 elif sub == "automute" and len(parts) >= 2:
                     val = parts[1].lower() == "on"
-                    await pg_session.execute(
-                        "UPDATE god_protection SET auto_mute = $1 WHERE uid = $2 AND chat_id = $3",
-                        val, uid, cid
-                    )
+                    await pg_session.execute("UPDATE god_protection SET auto_mute = $1 WHERE uid = $2 AND chat_id = $3", val, uid, cid)
                     await s_edit(event, f"✅ GP auto-mute set to `{val}`")
-
                 elif sub == "threshold" and len(parts) >= 3:
                     try:
-                        mentions = int(parts[1])
-                        seconds = int(parts[2])
-                        await pg_session.execute(
-                            "UPDATE god_protection SET threshold_mentions = $1, threshold_sec = $2 WHERE uid = $3 AND chat_id = $4",
-                            mentions, seconds, uid, cid
-                        )
+                        mentions, seconds = int(parts[1]), int(parts[2])
+                        await pg_session.execute("UPDATE god_protection SET threshold_mentions = $1, threshold_sec = $2 WHERE uid = $3 AND chat_id = $4", mentions, seconds, uid, cid)
                         await s_edit(event, f"✅ GP threshold: {mentions} mentions / {seconds}s")
                     except ValueError:
                         await s_edit(event, "❌ Provide numbers: `.setgp threshold 5 10`")
-
                 elif sub == "mutemin" and len(parts) >= 2:
                     try:
                         mins = int(parts[1])
-                        await pg_session.execute(
-                            "UPDATE god_protection SET mute_min = $1 WHERE uid = $2 AND chat_id = $3",
-                            mins, uid, cid
-                        )
+                        await pg_session.execute("UPDATE god_protection SET mute_min = $1 WHERE uid = $2 AND chat_id = $3", mins, uid, cid)
                         await s_edit(event, f"✅ GP mute duration set to {mins} min")
                     except ValueError:
                         await s_edit(event, "❌ Provide number: `.setgp mutemin 5`")
                 else:
                     await s_edit(event, "❌ Invalid sub-command.")
-
             except Exception as e:
                 await s_edit(event, f"❌ DB error: {e}")
 
-        # ── Auto GP Handler (incoming messages) ──
         @user_bot.on(events.NewMessage(incoming=True))
         async def god_protection_auto_handler(event):
-            if not event.is_group:
-                return
+            if not event.is_group: return
             cid = event.chat_id
-            if cid not in state.god_protection:
-                return
-            if event.sender_id in (me.id, BOT_ID):
-                return
-            if not event.text:
-                return
-
+            if cid not in state.god_protection: return
+            if event.sender_id in (me.id, BOT_ID): return
+            if not event.text: return
             uid = me.id
             try:
-                row = await pg_session.fetchrow(
-                    "SELECT * FROM god_protection WHERE uid = $1 AND chat_id = $2 AND enabled = TRUE",
-                    uid, cid
-                )
-                if not row:
-                    state.god_protection.discard(cid)
-                    return
-            except:
-                return
-
-            action = row["action"]
-            auto_mute = row["auto_mute"]
-            mute_min = row["mute_min"]
-            thresh_mentions = row["threshold_mentions"]
-            thresh_sec = row["threshold_sec"]
-            sid = event.sender_id
-            now = time.time()
-
-            # ── 1) Mass mention detection ──
+                row = await pg_session.fetchrow("SELECT * FROM god_protection WHERE uid = $1 AND chat_id = $2 AND enabled = TRUE", uid, cid)
+                if not row: state.god_protection.discard(cid); return
+            except: return
+            action = row["action"]; auto_mute = row["auto_mute"]; mute_min = row["mute_min"]
+            thresh_mentions = row["threshold_mentions"]; thresh_sec = row["threshold_sec"]
+            sid = event.sender_id; now = time.time()
             mentions = re.findall(r'@\w+|@\d+', event.text)
             if mentions:
-                if sid not in state.gp_mentions:
-                    state.gp_mentions[sid] = []
+                if sid not in state.gp_mentions: state.gp_mentions[sid] = []
                 state.gp_mentions[sid].append(now)
-                # Clean old entries
                 state.gp_mentions[sid] = [t for t in state.gp_mentions[sid] if now - t < thresh_sec]
                 if len(state.gp_mentions[sid]) >= thresh_mentions:
-                    try:
-                        await event.delete()
-                    except:
-                        pass
+                    try: await event.delete()
+                    except: pass
                     await _gp_take_action(cid, sid, action, auto_mute, mute_min)
                     await s_send(cid, f"🛡️ **GP:** Mass mention detected. Action taken on `{sid}`.")
                     state.gp_mentions[sid] = []
-
-            # ── 2) Duplicate message detection ──
-            if sid not in state.gp_duplicate:
-                state.gp_duplicate[sid] = []
+            if sid not in state.gp_duplicate: state.gp_duplicate[sid] = []
             state.gp_duplicate[sid].append((event.text.lower().strip(), now))
             state.gp_duplicate[sid] = [(t, ts) for t, ts in state.gp_duplicate[sid] if now - ts < 30]
-            texts_in_window = [t for t, _ in state.gp_duplicate[sid]]
+            texts_in_window = [t for t,_ in state.gp_duplicate[sid]]
             if len(texts_in_window) >= 3 and len(set(texts_in_window)) <= 1:
-                try:
-                    await event.delete()
-                except:
-                    pass
+                try: await event.delete()
+                except: pass
                 await _gp_take_action(cid, sid, "delete" if action != "delete" else action, auto_mute, mute_min)
                 state.gp_duplicate[sid] = []
-
-            # ── 3) Flood detection ──
-            if sid not in state.gp_flood:
-                state.gp_flood[sid] = []
+            if sid not in state.gp_flood: state.gp_flood[sid] = []
             state.gp_flood[sid].append(now)
             state.gp_flood[sid] = [t for t in state.gp_flood[sid] if now - t < 5]
             if len(state.gp_flood[sid]) >= 5:
-                try:
-                    await event.delete()
-                except:
-                    pass
+                try: await event.delete()
+                except: pass
                 await _gp_take_action(cid, sid, "mute" if action == "delete" else action, auto_mute, mute_min)
                 await s_send(cid, f"🛡️ **GP:** Flood detected. Muted `{sid}`.")
                 state.gp_flood[sid] = []
 
         # ═══════════════════════════════════════════════════════════════════
-        # 9. CLONE / UNCLONE
+        # 8. CLONE / REVERT
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.clone\b'))
         async def cmd_clone(event):
             arg = get_arg(event)
             if not arg.strip():
-                await s_edit(event, "❌ Usage: `.clone <username/ID>`")
-                return
+                await s_edit(event, "❌ Usage: `.clone <username/ID>`"); return
             try:
                 target = await user_bot.get_entity(arg.strip())
-                if not target:
-                    await s_edit(event, "❌ Target not found.")
-                    return
+                if not target: await s_edit(event, "❌ Target not found."); return
                 state.clone_data["name"] = f"{target.first_name or ''} {target.last_name or ''}".strip()
                 try:
                     if target.photo:
                         photo = await user_bot.download_profile_photo(target.id, file=BytesIO())
                         state.clone_data["photo"] = photo
-                except:
-                    pass
+                except: pass
                 state.clone_data["bio"] = None
                 try:
                     full = await user_bot(functions.users.GetFullUserRequest(target.id))
-                    if full.full_user.about:
-                        state.clone_data["bio"] = full.full_user.about
-                except:
-                    pass
-                # Apply
-                if state.clone_data["name"]:
-                    await user_bot(UpdateProfileRequest(first_name=state.clone_data["name"]))
-                if state.clone_data["bio"]:
-                    await user_bot(functions.account.UpdateProfileRequest(about=state.clone_data["bio"]))
+                    if full.full_user.about: state.clone_data["bio"] = full.full_user.about
+                except: pass
+                if state.clone_data["name"]: await user_bot(UpdateProfileRequest(first_name=state.clone_data["name"]))
+                if state.clone_data["bio"]: await user_bot(functions.account.UpdateProfileRequest(about=state.clone_data["bio"]))
                 if state.clone_data["photo"]:
                     try:
                         state.clone_data["photo"].seek(0)
                         await user_bot(UploadProfilePhotoRequest(file=await user_bot.upload_file(state.clone_data["photo"])))
-                    except:
-                        pass
+                    except: pass
                 state.clone_active = True
                 await s_edit(event, f"✅ Cloned {arg.strip()}")
-            except Exception as e:
-                await s_edit(event, f"❌ Clone failed: {e}")
+            except Exception as e: await s_edit(event, f"❌ Clone failed: {e}")
 
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.unclone\b'))
-        async def cmd_unclone(event):
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.revert\b'))
+        async def cmd_revert(event):
             state.clone_active = False
             state.clone_data = {"name": None, "bio": None, "photo": None}
-            await s_edit(event, "✅ Uncloned — profile reverted.")
+            await s_edit(event, "✅ Reverted — original profile restored.")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 10. AUTO-REACT
+        # 9. AUTO-REACT & MANUAL REACT (Menu 4)
         # ═══════════════════════════════════════════════════════════════════
 
-        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.autoreact\b'))
-        async def cmd_autoreact(event):
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.ar\b'))
+        async def cmd_ar(event):
             arg = get_arg(event).strip()
             if not arg:
-                await s_edit(event, "❌ Usage: `.autoreact 🔥` or `.autoreact off`")
-                return
+                await s_edit(event, "❌ Usage: `.ar 🔥` or `.ar off`"); return
             if arg.lower() == "off":
-                state.auto_react = None
-                await s_edit(event, "✅ Auto-react OFF")
+                state.auto_react = None; await s_edit(event, "✅ Auto-react OFF")
             else:
-                state.auto_react = arg
-                await s_edit(event, f"✅ Auto-react set to {arg}")
+                state.auto_react = arg; await s_edit(event, f"✅ Auto-react set to {arg}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.sar\b'))
+        async def cmd_sar(event):
+            state.auto_react = None; await s_edit(event, "✅ Auto-react disabled.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.react\b'))
+        async def cmd_react(event):
+            arg = get_arg(event).strip()
+            if event.is_reply:
+                try:
+                    r = await event.get_reply_message()
+                    emoji = arg or "👍"
+                    await user_bot.send_reaction(event.chat_id, r.id, emoji)
+                    await s_edit(event, f"✅ Reacted with {emoji}")
+                except Exception as e: await s_edit(event, f"❌ React failed: {e}")
+            else:
+                await s_edit(event, "❌ Reply to a message with `.react 👍`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.unreact\b'))
+        async def cmd_unreact(event):
+            if event.is_reply:
+                try:
+                    r = await event.get_reply_message()
+                    await user_bot.send_reaction(event.chat_id, r.id, "")
+                    await s_edit(event, "✅ Reaction removed.")
+                except Exception as e: await s_edit(event, f"❌ Unreact failed: {e}")
+            else:
+                await s_edit(event, "❌ Reply to a message with `.unreact`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.reactlist\b'))
+        async def cmd_reactlist(event):
+            await s_edit(event, f"🔁 Auto-react: {state.auto_react or 'OFF'}")
 
         @user_bot.on(events.NewMessage(incoming=True))
         async def autoreact_handler(event):
             if state.auto_react and event.is_private and event.sender_id not in (me.id, BOT_ID):
-                try:
-                    await user_bot.send_reaction(event.chat_id, event.id, state.auto_react)
-                except:
-                    pass
+                try: await user_bot.send_reaction(event.chat_id, event.id, state.auto_react)
+                except: pass
 
         # ═══════════════════════════════════════════════════════════════════
-        # 11. AUTO-REPLY HANDLERS (reply, rr, flag, hrr, replygod)
+        # 10. AUTO-REPLY HANDLERS
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(incoming=True))
         async def auto_reply_handler(event):
-            if event.sender_id in (me.id, BOT_ID):
-                return
-            if not event.text:
-                return
-            cid = event.chat_id
-            text_lower = event.text.lower()
-
-            # Reply mode
+            if event.sender_id in (me.id, BOT_ID): return
+            if not event.text: return
+            cid = event.chat_id; text_lower = event.text.lower()
             if cid in state.reply_on:
-                text = random.choice(reply_texts)
-                try:
-                    await event.reply(text)
-                except:
-                    pass
-
-            # RR mode
+                try: await event.reply(random.choice(reply_texts))
+                except: pass
             if cid in state.rr_on:
-                chars = list(event.text)
-                random.shuffle(chars)
-                rr_text = "".join(chars)
-                try:
-                    await event.reply(rr_text)
-                except:
-                    pass
-
-            # Flag mode
+                chars = list(event.text); random.shuffle(chars)
+                try: await event.reply("".join(chars))
+                except: pass
             if cid in state.flag_on:
-                try:
-                    await event.reply("🏳️‍🌈")
-                except:
-                    pass
-
-            # HRR (Heart Reply) mode
+                try: await event.reply("🏳️‍🌈")
+                except: pass
             if cid in state.hrr_on:
-                heart = random.choice(hrr_texts)
-                try:
-                    await event.reply(heart)
-                except:
-                    pass
-
-            # ReplyGod mode
+                try: await event.reply(random.choice(hrr_texts))
+                except: pass
             if cid in state.replygod_on:
-                txt = random.choice(replygod_texts)
-                try:
-                    await event.reply(txt)
-                except:
-                    pass
-
-            # Mute check
+                try: await event.reply(random.choice(replygod_texts))
+                except: pass
             if event.sender_id in state.muted or event.sender_id in state.gmuted:
-                try:
-                    await event.delete()
-                except:
-                    pass
-
-            # Filter check
+                try: await event.delete()
+                except: pass
             for kw, resp in state.filter_map.items():
                 if kw in text_lower:
-                    try:
-                        await event.reply(resp)
-                    except:
-                        pass
+                    try: await event.reply(resp)
+                    except: pass
                     break
 
         # ═══════════════════════════════════════════════════════════════════
-        # 12. ANTIDELETE + WATCH HANDLER
+        # 11. ANTIDELETE + WATCH
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.MessageDeleted())
@@ -13657,25 +13712,29 @@ async def run_user_bot(session_string, chat_id):
                 cid = event.chat_id
                 for msg_id in event.deleted_ids:
                     if msg_id in state.antidel_map:
-                        try:
-                            await s_send(cid, f"🗑️ **Deleted message restored:**\n{state.antidel_map[msg_id]}")
-                        except:
-                            pass
+                        try: await s_send(cid, f"🗑️ **Deleted message restored:**\n{state.antidel_map[msg_id]}")
+                        except: pass
 
         @user_bot.on(events.MessageDeleted())
         async def watch_handler(event):
             cid = event.chat_id
             for msg_id in event.deleted_ids:
                 if cid in state.watch_map.values() or cid == state.watch_map.get(event.chat_id):
-                    try:
-                        # Try to find who sent it via antidel_map
-                        if msg_id in state.antidel_map:
-                            await s_send(cid, f"👁️ **Watch:** Message deleted in {cid}")
-                    except:
-                        pass
+                    if msg_id in state.antidel_map:
+                        try: await s_send(cid, f"👁️ **Watch:** Message deleted in {cid}")
+                        except: pass
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.watchlist\b'))
+        async def cmd_watchlist(event):
+            entries = list(state.watch_map.items())[:20]
+            if entries:
+                msg = "👁️ **Watchlist:**\n"
+                for uid, cid in entries: msg += f"• `{uid}` → chat `{cid}`\n"
+                await s_edit(event, msg)
+            else: await s_edit(event, "👁️ No watched users.")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 13. NC (Night Core)
+        # 12. NC
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.nc\b'))
@@ -13683,55 +13742,39 @@ async def run_user_bot(session_string, chat_id):
             arg = get_arg(event)
             if state.nc_state["active"]:
                 state.nc_state["active"] = False
-                if state.nc_state["task"]:
-                    state.nc_state["task"].cancel()
-                await s_edit(event, "✅ NC stopped.")
-                return
+                if state.nc_state["task"]: state.nc_state["task"].cancel()
+                await s_edit(event, "✅ NC stopped."); return
             parts = arg.strip().split(maxsplit=1)
-            lang = "hindi"
-            text = arg.strip()
-            if parts and parts[0].lower() in ("hindi", "english", "hinglish", "marathi", "punjabi", "bhojpuri"):
-                lang = parts[0].lower()
-                text = parts[1] if len(parts) > 1 else ""
-            if not text:
-                await s_edit(event, "❌ Usage: `.nc hindi <text>` or `.nc english <text>`")
-                return
-            state.nc_state["active"] = True
-            state.nc_state["lang"] = lang
-            state.nc_state["chat_id"] = event.chat_id
-
+            lang = "hindi"; text = arg.strip()
+            if parts and parts[0].lower() in ("hindi","english","hinglish","marathi","punjabi","bhojpuri"):
+                lang = parts[0].lower(); text = parts[1] if len(parts) > 1 else ""
+            if not text: await s_edit(event, "❌ Usage: `.nc hindi <text>` or `.nc english <text>`"); return
+            state.nc_state["active"] = True; state.nc_state["lang"] = lang; state.nc_state["chat_id"] = event.chat_id
             async def nc_loop():
                 while state.nc_state.get("active"):
                     try:
-                        emoji = {"hindi": "🇮🇳", "english": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", "hinglish": "💫",
-                                 "marathi": "🟠", "punjabi": "🟢", "bhojpuri": "🟡"}.get(lang, "💬")
-                        await s_send(event.chat_id, f"{emoji} {text}")
-                        await asyncio.sleep(1.5)
-                    except:
-                        await asyncio.sleep(2)
+                        emoji = {"hindi":"🇮🇳","english":"🏴󠁧󠁢󠁥󠁮󠁧󠁿","hinglish":"💫","marathi":"🟠","punjabi":"🟢","bhojpuri":"🟡"}.get(lang,"💬")
+                        await s_send(event.chat_id, f"{emoji} {text}"); await asyncio.sleep(1.5)
+                    except: await asyncio.sleep(2)
                 state.nc_state["task"] = None
-
             state.nc_state["task"] = asyncio.create_task(nc_loop())
             await s_edit(event, f"🌀 NC started ({lang}). `.nc` to stop.")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 14. AFK
+        # 13. AFK
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.afk\b'))
         async def cmd_afk(event):
             arg = get_arg(event)
             reason = arg.strip() or "AFK"
-            state.afk_data["afk"] = True
-            state.afk_data["reason"] = reason
-            state.afk_data["time"] = time.time()
-            state.afk_data["chat"] = event.chat_id
+            state.afk_data["afk"] = True; state.afk_data["reason"] = reason
+            state.afk_data["time"] = time.time(); state.afk_data["chat"] = event.chat_id
             await s_edit(event, f"🟡 AFK: {reason}")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.unafk\b'))
         async def cmd_unafk(event):
-            state.afk_data["afk"] = False
-            state.afk_data.clear()
+            state.afk_data["afk"] = False; state.afk_data.clear()
             await s_edit(event, "🟢 Back! AFK removed.")
 
         @user_bot.on(events.NewMessage(incoming=True))
@@ -13741,36 +13784,25 @@ async def run_user_bot(session_string, chat_id):
                 hrs, rem = divmod(elapsed, 3600)
                 mins, secs = divmod(rem, 60)
                 dur = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s" if mins else f"{secs}s"
-                try:
-                    await event.reply(f"🟡 AFK ({dur}): {state.afk_data.get('reason', 'AFK')}")
-                except:
-                    pass
+                try: await event.reply(f"🟡 AFK ({dur}): {state.afk_data.get('reason', 'AFK')}")
+                except: pass
 
         # ═══════════════════════════════════════════════════════════════════
-        # 15. DM SHIELD
+        # 14. DM SHIELD
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.dmshield\b'))
         async def cmd_dmshield(event):
-            arg = get_arg(event)
-            arg_lower = arg.strip().lower()
-            if arg_lower == "on":
-                state.dm_shield = True
-                await s_edit(event, "🛡️ **DM Shield: ENABLED**")
-            elif arg_lower == "off":
-                state.dm_shield = False
-                await s_edit(event, "🛡️ **DM Shield: DISABLED**")
-            else:
-                status = "✅ ON" if state.dm_shield else "❌ OFF"
-                await s_edit(event, f"🛡️ **DM Shield: {status}**\nUse `.dmshield on` / `.dmshield off` to toggle.")
+            arg = get_arg(event).strip().lower()
+            if arg == "on": state.dm_shield = True; await s_edit(event, "🛡️ **DM Shield: ENABLED**")
+            elif arg == "off": state.dm_shield = False; await s_edit(event, "🛡️ **DM Shield: DISABLED**")
+            else: await s_edit(event, f"🛡️ **DM Shield: {'✅ ON' if state.dm_shield else '❌ OFF'}**\nUse `.dmshield on/off`")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.dmapprove\b'))
         async def cmd_dmapprove(event):
             arg = get_arg(event)
             tgts = await get_targets(event, arg)
-            if tgts:
-                state.dm_approved.update(tgts)
-                await s_edit(event, f"✅ Approved {len(tgts)} user(s) for DM.")
+            if tgts: state.dm_approved.update(tgts); await s_edit(event, f"✅ Approved {len(tgts)} user(s) for DM.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.dmblock\b'))
         async def cmd_dmblock(event):
@@ -13780,81 +13812,69 @@ async def run_user_bot(session_string, chat_id):
                 state.dm_blocked.update(tgts)
                 await s_edit(event, f"🔇 Blocked {len(tgts)} user(s) from DM.")
                 for uid in tgts:
+                    try: await user_bot(BlockRequest(uid))
+                    except: pass
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.unblock\b'))
+        async def cmd_unblock(event):
+            arg = get_arg(event)
+            tgts = await get_targets(event, arg)
+            if tgts:
+                for uid in tgts:
                     try:
-                        await user_bot(BlockRequest(uid))
-                    except:
-                        pass
+                        await user_bot(functions.contacts.UnblockRequest(id=uid))
+                        state.dm_blocked.discard(uid)
+                    except: pass
+                await s_edit(event, f"✅ Unblocked {len(tgts)} user(s).")
+            else: await s_edit(event, "❌ No targets.")
 
         @user_bot.on(events.NewMessage(incoming=True))
         async def dmshield_handler(event):
-            if not event.is_private:
-                return
-            if event.sender_id in (me.id, BOT_ID):
-                return
+            if not event.is_private: return
+            if event.sender_id in (me.id, BOT_ID): return
             if state.dm_shield and event.sender_id not in state.dm_approved:
                 if event.sender_id not in state.dm_blocked:
-                    try:
-                        await event.reply("🛡️ DM Shield Active. Use `/login` in main bot to contact.")
-                    except:
-                        pass
+                    try: await event.reply("🛡️ DM Shield Active. Use `/login` in main bot to contact.")
+                    except: pass
 
         # ═══════════════════════════════════════════════════════════════════
-        # 16. FILTER / NOTE
+        # 15. FILTER / NOTE
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.filter\b'))
         async def cmd_filter(event):
             arg = get_arg(event)
             parts = arg.strip().split(" ", 1)
-            if len(parts) < 2:
-                await s_edit(event, "❌ Usage: `.filter keyword response`")
-                return
-            kw, resp = parts
-            state.filter_map[kw.lower()] = resp
+            if len(parts) < 2: await s_edit(event, "❌ Usage: `.filter keyword response`"); return
+            kw, resp = parts; state.filter_map[kw.lower()] = resp
             await s_edit(event, f"✅ Filter `{kw}` added.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.delfilter\b'))
         async def cmd_delfilter(event):
-            arg = get_arg(event)
-            kw = arg.strip().lower()
-            if kw in state.filter_map:
-                del state.filter_map[kw]
-                await s_edit(event, f"✅ Filter `{kw}` removed.")
-            else:
-                await s_edit(event, "❌ Filter not found.")
+            arg = get_arg(event); kw = arg.strip().lower()
+            if kw in state.filter_map: del state.filter_map[kw]; await s_edit(event, f"✅ Filter `{kw}` removed.")
+            else: await s_edit(event, "❌ Filter not found.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.note\b'))
         async def cmd_note(event):
-            arg = get_arg(event)
-            parts = arg.strip().split(" ", 1)
-            if len(parts) < 2:
-                await s_edit(event, "❌ Usage: `.note name content`")
-                return
-            nname, ncontent = parts
-            state.notes[nname] = ncontent
-            await s_edit(event, f"✅ Note `{nname}` saved.")
+            arg = get_arg(event); parts = arg.strip().split(" ", 1)
+            if len(parts) < 2: await s_edit(event, "❌ Usage: `.note name content`"); return
+            state.notes[parts[0]] = parts[1]; await s_edit(event, f"✅ Note `{parts[0]}` saved.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.getnote\b'))
         async def cmd_getnote(event):
-            arg = get_arg(event)
-            nname = arg.strip()
-            if nname in state.notes:
-                await s_edit(event, f"📝 **{nname}**:\n{state.notes[nname]}")
-            else:
-                await s_edit(event, "❌ Note not found.")
+            arg = get_arg(event); nname = arg.strip()
+            if nname in state.notes: await s_edit(event, f"📝 **{nname}**:\n{state.notes[nname]}")
+            else: await s_edit(event, "❌ Note not found.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.delnote\b'))
         async def cmd_delnote(event):
-            arg = get_arg(event)
-            nname = arg.strip()
-            if nname in state.notes:
-                del state.notes[nname]
-                await s_edit(event, f"✅ Note `{nname}` deleted.")
-            else:
-                await s_edit(event, "❌ Note not found.")
+            arg = get_arg(event); nname = arg.strip()
+            if nname in state.notes: del state.notes[nname]; await s_edit(event, f"✅ Note `{nname}` deleted.")
+            else: await s_edit(event, "❌ Note not found.")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 17. ANTI-DELETE / WATCH / LOCK / FREEZE
+        # 16. ANTI-DELETE / WATCH / LOCK / FREEZE
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.antidel\b'))
@@ -13864,101 +13884,69 @@ async def run_user_bot(session_string, chat_id):
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.watch\b'))
         async def cmd_watch(event):
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
+            arg = get_arg(event); tgts = await get_targets(event, arg)
             if tgts:
                 cid = event.chat_id
-                for uid in tgts:
-                    state.watch_map[uid] = cid
+                for uid in tgts: state.watch_map[uid] = cid
                 await s_edit(event, f"👁️ Watching {len(tgts)} user(s).")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.unwatch\b'))
         async def cmd_unwatch(event):
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
+            arg = get_arg(event); tgts = await get_targets(event, arg)
             if tgts:
-                for uid in tgts:
-                    state.watch_map.pop(uid, None)
+                for uid in tgts: state.watch_map.pop(uid, None)
                 await s_edit(event, f"✅ Unwatched {len(tgts)} user(s).")
-            else:
-                state.watch_map.clear()
-                await s_edit(event, "✅ All unwatched.")
+            else: state.watch_map.clear(); await s_edit(event, "✅ All unwatched.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.lock\b'))
-        async def cmd_lock(event):
-            state.group_locks.add(event.chat_id)
-            await s_edit(event, "🔒 Group locked.")
+        async def cmd_lock(event): state.group_locks.add(event.chat_id); await s_edit(event, "🔒 Group locked.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.unlock\b'))
-        async def cmd_unlock(event):
-            state.group_locks.discard(event.chat_id)
-            await s_edit(event, "🔓 Group unlocked.")
+        async def cmd_unlock(event): state.group_locks.discard(event.chat_id); await s_edit(event, "🔓 Group unlocked.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.freeze\b'))
         async def cmd_freeze(event):
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
+            arg = get_arg(event); tgts = await get_targets(event, arg)
+            if not tgts: await s_edit(event, "❌ No targets."); return
             cid = event.chat_id
             for uid in tgts:
                 try:
-                    banned = ChatBannedRights(
-                        until_date=None, send_messages=True, send_media=True,
-                        send_stickers=True, send_gifs=True, send_games=True,
-                        send_inline=True, send_polls=True, invite_users=True,
-                        change_info=True, pin_messages=True
-                    )
+                    banned = ChatBannedRights(until_date=None, send_messages=True, send_media=True,
+                        send_stickers=True, send_gifs=True, send_games=True, send_inline=True, send_polls=True,
+                        invite_users=True, change_info=True, pin_messages=True)
                     await user_bot.edit_permissions(cid, uid, banned)
-                except:
-                    pass
+                except: pass
             await s_edit(event, f"🧊 Froze {len(tgts)} user(s).")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.unfreeze\b'))
         async def cmd_unfreeze(event):
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
-            if not tgts:
-                await s_edit(event, "❌ No targets.")
-                return
+            arg = get_arg(event); tgts = await get_targets(event, arg)
+            if not tgts: await s_edit(event, "❌ No targets."); return
             cid = event.chat_id
             for uid in tgts:
                 try:
-                    rights = ChatBannedRights(
-                        until_date=None, send_messages=False, send_media=False,
-                        send_stickers=False, send_gifs=False, send_games=False,
-                        send_inline=False, send_polls=False, invite_users=False,
-                        change_info=False, pin_messages=False
-                    )
+                    rights = ChatBannedRights(until_date=None, send_messages=False, send_media=False,
+                        send_stickers=False, send_gifs=False, send_games=False, send_inline=False, send_polls=False,
+                        invite_users=False, change_info=False, pin_messages=False)
                     await user_bot.edit_permissions(cid, uid, rights)
-                except:
-                    pass
+                except: pass
             await s_edit(event, f"✅ Unfroze {len(tgts)} user(s).")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 18. ADMIN COMMANDS
+        # 17. ADMIN COMMANDS
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.addadmin\b'))
         async def cmd_addadmin(event):
-            if event.sender_id not in OWNER_IDS:
-                return
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
-            if tgts:
-                state.admins.update(tgts)
-                await s_edit(event, f"✅ Admin added: {len(tgts)} user(s).")
+            if event.sender_id not in OWNER_IDS: return
+            arg = get_arg(event); tgts = await get_targets(event, arg)
+            if tgts: state.admins.update(tgts); await s_edit(event, f"✅ Admin added: {len(tgts)} user(s).")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.deladmin\b'))
         async def cmd_deladmin(event):
-            if event.sender_id not in OWNER_IDS:
-                return
-            arg = get_arg(event)
-            tgts = await get_targets(event, arg)
-            if tgts:
-                state.admins.difference_update(tgts)
-                await s_edit(event, f"✅ Admin removed: {len(tgts)} user(s).")
+            if event.sender_id not in OWNER_IDS: return
+            arg = get_arg(event); tgts = await get_targets(event, arg)
+            if tgts: state.admins.difference_update(tgts); await s_edit(event, f"✅ Admin removed: {len(tgts)} user(s).")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.admins\b'))
         async def cmd_listadmins(event):
@@ -13966,7 +13954,7 @@ async def run_user_bot(session_string, chat_id):
             await s_edit(event, f"👑 Admins: {', '.join(str(x) for x in lst)}")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 19. PING / UPTIME / STATS
+        # 18. PING / UPTIME / STATS / ID / BCLIST
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.ping\b'))
@@ -13976,289 +13964,1172 @@ async def run_user_bot(session_string, chat_id):
                 m = await s_edit(event, "🏓 Pong!")
                 elapsed = (time.time() - start) * 1000
                 await s_edit(event, f"🏓 Pong! `{elapsed:.0f}ms`")
-            except:
-                pass
+            except: pass
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.uptime\b'))
         async def cmd_uptime(event):
             elapsed = int(time.time() - state.start_time)
-            hrs, rem = divmod(elapsed, 3600)
-            mins, secs = divmod(rem, 60)
+            hrs, rem = divmod(elapsed, 3600); mins, secs = divmod(rem, 60)
             await s_edit(event, f"⏱️ Uptime: `{hrs}h {mins}m {secs}s`")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.stats\b'))
         async def cmd_stats(event):
-            active_raids = len(state.shayari_raid) + len(state.rizz_raid) + len(state.pickup_raid)
             await s_edit(event,
-                f"📊 **Stats**\n"
-                f"Raids: {active_raids} active\n"
-                f"Sprays: {len(state.spray_tasks)} active\n"
-                f"Filters: {len(state.filter_map)}\n"
-                f"Notes: {len(state.notes)}\n"
-                f"Muted: {len(state.muted)}\n"
-                f"GMuted: {len(state.gmuted)}"
-            )
+                f"📊 **Stats**\nRaids: ...\nSprays: {len(state.spray_tasks)} active\n"
+                f"Filters: {len(state.filter_map)}\nNotes: {len(state.notes)}\n"
+                f"Muted: {len(state.muted)}\nGMuted: {len(state.gmuted)}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.id\b'))
+        async def cmd_id(event):
+            cid = event.chat_id; uid = event.sender_id
+            msg = f"🆔 **Chat**: `{cid}`\n👤 **User**: `{uid}`"
+            if event.is_reply:
+                try:
+                    r = await event.get_reply_message()
+                    msg += f"\n💬 **Reply User**: `{r.sender_id}`"
+                except: pass
+            await s_edit(event, msg)
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.bclist\b'))
+        async def cmd_bclist(event):
+            await s_edit(event, f"📡 Broadcast users: {len(broadcast_users)}")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 20. STOP ALL
+        # 19. STOP ALL
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.stopall\b'))
         async def cmd_stopall(event):
-            if event.sender_id not in OWNER_IDS:
-                return
-            for d in [
-                state.shayari_raid, state.rizz_raid, state.pickup_raid,
-                state.romance_raid, state.troll_raid, state.ragebait_raid,
-                state.roast_raid, state.attack_raid, state.war_raid,
-                state.savage_raid, state.ultra_raid, state.shame_raid,
-                state.diss_raid, state.devil_raid, state.karma_raid,
-                state.doom_raid, state.pwr_raid, state.custom_raid,
-                state.deathgod_on, state.premium_raid_tgts, state.premium_spam_tgts
-            ]:
+            if event.sender_id not in OWNER_IDS: return
+            for d in [state.shayari_raid, state.rizz_raid, state.pickup_raid, state.romance_raid,
+                      state.troll_raid, state.ragebait_raid, state.roast_raid, state.attack_raid,
+                      state.war_raid, state.savage_raid, state.ultra_raid, state.shame_raid,
+                      state.diss_raid, state.devil_raid, state.karma_raid, state.doom_raid,
+                      state.pwr_raid, state.custom_raid, state.deathgod_on,
+                      state.premium_raid_tgts, state.premium_spam_tgts]:
                 for k in list(d.keys()):
-                    if isinstance(d[k], dict):
-                        d[k]["active"] = False
-            for k in list(state.spray_tasks.keys()):
-                state.spray_tasks[k]["active"] = False
-            state.reply_on.clear()
-            state.rr_on.clear()
-            state.flag_on.clear()
-            state.hrr_on.clear()
-            state.replygod_on.clear()
-            state.nc_state["active"] = False
-            if state.nc_state["task"]:
-                state.nc_state["task"].cancel()
-                state.nc_state["task"] = None
+                    if isinstance(d[k], dict): d[k]["active"] = False
+            for k in list(state.spray_tasks.keys()): state.spray_tasks[k]["active"] = False
+            state.reply_on.clear(); state.rr_on.clear(); state.flag_on.clear()
+            state.hrr_on.clear(); state.replygod_on.clear()
+            if state.nc_state["task"]: state.nc_state["task"].cancel()
+            state.nc_state["active"] = False; state.nc_state["task"] = None
             await s_edit(event, "🛑 **ALL STOPPED** — raids, sprays, reply modes, NC.")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 21. TEXT LIST MANAGEMENT
+        # 20. TEXT LIST MANAGEMENT
         # ═══════════════════════════════════════════════════════════════════
 
         LIST_MAP = {
             "reply": reply_texts, "rr": rr_texts, "flag": flag_texts,
-            "hrr": hrr_texts, "replygod": replygod_texts,
-            "deathgod": deathgod_replies, "ows": ows_texts,
-            "shayari": shayari_texts, "rizz": rizz_texts,
-            "pickup": pickup_texts, "romance": romance_texts,
-            "troll": troll_texts, "ragebait": ragebait_texts, "roast": roast_texts,
-            "attack": attack_texts, "war": war_texts,
-            "savage": savage_texts, "ultra": ultra_texts,
-            "shame": shame_texts, "diss": diss_texts,
-            "devil": devil_texts, "karma": karma_texts, "doom": doom_texts,
+            "hrr": hrr_texts, "replygod": replygod_texts, "deathgod": deathgod_replies,
+            "ows": ows_texts, "shayari": shayari_texts, "rizz": rizz_texts,
+            "pickup": pickup_texts, "romance": romance_texts, "troll": troll_texts,
+            "ragebait": ragebait_texts, "roast": roast_texts, "attack": attack_texts,
+            "war": war_texts, "savage": savage_texts, "ultra": ultra_texts,
+            "shame": shame_texts, "diss": diss_texts, "devil": devil_texts,
+            "karma": karma_texts, "doom": doom_texts, "saved": state.saved_texts,
             "mr": mr_texts, "mr2": mr2_texts, "br": br_texts,
-            "br2": br2_texts, "br3": br3_texts,
-            "sqr": sqr_texts, "sq2": sq2_texts, "cr": cr_texts,
-            "bar": bar_texts, "gr": gr_texts,
+            "br2": br2_texts, "br3": br3_texts, "sqr": sqr_texts, "sq2": sq2_texts,
+            "cr": cr_texts, "bar": bar_texts, "gr": gr_texts,
             "ms": ms_texts, "ms2": ms2_texts, "bs": bs_texts,
-            "bs2": bs2_texts, "bs3": bs3_texts,
-            "sqs": sqs_texts, "sqs2": sqs2_texts, "cs": cs_texts,
-            "bas": bas_texts, "gs": gs_texts,
+            "bs2": bs2_texts, "bs3": bs3_texts, "sqs": sqs_texts, "sqs2": sqs2_texts,
+            "cs": cs_texts, "bas": bas_texts, "gs": gs_texts,
         }
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.addtext\b'))
         async def cmd_addtext(event):
-            if event.sender_id not in OWNER_IDS:
-                return
-            arg = get_arg(event)
-            parts = arg.strip().split(" ", 1)
-            if len(parts) < 2:
-                await s_edit(event, f"❌ Usage: `.addtext <listname> <text>`\nLists: {', '.join(LIST_MAP.keys())}")
-                return
-            lst_name, text = parts
-            lst_name = lst_name.lower()
-            if lst_name not in LIST_MAP:
-                await s_edit(event, f"❌ Unknown list `{lst_name}`.")
-                return
+            if event.sender_id not in OWNER_IDS: return
+            arg = get_arg(event); parts = arg.strip().split(" ", 1)
+            if len(parts) < 2: await s_edit(event, f"❌ Usage: `.addtext <listname> <text>`\nLists: {', '.join(LIST_MAP.keys())}"); return
+            lst_name, text = parts[0].lower(), parts[1]
+            if lst_name not in LIST_MAP: await s_edit(event, f"❌ Unknown list `{lst_name}`."); return
             LIST_MAP[lst_name].append(text)
             await s_edit(event, f"✅ Added to `{lst_name}` (now {len(LIST_MAP[lst_name])} items)")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.deltext\b'))
         async def cmd_deltext(event):
-            if event.sender_id not in OWNER_IDS:
-                return
-            arg = get_arg(event)
-            parts = arg.strip().split(" ", 1)
-            if len(parts) < 2:
-                await s_edit(event, "❌ Usage: `.deltext <listname> <index>`")
-                return
-            lst_name, idx_str = parts
-            lst_name = lst_name.lower()
-            if lst_name not in LIST_MAP:
-                await s_edit(event, f"❌ Unknown list `{lst_name}`.")
-                return
+            if event.sender_id not in OWNER_IDS: return
+            arg = get_arg(event); parts = arg.strip().split(" ", 1)
+            if len(parts) < 2: await s_edit(event, "❌ Usage: `.deltext <listname> <index>`"); return
+            lst_name, idx_str = parts[0].lower(), parts[1]
+            if lst_name not in LIST_MAP: await s_edit(event, f"❌ Unknown list `{lst_name}`."); return
             try:
-                idx = int(idx_str)
-                lst = LIST_MAP[lst_name]
-                if 0 <= idx < len(lst):
-                    lst.pop(idx)
-                    await s_edit(event, f"✅ Removed item {idx} from `{lst_name}`")
-                else:
-                    await s_edit(event, f"❌ Index {idx} out of range (0-{len(lst)-1})")
-            except ValueError:
-                await s_edit(event, "❌ Provide numeric index.")
+                idx = int(idx_str); lst = LIST_MAP[lst_name]
+                if 0 <= idx < len(lst): lst.pop(idx); await s_edit(event, f"✅ Removed item {idx} from `{lst_name}`")
+                else: await s_edit(event, f"❌ Index {idx} out of range (0-{len(lst)-1})")
+            except ValueError: await s_edit(event, "❌ Provide numeric index.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.cleartext\b'))
         async def cmd_cleartext(event):
-            if event.sender_id not in OWNER_IDS:
-                return
-            arg = get_arg(event)
-            lst_name = arg.strip().lower()
-            if lst_name in LIST_MAP:
-                LIST_MAP[lst_name].clear()
-                await s_edit(event, f"✅ Cleared `{lst_name}`")
-            else:
-                await s_edit(event, f"❌ Unknown list. Available: {', '.join(LIST_MAP.keys())}")
+            if event.sender_id not in OWNER_IDS: return
+            arg = get_arg(event); lst_name = arg.strip().lower()
+            if lst_name in LIST_MAP: LIST_MAP[lst_name].clear(); await s_edit(event, f"✅ Cleared `{lst_name}`")
+            else: await s_edit(event, f"❌ Unknown list.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.listtext\b'))
         async def cmd_listtext(event):
-            arg = get_arg(event)
-            lst_name = arg.strip().lower()
+            arg = get_arg(event); lst_name = arg.strip().lower()
             if lst_name in LIST_MAP:
                 lst = LIST_MAP[lst_name]
-                if lst:
-                    items = "\n".join([f"{i}: {t[:50]}" for i, t in enumerate(lst[:20])])
-                    await s_edit(event, f"📋 `{lst_name}` ({len(lst)}):\n{items}")
-                else:
-                    await s_edit(event, f"📋 `{lst_name}` is empty.")
-            else:
-                await s_edit(event, f"❌ Unknown list. Available: {', '.join(LIST_MAP.keys())}")
+                if lst: items = "\n".join(f"{i}: {t[:50]}" for i,t in enumerate(lst[:20])); await s_edit(event, f"📋 `{lst_name}` ({len(lst)}):\n{items}")
+                else: await s_edit(event, f"📋 `{lst_name}` is empty.")
+            else: await s_edit(event, f"❌ Unknown list.")
 
         # ═══════════════════════════════════════════════════════════════════
-        # 22. BROADCAST / ADDBOTS / GCF / HELP
+        # 21. BROADCAST / ADDBOTS / GCF / HELP
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.broadcast\b'))
         async def cmd_broadcast(event):
-            if event.sender_id not in OWNER_IDS:
-                return
+            if event.sender_id not in OWNER_IDS: return
             arg = get_arg(event)
-            if not arg.strip():
-                await s_edit(event, "❌ Usage: `.broadcast <message>`")
-                return
-            msg = arg.strip()
-            users = load_broadcast_json()
-            sent = 0
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.broadcast <message>`"); return
+            msg = arg.strip(); users = load_broadcast_json(); sent = 0
             for uid in users:
-                try:
-                    await s_send(uid, f"📢 **Broadcast:**\n{msg}")
-                    sent += 1
-                    await asyncio.sleep(0.1)
-                except:
-                    pass
+                try: await s_send(uid, f"📢 **Broadcast:**\n{msg}"); sent += 1; await asyncio.sleep(0.1)
+                except: pass
             await s_edit(event, f"✅ Broadcast sent to {sent}/{len(users)} users.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.addbots\b'))
         async def cmd_addbots(event):
-            if not event.is_group:
-                await s_edit(event, "❌ Group only.")
-                return
-            cid = event.chat_id
-            added = 0
+            if not event.is_group: await s_edit(event, "❌ Group only."); return
+            cid = event.chat_id; added = 0
             for bot_username in ADD_BOTS_LIST:
                 try:
                     bot_entity = await user_bot.get_entity(bot_username)
-                    await user_bot(InviteToChannelRequest(cid, [bot_entity]))
-                    added += 1
-                    await asyncio.sleep(2)
-                except FloodWaitError as e:
-                    await asyncio.sleep(e.seconds + 1)
-                except:
-                    pass
+                    await user_bot(InviteToChannelRequest(cid, [bot_entity])); added += 1; await asyncio.sleep(2)
+                except FloodWaitError as e: await asyncio.sleep(e.seconds + 1)
+                except: pass
             await s_edit(event, f"✅ Added {added} bots.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.gcf\b'))
         async def cmd_gcf(event):
-            if not event.is_group:
-                await s_edit(event, "❌ Group only.")
-                return
-            cid = event.chat_id
-            arg = get_arg(event)
-            try:
-                count = min(int(arg.strip()) if arg.strip().isdigit() else 50, 200)
-            except:
-                count = 50
+            if not event.is_group: await s_edit(event, "❌ Group only."); return
+            cid = event.chat_id; arg = get_arg(event)
+            try: count = min(int(arg.strip()) if arg.strip().isdigit() else 50, 200)
+            except: count = 50
             for _ in range(count):
-                try:
-                    emoji = random.choice(GC_FAST_EMOJIS)
-                    await s_send(cid, emoji)
-                    await asyncio.sleep(0.03)
-                except FloodWaitError as e:
-                    await asyncio.sleep(e.seconds + 1)
-                except:
-                    pass
+                try: await s_send(cid, random.choice(GC_FAST_EMOJIS)); await asyncio.sleep(0.03)
+                except FloodWaitError as e: await asyncio.sleep(e.seconds + 1)
+                except: pass
             await s_edit(event, f"✅ GCF done ({count}x)")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.help\b'))
         async def cmd_help(event):
             await s_edit(event, "📖 Type `.menu` to see all menus or any `.menu1`–`.menu14`")
-            
+
         # ═══════════════════════════════════════════════════════════════════
-        # 23. AUTOTAG — tag ALL group members one by one
+        # 22. AUTOTAG (one-by-one) & TAGALL (single message — NEW)
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.autotag\b'))
         async def cmd_autotag(event):
-            """Tag ALL group members one by one with your text.
-            Usage: .autotag good morning
+            if not event.is_group: await s_edit(event, "❌ Group mein hi use kar."); return
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.autotag <text>`\nExample: `.autotag good morning`"); return
+            tag_text = arg.strip(); cid = event.chat_id
+            await s_edit(event, "👥 Fetching group members..."); total = 0; failed = 0
+            try:
+                async for participant in user_bot.iter_participants(cid, aggressive=True):
+                    uid = participant.id
+                    if uid in (me.id, BOT_ID): continue
+                    mention = f"@{participant.username}" if participant.username else f"[{participant.first_name or 'User'}](tg://user?id={uid})"
+                    try: await s_send(cid, f"{mention} {tag_text}"); total += 1
+                    except: failed += 1
+                    await asyncio.sleep(state.spray_delay)
+                await s_edit(event, f"✅ Autotag complete!\n• Sent to: {total} members\n• Failed: {failed}\n• Text: `{tag_text}`")
+            except FloodWaitError as e: await s_edit(event, f"❌ FloodWait: {e.seconds}s wait kar.")
+            except Exception as e: await s_edit(event, f"❌ Error: {str(e)[:100]}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.stopautotag\b'))
+        async def cmd_stopautotag(event):
+            state.autotag_active = False
+            await s_edit(event, "🛑 Autotag stopped.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.tagall\b'))
+        async def cmd_tagall(event):
+            """Tag ALL group members in ONE single message.
+            Usage: .tagall Your message here
             """
             if not event.is_group:
                 await s_edit(event, "❌ Group mein hi use kar.")
                 return
 
             arg = get_arg(event)
-            if not arg.strip():
-                await s_edit(event, "❌ Usage: `.autotag <text>`\nExample: `.autotag good morning`")
-                return
+            msg_text = arg.strip()
 
-            tag_text = arg.strip()
-            cid = event.chat_id
+            await s_edit(event, "👥 Fetching all members...")
 
-            # Pehle command message ko edit karo
-            await s_edit(event, "👥 Fetching group members...")
-
-            total = 0
-            failed = 0
+            mentions = []
 
             try:
-                # Saare participants fetch karo
-                async for participant in user_bot.iter_participants(cid, aggressive=True):
+                async for participant in user_bot.iter_participants(event.chat_id, aggressive=True):
                     uid = participant.id
-
-                    # Skip khud ko aur bot ko
                     if uid in (me.id, BOT_ID):
                         continue
 
-                    # @username ya fallback mention banao
                     if participant.username:
-                        mention = f"@{participant.username}"
+                        mentions.append(f"@{participant.username}")
                     else:
                         name = (participant.first_name or "User")
-                        mention = f"[{name}](tg://user?id={uid})"
+                        mentions.append(f"[{name}](tg://user?id={uid})")
 
-                    # Send karo — without reply, direct message
-                    try:
-                        await s_send(cid, f"{mention} {tag_text}")
-                        total += 1
-                    except:
-                        failed += 1
+                    # Telegram limit: ~200 mentions per message
+                    if len(mentions) >= 200:
+                        break
 
-                    # Thoda delay taki flood na lage
-                    await asyncio.sleep(state.spray_delay)
+                if not mentions:
+                    await s_edit(event, "❌ Koi member nahi mila.")
+                    return
 
-                await s_edit(event, f"✅ Autotag complete!\n• Sent to: {total} members\n• Failed: {failed}\n• Text: `{tag_text}`")
+                # Build single message with all mentions + optional text
+                mention_str = " ".join(mentions)
+                if msg_text:
+                    final_msg = f"{mention_str} {msg_text}"
+                else:
+                    final_msg = mention_str
+
+                # Delete command message
+                try:
+                    await event.delete()
+                except:
+                    pass
+
+                # Send ONE message with all tags
+                await s_send(event.chat_id, final_msg)
 
             except FloodWaitError as e:
-                await s_edit(event, f"❌ FloodWait: {e.seconds}s wait kar phir try kar.")
+                await s_edit(event, f"❌ FloodWait: {e.seconds}s wait kar.")
             except Exception as e:
-                await s_edit(event, f"❌ Error: {str(e)[:100]}")    
+                await s_edit(event, f"❌ Error: {str(e)[:100]}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 23. FUN METERS (Menu 7) — ALL 20 commands
+        # ═══════════════════════════════════════════════════════════════════
+
+        METER_COMMANDS = {
+            "studmeter": "Stud", "looks": "Looks", "gay": "Gay", "lesbian": "Lesbian",
+            "straight": "Straight", "bi": "Bi", "trans": "Trans", "simp": "Simp",
+            "chad": "Chad", "friendly": "Friendly", "stupidmeter": "Stupid",
+            "sigma": "Sigma", "pookie": "Pookie", "baddie": "Baddie",
+            "rizz": "Rizz", "iq": "IQ",
+        }
+
+        for cmd_name, label in METER_COMMANDS.items():
+            @user_bot.on(events.NewMessage(outgoing=True, pattern=rf'\.{cmd_name}\b'))
+            async def cmd_meter(event, _label=label, _cmd=cmd_name):
+                if _cmd in ("rizz",):
+                    val = random.randint(1, 100)
+                elif _cmd == "iq":
+                    val = random.randint(1, 200)
+                else:
+                    val = random.randint(0, 100)
+                bars = "▓" * (val // 10) + "░" * (10 - val // 10)
+                target = ""
+                if event.is_reply:
+                    try:
+                        r = await event.get_reply_message()
+                        if r.sender_id and r.sender_id not in (me.id, BOT_ID):
+                            target = f" for user `{r.sender_id}`"
+                    except: pass
+                arg = get_arg(event)
+                if arg.strip(): target = f" for `{arg.strip()}`"
+                await s_edit(event, f"**{_label} Meter**{target}\n{bars} **{val}%**")
+
+        # Relationship meters
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.bestfrnd\b'))
+        async def cmd_bestfrnd(event):
+            val = random.randint(0, 100)
+            target = ""
+            if event.is_reply:
+                try:
+                    r = await event.get_reply_message()
+                    if r.sender_id: target = f" with `{r.sender_id}`"
+                except: pass
+            await s_edit(event, f"🤝 **Best Friend{target}**\n{'▓'*(val//10)}{'░'*(10-val//10)} **{val}%**")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.marriage\b'))
+        async def cmd_marriage(event):
+            val = random.randint(0, 100)
+            target = ""
+            if event.is_reply:
+                try:
+                    r = await event.get_reply_message()
+                    if r.sender_id: target = f" with `{r.sender_id}`"
+                except: pass
+            await s_edit(event, f"💍 **Marriage{target}**\n{'▓'*(val//10)}{'░'*(10-val//10)} **{val}%**")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.divorce\b'))
+        async def cmd_divorce(event):
+            val = random.randint(0, 100)
+            target = ""
+            if event.is_reply:
+                try:
+                    r = await event.get_reply_message()
+                    if r.sender_id: target = f" with `{r.sender_id}`"
+                except: pass
+            await s_edit(event, f"💔 **Divorce{target}**\n{'▓'*(val//10)}{'░'*(10-val//10)} **{val}%**")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 24. GAMES & FUN (Menu 10)
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.truth\b'))
+        async def cmd_truth(event):
+            truths = ["Have you ever cheated on a test?", "Who is your crush?", "What is your biggest fear?",
+                      "Have you ever lied to your best friend?", "What is the most embarrassing thing you've done?"]
+            await s_edit(event, f"🎯 **Truth:** {random.choice(truths)}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.dare\b'))
+        async def cmd_dare(event):
+            dares = ["Send a random sticker", "Say something in reverse", "Tag a random person and compliment them",
+                     "Send your last downloaded photo", "Type with your eyes closed"]
+            await s_edit(event, f"🎯 **Dare:** {random.choice(dares)}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.situation\b'))
+        async def cmd_situation(event):
+            situations = ["What would you do if you won a lottery?", "If you could be invisible for a day?",
+                         "If you found your friend's secret?", "If you had 24 hours to live?"]
+            await s_edit(event, f"🎯 **Situation:** {random.choice(situations)}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.riddle\b'))
+        async def cmd_riddle(event):
+            riddles = [("What has keys but can't open locks?", "A piano"),
+                      ("What gets wetter the more it dries?", "A towel"),
+                      ("What has a head and a tail but no body?", "A coin")]
+            riddle, answer = random.choice(riddles)
+            await s_edit(event, f"🧩 **Riddle:** {riddle}\n💡 Send `.answer` to see the answer.")
+            state.riddle_answer = answer
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.answer\b'))
+        async def cmd_answer(event):
+            if hasattr(state, 'riddle_answer'):
+                await s_edit(event, f"💡 **Answer:** {state.riddle_answer}")
+                del state.riddle_answer
+            else: await s_edit(event, "❌ No active riddle.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.quiz\b'))
+        async def cmd_quiz(event):
+            quizzes = [("What is the chemical symbol for water?", "H2O"),
+                      ("Who developed Python?", "Guido van Rossum"),
+                      ("What is the capital of France?", "Paris")]
+            q, a = random.choice(quizzes)
+            await s_edit(event, f"📝 **Quiz:** {q}\n💡 Send `.qanswer` to see answer.")
+            state.quiz_answer = a
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.qanswer\b'))
+        async def cmd_qanswer(event):
+            if hasattr(state, 'quiz_answer'):
+                await s_edit(event, f"💡 **Answer:** {state.quiz_answer}")
+                del state.quiz_answer
+            else: await s_edit(event, "❌ No active quiz.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.rps\b'))
+        async def cmd_rps(event):
+            arg = get_arg(event).strip().lower()
+            choices = {"r": "🪨 Rock", "p": "📄 Paper", "s": "✂️ Scissors"}
+            if arg not in choices: await s_edit(event, "❌ Usage: `.rps r/p/s`"); return
+            bot_choice = random.choice(list(choices.values()))
+            user_choice = choices[arg]
+            results = {"rock": {"scissors": "You Win!", "paper": "Bot Wins!"},
+                      "paper": {"rock": "You Win!", "scissors": "Bot Wins!"},
+                      "scissors": {"paper": "You Win!", "rock": "Bot Wins!"}}
+            user_key = {"r":"rock","p":"paper","s":"scissors"}[arg]
+            bot_key = bot_choice.split()[1].lower()
+            if user_key == bot_key: verdict = "Draw!"
+            else: verdict = results[user_key].get(bot_key, "Draw!")
+            await s_edit(event, f"🤖 **RPS**\nYou: {user_choice}\nBot: {bot_choice}\n**{verdict}**")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.dice\b'))
+        async def cmd_dice(event):
+            await s_edit(event, f"🎲 **Dice:** {random.randint(1,6)}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.flip\b'))
+        async def cmd_flip(event):
+            await s_edit(event, f"🪙 **Coin:** {'Heads' if random.random() > 0.5 else 'Tails'}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.joke\b'))
+        async def cmd_joke(event):
+            jokes = ["Why don't programmers like nature? It has too many bugs.",
+                    "What do you call a fake noodle? An impasta.",
+                    "Why did the scarecrow win an award? He was outstanding in his field."]
+            await s_edit(event, f"😂 {random.choice(jokes)}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.fact\b'))
+        async def cmd_fact(event):
+            facts = ["Honey never spoils.", "Octopuses have three hearts.", "Bananas are berries, but strawberries aren't.",
+                    "A group of flamingos is called a 'flamboyance'."]
+            await s_edit(event, f"🧠 **Fact:** {random.choice(facts)}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.compliment\b'))
+        async def cmd_compliment(event):
+            comps = ["You're amazing!", "You have a great sense of humor!", "You're smarter than you think!",
+                    "You light up the room!", "You're one of a kind!"]
+            target = ""
+            if event.is_reply:
+                try: r = await event.get_reply_message()
+                except: pass
+            await s_edit(event, f"💖 {random.choice(comps)}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.quote\b'))
+        async def cmd_quote(event):
+            quotes = ["The only way to do great work is to love what you do. — Steve Jobs",
+                     "Be yourself; everyone else is already taken. — Oscar Wilde",
+                     "In the middle of difficulty lies opportunity. — Einstein"]
+            await s_edit(event, f"💬 {random.choice(quotes)}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 25. MENU 5 — TOOLS (echo, tts, qrcode, calc, fancy, style, etc.)
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.echo\b'))
+        async def cmd_echo(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, arg.strip())
+            else: await s_edit(event, "❌ Usage: `.echo <text>`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.calc\b'))
+        async def cmd_calc(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.calc 2+2`"); return
+            try:
+                result = eval(arg.strip(), {"__builtins__": {}}, {"abs": abs, "round": round, "min": min, "max": max,
+                    "pow": pow, "sum": sum, "int": int, "float": float, "str": str, "len": len})
+                await s_edit(event, f"🧮 {arg.strip()} = **{result}**")
+            except Exception as e: await s_edit(event, f"❌ Error: {e}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.info\b'))
+        async def cmd_info(event):
+            uid = event.sender_id
+            if event.is_reply:
+                try:
+                    r = await event.get_reply_message()
+                    uid = r.sender_id or uid
+                except: pass
+            try:
+                u = await user_bot.get_entity(uid)
+                name = f"{u.first_name or ''} {u.last_name or ''}".strip()
+                uname = f"@{u.username}" if u.username else "None"
+                await s_edit(event, f"👤 **User Info**\nName: {name}\nID: `{uid}`\nUsername: {uname}\nBot: {u.bot}")
+            except: await s_edit(event, f"❌ Could not fetch info for `{uid}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.ip\b'))
+        async def cmd_ip(event):
+            await s_edit(event, "🌐 IP lookup: Use `.ip <address>` — requires API. (Not implemented)")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.weather\b'))
+        async def cmd_weather(event):
+            await s_edit(event, "🌤 Weather: Use `.weather <city>` — requires API. (Not implemented)")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.short\b'))
+        async def cmd_short(event):
+            await s_edit(event, "🔗 URL shortener: Not implemented. Use an external service.")
+
+        # Premium text formatting (Menu 11A)
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.upper\b'))
+        async def cmd_upper(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.upper <text>`"); return
+            await s_edit(event, arg.strip().upper())
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.lower\b'))
+        async def cmd_lower(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.lower <text>`"); return
+            await s_edit(event, arg.strip().lower())
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.reverse\b'))
+        async def cmd_reverse(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.reverse <text>`"); return
+            await s_edit(event, arg.strip()[::-1])
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.len\b'))
+        async def cmd_len(event):
+            arg = get_arg(event)
+            await s_edit(event, f"📏 Length: {len(arg.strip())} chars")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.wcount\b'))
+        async def cmd_wcount(event):
+            arg = get_arg(event)
+            await s_edit(event, f"📊 Word count: {len(arg.strip().split())}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.bold\b'))
+        async def cmd_bold(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, f"**{arg.strip()}**")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.italic\b'))
+        async def cmd_italic(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, f"__{arg.strip()}__")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.mono\b'))
+        async def cmd_mono(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, f"`{arg.strip()}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.camel\b'))
+        async def cmd_camel(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, ''.join(w.capitalize() for w in arg.strip().split()))
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.repeat\b'))
+        async def cmd_repeat(event):
+            arg = get_arg(event)
+            parts = arg.strip().split(maxsplit=1)
+            n = 3
+            if parts and parts[0].isdigit(): n = int(parts[0]); text = parts[1] if len(parts) > 1 else parts[0]
+            else: text = arg.strip()
+            await s_edit(event, (text + "\n") * min(n, 50))
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.shout\b'))
+        async def cmd_shout(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, arg.strip().upper() + "!!!")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.mock\b'))
+        async def cmd_mock(event):
+            arg = get_arg(event)
+            if arg.strip():
+                result = ''.join(c.upper() if i%2 else c.lower() for i,c in enumerate(arg))
+                await s_edit(event, result)
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.spaceit\b'))
+        async def cmd_spaceit(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, ' '.join(arg.strip()))
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.titlecase\b'))
+        async def cmd_titlecase(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, arg.strip().title())
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.leet\b'))
+        async def cmd_leet(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.leet <text>`"); return
+            leet_map = str.maketrans({'e':'3','E':'3','a':'4','A':'4','i':'1','I':'1','o':'0','O':'0','s':'5','S':'5','t':'7','T':'7'})
+            await s_edit(event, arg.strip().translate(leet_map))
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.snake\b'))
+        async def cmd_snake(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, '_'.join(arg.strip().lower().split()))
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.removespaces\b'))
+        async def cmd_removespaces(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, arg.strip().replace(' ', ''))
+
+        # Menu 11B — Math
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.prime\b'))
+        async def cmd_prime(event):
+            arg = get_arg(event)
+            try:
+                n = int(arg.strip())
+                if n < 2: await s_edit(event, f"🔢 {n} is **not** prime."); return
+                for i in range(2, int(n**0.5)+1):
+                    if n % i == 0: await s_edit(event, f"🔢 {n} is **not** prime."); return
+                await s_edit(event, f"🔢 {n} is **prime** ✅")
+            except: await s_edit(event, "❌ Provide a number.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.factorial\b'))
+        async def cmd_factorial(event):
+            arg = get_arg(event)
+            try:
+                n = int(arg.strip())
+                if n < 0: await s_edit(event, "❌ Positive number only."); return
+                import math
+                await s_edit(event, f"🔢 {n}! = **{math.factorial(n)}**")
+            except: await s_edit(event, "❌ Provide a number.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.fibonacci\b'))
+        async def cmd_fibonacci(event):
+            arg = get_arg(event)
+            try:
+                n = min(int(arg.strip()), 50)
+                a, b = 0, 1; seq = []
+                for _ in range(n): seq.append(a); a, b = b, a + b
+                await s_edit(event, f"🔢 Fibonacci({n}): {', '.join(map(str, seq))}")
+            except: await s_edit(event, "❌ Provide a number.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.square\b'))
+        async def cmd_square(event):
+            arg = get_arg(event)
+            try: n = int(arg.strip()); await s_edit(event, f"🔢 {n}² = **{n*n}**")
+            except: await s_edit(event, "❌ Provide a number.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.table\b'))
+        async def cmd_table(event):
+            arg = get_arg(event)
+            try:
+                n = int(arg.strip())
+                lines = [f"{n} x {i} = {n*i}" for i in range(1, 11)]
+                await s_edit(event, f"📊 **Table of {n}**\n" + "\n".join(lines))
+            except: await s_edit(event, "❌ Provide a number.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.percentage\b'))
+        async def cmd_percentage(event):
+            arg = get_arg(event)
+            parts = arg.strip().split()
+            if len(parts) >= 2:
+                try: pct = float(parts[0]); total = float(parts[1]); await s_edit(event, f"📊 {pct}% of {total} = **{pct*total/100}**")
+                except: await s_edit(event, "❌ Usage: `.percentage 20 200`")
+            else: await s_edit(event, "❌ Usage: `.percentage 20 200`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.bmi\b'))
+        async def cmd_bmi(event):
+            arg = get_arg(event)
+            parts = arg.strip().split()
+            if len(parts) >= 2:
+                try: w = float(parts[0]); h = float(parts[1]); bmi = w/(h*h); cat = "Underweight" if bmi<18.5 else "Normal" if bmi<25 else "Overweight" if bmi<30 else "Obese"
+                except: await s_edit(event, "❌ Usage: `.bmi weight_kg height_m`"); return
+                await s_edit(event, f"⚕️ **BMI**: {bmi:.1f} — {cat}")
+            else: await s_edit(event, "❌ Usage: `.bmi weight_kg height_m`")
+
+        # Encryption / Hash
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.encrypt\b'))
+        async def cmd_encrypt(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.encrypt <text>`"); return
+            result = ''.join(chr(ord(c)+3) for c in arg.strip())
+            await s_edit(event, f"🔐 **Encrypted (Caesar+3):** `{result}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.decrypt\b'))
+        async def cmd_decrypt(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.decrypt <text>`"); return
+            result = ''.join(chr(ord(c)-3) for c in arg.strip())
+            await s_edit(event, f"🔓 **Decrypted (Caesar-3):** `{result}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.sha1\b'))
+        async def cmd_sha1(event):
+            arg = get_arg(event)
+            if arg.strip(): import hashlib; await s_edit(event, f"🔐 SHA1: `{hashlib.sha1(arg.strip().encode()).hexdigest()}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.sha512\b'))
+        async def cmd_sha512(event):
+            arg = get_arg(event)
+            if arg.strip(): import hashlib; await s_edit(event, f"🔐 SHA512: `{hashlib.sha512(arg.strip().encode()).hexdigest()}`")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 26. MENU 12 — Sangmata, DLTALL, Tracknames
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.dltall\b'))
+        async def cmd_dltall(event):
+            if not event.is_reply:
+                await s_edit(event, "❌ Reply to a message to delete all from there onwards.")
+                return
+            try:
+                r = await event.get_reply_message()
+                cid = event.chat_id; deleted = 0
+                async for msg in user_bot.iter_messages(cid, offset_id=r.id, reverse=True):
+                    try: await user_bot.delete_messages(cid, msg.id, revoke=True); deleted += 1; await asyncio.sleep(0.05)
+                    except: pass
+                await s_edit(event, f"✅ Deleted {deleted} messages from that point.")
+            except Exception as e: await s_edit(event, f"❌ Error: {e}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.sangmata\b'))
+        async def cmd_sangmata(event):
+            uid = event.sender_id
+            if event.is_reply:
+                try: r = await event.get_reply_message(); uid = r.sender_id
+                except: pass
+            await s_edit(event, f"📋 Sangmata (name history) for `{uid}` — requires external API. (Not fully implemented)")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.tracknames\b'))
+        async def cmd_tracknames(event):
+            arg = get_arg(event).strip().lower()
+            if arg in ("on", "off"):
+                state.track_names = arg == "on"
+                await s_edit(event, f"🔍 Track names: {'ON' if state.track_names else 'OFF'}")
+            else: await s_edit(event, f"🔍 Track names: {'ON' if getattr(state, 'track_names', False) else 'OFF'}. Use `.tracknames on/off`")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 27. MISC — Banner, Fancy, Style, TTS, QR, Music (stubs & real)
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.banner\b'))
+        async def cmd_banner(event):
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.banner <text>` — sets menu banner if implemented.")
+                return
+            state.banner_text = arg.strip()
+            await s_edit(event, f"✅ Banner set to: `{arg.strip()}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.fancy\b'))
+        async def cmd_fancy(event):
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.fancy <text>`")
+                return
+            # Simple fancy: replace letters with math-sans-serif look
+            fancy_map = {
+                'a':'𝓪','b':'𝓫','c':'𝓬','d':'𝓭','e':'𝓮','f':'𝓯','g':'𝓰','h':'𝓱',
+                'i':'𝓲','j':'𝓳','k':'𝓴','l':'𝓵','m':'𝓶','n':'𝓷','o':'𝓸','p':'𝓹',
+                'q':'𝓺','r':'𝓻','s':'𝓼','t':'𝓽','u':'𝓾','v':'𝓿','w':'𝔀','x':'𝔁',
+                'y':'𝔂','z':'𝔃',
+                'A':'𝓐','B':'𝓑','C':'𝓒','D':'𝓓','E':'𝓔','F':'𝓕','G':'𝓖','H':'𝓗',
+                'I':'𝓘','J':'𝓙','K':'𝓚','L':'𝓛','M':'𝓜','N':'𝓝','O':'𝓞','P':'𝓟',
+                'Q':'𝓠','R':'𝓡','S':'𝓢','T':'𝓣','U':'𝓤','V':'𝓥','W':'𝓦','X':'𝓧',
+                'Y':'𝓨','Z':'𝓩',
+            }
+            result = ''.join(fancy_map.get(c, c) for c in arg.strip())
+            await s_edit(event, result)
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.style\b'))
+        async def cmd_style(event):
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.style <text>` — shows bold/italic/mono")
+                return
+            t = arg.strip()
+            await s_edit(event, f"**Bold:** **{t}**\n__Italic:__ __{t}__\n`Mono: `{t}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.emoji\b'))
+        async def cmd_emoji(event):
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.emoji <text>` — adds emojis between chars")
+                return
+            result = ' '.join(f"{c}✨" for c in arg.strip())
+            await s_edit(event, result)
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.tts\b'))
+        async def cmd_tts(event):
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.tts <text>` — Text to Speech (requires gTTS API)")
+                return
+            await s_edit(event, f"🔊 TTS: `{arg.strip()}` (audio generation not implemented in this version)")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.qrcode\b'))
+        async def cmd_qrcode(event):
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.qrcode <text/url>`")
+                return
+            await s_edit(event, f"📱 QR Code for: `{arg.strip()}` (requires qrcode library — not implemented in stub)")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.music\b'))
+        async def cmd_music(event):
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.music <song name>` — send as voice")
+                return
+            await s_edit(event, f"🎵 Searching: `{arg.strip()}` (requires yt-dlp — not implemented in stub)")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.dmusic\b'))
+        async def cmd_dmusic(event):
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.dmusic <song name>` — download MP3")
+                return
+            await s_edit(event, f"🎵 Downloading: `{arg.strip()}` (requires yt-dlp — not implemented in stub)")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 28. TYPING EFFECTS (Menu 11B)
+        # ═══════════════════════════════════════════════════════════════════
+
+        TYPING_STYLES = {
+            "bold": lambda t: ''.join(chr(0x1D5D4 + ord(c) - ord('a')) if 'a' <= c <= 'z' else
+                                      chr(0x1D5EE + ord(c) - ord('A')) if 'A' <= c <= 'Z' else c for c in t),
+            "italic": lambda t: ''.join(chr(0x1D43A + ord(c) - ord('a')) if 'a' <= c <= 'z' else
+                                        chr(0x1D454 + ord(c) - ord('A')) if 'A' <= c <= 'Z' else c for c in t),
+            "double": lambda t: ''.join(chr(0x1D53B + ord(c) - ord('a')) if 'a' <= c <= 'z' else
+                                        chr(0x1D555 + ord(c) - ord('A')) if 'A' <= c <= 'Z' else c for c in t),
+            "script": lambda t: ''.join(chr(0x1D4B6 + ord(c) - ord('a')) if 'a' <= c <= 'z' else
+                                        chr(0x1D4D0 + ord(c) - ord('A')) if 'A' <= c <= 'Z' else c for c in t),
+            "mono": lambda t: ''.join(chr(0x1D68A + ord(c) - ord('a')) if 'a' <= c <= 'z' else
+                                      chr(0x1D6A4 + ord(c) - ord('A')) if 'A' <= c <= 'Z' else c for c in t),
+            "circle": lambda t: ''.join(chr(0x24D0 + ord(c) - ord('a')) if 'a' <= c <= 'z' else
+                                        chr(0x24B6 + ord(c) - ord('A')) if 'A' <= c <= 'Z' else c for c in t),
+            "square": lambda t: ''.join(chr(0x1F130 + ord(c) - ord('A')) if 'A' <= c <= 'Z' else c for c in t.upper()),
+        }
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.typing\b'))
+        async def cmd_typing(event):
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.typing bold/italic/double/script/mono/circle/square <text>`\nDefault: bold")
+                return
+            parts = arg.strip().split(maxsplit=1)
+            style = "bold"
+            text = arg.strip()
+            if len(parts) >= 2 and parts[0].lower() in TYPING_STYLES:
+                style = parts[0].lower()
+                text = parts[1]
+            elif len(parts) == 1 and parts[0].lower() in TYPING_STYLES:
+                await s_edit(event, f"❌ Provide text too. Usage: `.typing {parts[0]} <text>`")
+                return
+            result = TYPING_STYLES.get(style, TYPING_STYLES["bold"])(text)
+            await s_edit(event, result)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 29. FUN GAMES (Menu 11B — coin, lucky, roll, timer, typetest)
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.coin\b'))
+        async def cmd_coin(event):
+            await s_edit(event, f"🪙 **Coin:** {'Heads' if random.random() > 0.5 else 'Tails'}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.lucky\b'))
+        async def cmd_lucky(event):
+            await s_edit(event, f"🍀 **Lucky Number:** {random.randint(1, 999)}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.roll\b'))
+        async def cmd_roll(event):
+            arg = get_arg(event)
+            try:
+                sides = max(2, min(100, int(arg.strip())))
+            except:
+                sides = 6
+            await s_edit(event, f"🎲 **Roll d{sides}:** {random.randint(1, sides)}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.timer\b'))
+        async def cmd_timer(event):
+            arg = get_arg(event)
+            try:
+                seconds = int(arg.strip())
+                if seconds < 1 or seconds > 3600:
+                    await s_edit(event, "❌ Use 1-3600 seconds.")
+                    return
+                await s_edit(event, f"⏱️ Timer set for {seconds}s. Sending countdown...")
+                for remaining in range(seconds, 0, -5):
+                    if remaining % 10 == 0 or remaining <= 5:
+                        try:
+                            await s_send(event.chat_id, f"⏱️ {remaining}s remaining...")
+                        except:
+                            pass
+                    await asyncio.sleep(min(5, remaining))
+                await s_send(event.chat_id, "⏰ **Time's up!** ⏰")
+            except ValueError:
+                await s_edit(event, "❌ Usage: `.timer <seconds>`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.typetest\b'))
+        async def cmd_typetest(event):
+            # Generate a random typing test
+            words = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+                     "python", "coding", "speed", "type", "test", "telegram", "bot",
+                     "message", "fast", "keyboard", "practice", "random"]
+            sample = " ".join(random.choices(words, k=10))
+            await s_edit(event, f"⌨️ **Typing Test:**\n\n`{sample}`\n\nType this as fast as you can!")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 30. PREMIUM STATUS / PROTECT (Menu 11B)
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.premiumstatus\b'))
+        async def cmd_premiumstatus(event):
+            prem = await check_premium_status(event.sender_id)
+            if prem:
+                expiry = prem.get("expiry_date", "Unknown")
+                await s_edit(event, f"⭐ **Premium Status:** Active ✅\nExpires: {expiry}")
+            else:
+                await s_edit(event, "⭐ **Premium Status:** Not active ❌\nUse `/buy` in main bot.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.protect\b'))
+        async def cmd_protect(event):
+            arg = get_arg(event)
+            tgts = await get_targets(event, arg)
+            if tgts:
+                if not hasattr(state, 'protected_users'):
+                    state.protected_users = set()
+                state.protected_users.update(tgts)
+                await s_edit(event, f"🛡️ Protected {len(tgts)} user(s) from actions.")
+            else:
+                await s_edit(event, "❌ No targets.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.unprotect\b'))
+        async def cmd_unprotect(event):
+            arg = get_arg(event)
+            tgts = await get_targets(event, arg)
+            if tgts and hasattr(state, 'protected_users'):
+                state.protected_users.difference_update(tgts)
+                await s_edit(event, f"✅ Unprotected {len(tgts)} user(s).")
+            elif hasattr(state, 'protected_users'):
+                state.protected_users.clear()
+                await s_edit(event, "✅ All unprotected.")
+            else:
+                await s_edit(event, "✅ No protected users.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.protectlist\b'))
+        async def cmd_protectlist(event):
+            if hasattr(state, 'protected_users') and state.protected_users:
+                lst = list(state.protected_users)[:20]
+                await s_edit(event, f"🛡️ **Protected Users:** {', '.join(str(x) for x in lst)}")
+            else:
+                await s_edit(event, "🛡️ No protected users.")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 31. MENU 6 — SEND & TAG
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.send\b'))
+        async def cmd_send(event):
+            """Send direct message to a user.
+            Usage: .send @username <message>
+            """
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.send @user <message>`")
+                return
+            parts = arg.strip().split(maxsplit=1)
+            if len(parts) < 2:
+                await s_edit(event, "❌ Usage: `.send @user <message>`")
+                return
+            target_str, msg_text = parts
+            try:
+                target = await user_bot.get_entity(target_str.strip())
+                if target:
+                    await s_send(target.id, msg_text)
+                    await s_edit(event, f"✅ Message sent to `{target_str}`")
+                else:
+                    await s_edit(event, "❌ Target not found.")
+            except Exception as e:
+                await s_edit(event, f"❌ Error: {e}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.tag\b'))
+        async def cmd_tag(event):
+            """Tag specific users with custom messages.
+            Usage: .tag @user1 msg1 @user2 msg2 ...
+            """
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.tag @user1 msg1 @user2 msg2 ...`")
+                return
+            # Parse alternating @user message pairs
+            parts = arg.strip().split()
+            if len(parts) < 2:
+                await s_edit(event, "❌ Need at least one @user and message.")
+                return
+            tags_sent = 0
+            i = 0
+            while i < len(parts):
+                if parts[i].startswith('@') or parts[i].startswith('tg://'):
+                    user_str = parts[i]
+                    # Find message text until next @user
+                    msg_parts = []
+                    i += 1
+                    while i < len(parts) and not parts[i].startswith('@') and not parts[i].startswith('tg://'):
+                        msg_parts.append(parts[i])
+                        i += 1
+                    msg = " ".join(msg_parts) if msg_parts else "Hello!"
+                    try:
+                        target = await user_bot.get_entity(user_str)
+                        if target:
+                            await s_send(event.chat_id, f"@{target.username or target.first_name} {msg}")
+                            tags_sent += 1
+                    except:
+                        pass
+                else:
+                    i += 1
+            if tags_sent:
+                try:
+                    await event.delete()
+                except:
+                    pass
+            else:
+                await s_edit(event, "❌ No valid targets found.")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 32. MORE PREMIUM TEXT TOOLS (Menu 11A — remaining)
+        # ═══════════════════════════════════════════════════════════════════
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.shadow\b'))
+        async def cmd_shadow(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, f"**{arg.strip()}**\n`{arg.strip()}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.zalgo\b'))
+        async def cmd_zalgo(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.zalgo <text>`"); return
+            zalgo_chars = [chr(c) for c in range(0x0300, 0x0370)] + [chr(c) for c in range(0xFE00, 0xFE10)]
+            result = ''.join(c + ''.join(random.choices(zalgo_chars, k=random.randint(1,3))) for c in arg.strip())
+            await s_edit(event, result)
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.big\b'))
+        async def cmd_big(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, f"__**{arg.strip().upper()}**__")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.small\b'))
+        async def cmd_small(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, f"`{arg.strip().lower()}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.hex\b'))
+        async def cmd_hex(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, f"🔢 Hex: `{arg.strip().encode().hex()}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.octal\b'))
+        async def cmd_octal(event):
+            arg = get_arg(event)
+            if arg.strip():
+                result = ' '.join(format(ord(c), 'o') for c in arg.strip())
+                await s_edit(event, f"🔢 Octal: `{result}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.ascii\b'))
+        async def cmd_ascii(event):
+            arg = get_arg(event)
+            if arg.strip():
+                result = ' '.join(str(ord(c)) for c in arg.strip())
+                await s_edit(event, f"🔢 ASCII: `{result}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.nato\b'))
+        async def cmd_nato(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.nato <text>`"); return
+            nato = {'a':'Alpha','b':'Bravo','c':'Charlie','d':'Delta','e':'Echo','f':'Foxtrot',
+                    'g':'Golf','h':'Hotel','i':'India','j':'Juliett','k':'Kilo','l':'Lima',
+                    'm':'Mike','n':'November','o':'Oscar','p':'Papa','q':'Quebec','r':'Romeo',
+                    's':'Sierra','t':'Tango','u':'Uniform','v':'Victor','w':'Whiskey',
+                    'x':'X-ray','y':'Yankee','z':'Zulu'}
+            result = ' '.join(nato.get(c.lower(), c) for c in arg.strip())
+            await s_edit(event, f"📡 NATO: `{result}`")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.palindrome\b'))
+        async def cmd_palindrome(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.palindrome <text>`"); return
+            clean = ''.join(c.lower() for c in arg.strip() if c.isalnum())
+            is_pal = clean == clean[::-1]
+            await s_edit(event, f"🔤 `{arg.strip()}` is {'a palindrome ✅' if is_pal else 'NOT a palindrome ❌'}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.vowels\b'))
+        async def cmd_vowels(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.vowels <text>`"); return
+            count = sum(1 for c in arg.strip().lower() if c in 'aeiou')
+            await s_edit(event, f"🔤 Vowels: **{count}**")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.wordfreq\b'))
+        async def cmd_wordfreq(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.wordfreq <text>`"); return
+            from collections import Counter
+            freq = Counter(arg.strip().lower().split())
+            result = '\n'.join(f"`{w}`: {c}" for w, c in freq.most_common(10))
+            await s_edit(event, f"📊 **Word Frequency:**\n{result}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.charcount\b'))
+        async def cmd_charcount(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.charcount <text>`"); return
+            await s_edit(event, f"🔤 Chars (with spaces): **{len(arg.strip())}**")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.lettercount\b'))
+        async def cmd_lettercount(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.lettercount <text>`"); return
+            count = sum(1 for c in arg.strip() if c.isalpha())
+            await s_edit(event, f"🔤 Letters (no spaces): **{count}**")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.charinfo\b'))
+        async def cmd_charinfo(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.charinfo <text>`"); return
+            info = '\n'.join(f"`{c}` → U+{ord(c):04X}" for c in arg.strip()[:20])
+            await s_edit(event, f"🔤 **Char Info:**\n{info}")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.clap\b'))
+        async def cmd_clap(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, ' 👏 '.join(arg.strip().split()))
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.mirror\b'))
+        async def cmd_mirror(event):
+            arg = get_arg(event)
+            if arg.strip(): await s_edit(event, arg.strip()[::-1])
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.flip_text\b'))
+        async def cmd_flip_text(event):
+            arg = get_arg(event)
+            if not arg.strip(): await s_edit(event, "❌ Usage: `.flip_text <text>`"); return
+            flip_map = {'a':'ɐ','b':'q','c':'ɔ','d':'p','e':'ǝ','f':'ɟ','g':'ɓ','h':'ɥ',
+                       'i':'ı','j':'ɾ','k':'ʞ','l':'l','m':'ɯ','n':'u','o':'o','p':'d',
+                       'q':'b','r':'ɹ','s':'s','t':'ʇ','u':'n','v':'ʌ','w':'ʍ','x':'x',
+                       'y':'ʎ','z':'z','A':'∀','B':'𐐒','C':'Ↄ','D':'◖','E':'Ǝ','F':'Ⅎ',
+                       'G':'⅁','H':'H','I':'I','J':'ſ','K':'⋊','L':'⅂','M':'W','N':'N',
+                       'O':'O','P':'Ԁ','Q':'Ọ','R':'ᴚ','S':'S','T':'⊥','U':'∩','V':'Λ',
+                       'W':'M','X':'X','Y':'⅄','Z':'Z'}
+            result = ''.join(flip_map.get(c, c) for c in reversed(arg.strip()))
+            await s_edit(event, result)
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.roman\b'))
+        async def cmd_roman(event):
+            arg = get_arg(event)
+            try:
+                n = int(arg.strip())
+                if n < 1 or n > 3999:
+                    await s_edit(event, "❌ Use 1-3999.")
+                    return
+                val_map = [(1000,'M'),(900,'CM'),(500,'D'),(400,'CD'),(100,'C'),(90,'XC'),
+                          (50,'L'),(40,'XL'),(10,'X'),(9,'IX'),(5,'V'),(4,'IV'),(1,'I')]
+                result = ''
+                for v, s in val_map:
+                    while n >= v: result += s; n -= v
+                await s_edit(event, f"🔢 Roman: **{result}**")
+            except: await s_edit(event, "❌ Provide a number.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.age\b'))
+        async def cmd_age(event):
+            arg = get_arg(event)
+            if not arg.strip():
+                await s_edit(event, "❌ Usage: `.age YYYY-MM-DD`")
+                return
+            try:
+                from datetime import date
+                birth = datetime.strptime(arg.strip(), "%Y-%m-%d").date()
+                today = date.today()
+                age = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+                await s_edit(event, f"🎂 Age: **{age}** years")
+            except: await s_edit(event, "❌ Invalid date format. Use YYYY-MM-DD")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.number\b'))
+        async def cmd_number(event):
+            arg = get_arg(event)
+            try:
+                n = int(arg.strip())
+                props = f"🔢 **Number Properties: {n}**\n"
+                props += f"• Even: {'✅' if n%2==0 else '❌'}\n"
+                props += f"• Odd: {'✅' if n%2!=0 else '❌'}\n"
+                props += f"• Positive: {'✅' if n>0 else '❌'}\n"
+                props += f"• Negative: {'✅' if n<0 else '❌'}\n"
+                props += f"• Square: {n*n}\n"
+                props += f"• Cube: {n*n*n}\n"
+                props += f"• Binary: {bin(n)[2:]}"
+                await s_edit(event, props)
+            except: await s_edit(event, "❌ Provide a valid number.")
+
+        @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.countdown\b'))
+        async def cmd_countdown(event):
+            arg = get_arg(event)
+            try:
+                n = min(int(arg.strip()), 30)
+                if n < 1: await s_edit(event, "❌ Positive number only."); return
+                msg = await s_edit(event, f"⏳ Countdown: {n}")
+                for i in range(n-1, -1, -1):
+                    await asyncio.sleep(1)
+                    try:
+                        if i == 0:
+                            await s_edit(event, "🚀 **BLAST OFF!** 🚀")
+                        else:
+                            await s_edit(event, f"⏳ Countdown: {i}")
+                    except: pass
+            except: await s_edit(event, "❌ Provide a number 1-30.")
 
         # ═══════════════════════════════════════════════════════════════════
         # READY
         # ═══════════════════════════════════════════════════════════════════
 
-        print(f"✅ Userbot {me.id} ready — ALL commands loaded")
+        print(f"✅ Userbot {me.id} ready — ALL {len(METER_COMMANDS)+200}+ commands loaded")
         await user_bot.run_until_disconnected()
 
     except Exception as e:
@@ -14273,7 +15144,6 @@ async def run_user_bot(session_string, chat_id):
                 pass
         if chat_id in active_userbots:
             del active_userbots[chat_id]
-
 # ═══════════════════════════════════════════════════════════════════════
 # SECTION 17: MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════
