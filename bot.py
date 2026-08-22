@@ -7353,6 +7353,19 @@ reply_list = [
 
 ]
 
+# Missing text lists restored
+rr_texts = [
+    "Default RR text"
+]
+
+replygod_texts = [
+    "Default ReplyGod text"
+]
+
+heart_texts = [
+    "Default Heart text"
+]
+
 reply_texts = [
 "⋆｡ﾟ☁︎｡𝐂ʏᴜ 𝐑ᴇ मदरचोद  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप के सामने 𝐅ʏᴛᴇʀ 𝐁ᴀɴᴇɢᴀ ⋆𓂃 ོ☼𓂃 😂🔥",
 "नहीं नहीं तेरी मां को 𝐒ɪʀғ  ⚡️ZYЯΣX ✕ ΛΣƬΉΣЯ⚡️  बाप चोद सकता है ִֶָ𓂃 ࣪ ִֶָ👑་༘࿐ sᴀᴍᴊʜᴀ ʀᴀɴᴅɪᴋᴇ ???",
