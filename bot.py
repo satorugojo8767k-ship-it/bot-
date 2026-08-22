@@ -12935,8 +12935,8 @@ async def run_user_bot(session_string, chat_id):
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.deathgod\b'))
         async def cmd_deathgod(event):
             arg = get_arg(event)
-            if not deathgod_texts:
-                await s_edit(event, "❌ deathgod_texts is empty.")
+            if not deathgod_replies:
+                await s_edit(event, "❌ deathgod_replies is empty.")
                 return
             tgts = await get_targets(event, arg)
             if not tgts:
@@ -12948,7 +12948,7 @@ async def run_user_bot(session_string, chat_id):
             await s_edit(event, f"☠️ DeathGod `{did}` started on {len(tgts)} target(s). `.sdeathgod {did}` to stop")
             while state.deathgod_on.get(did, {}).get("active"):
                 try:
-                    txt = random.choice(deathgod_texts)
+                    txt = random.choice(deathgod_replies)
                     for uid in tgts:
                         try:
                             await s_send(cid, txt, reply_to=uid)
@@ -13098,8 +13098,8 @@ async def run_user_bot(session_string, chat_id):
             if not tgts:
                 await s_edit(event, "❌ No targets.")
                 return
-            if not deathgod_texts:
-                await s_edit(event, "❌ deathgod_texts is empty.")
+            if not deathgod_replies:
+                await s_edit(event, "❌ deathgod_replies is empty.")
                 return
             cid = event.chat_id
             sid = f"dspray_{cid}_{random.randint(1000,9999)}"
@@ -13107,7 +13107,7 @@ async def run_user_bot(session_string, chat_id):
             await s_edit(event, f"🌀 DeathSpray `{sid}` started. Use `.stopspray`")
             while state.spray_tasks.get(sid, {}).get("active"):
                 try:
-                    txt = random.choice(deathgod_texts)
+                    txt = random.choice(deathgod_replies)
                     for uid in tgts:
                         try:
                             await s_send(cid, txt, reply_to=uid)
@@ -14090,7 +14090,7 @@ async def run_user_bot(session_string, chat_id):
         LIST_MAP = {
             "reply": reply_texts, "rr": rr_texts, "flag": flag_texts,
             "hrr": hrr_texts, "replygod": replygod_texts,
-            "deathgod": deathgod_texts, "ows": ows_texts,
+            "deathgod": deathgod_replies, "ows": ows_texts,
             "shayari": shayari_texts, "rizz": rizz_texts,
             "pickup": pickup_texts, "romance": romance_texts,
             "troll": troll_texts, "ragebait": ragebait_texts, "roast": roast_texts,
