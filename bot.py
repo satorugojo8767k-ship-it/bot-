@@ -13612,54 +13612,47 @@ async def run_user_bot(session_string, chat_id):
         # ═══════════════════════════════════════════════════════════════════
         # 10. DLTALL — Reply to msg, delete everything from there onwards (no limit)
         # ═══════════════════════════════════════════════════════════════════
-
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.dltall\b'))
         async def cmd_dltall(event, arg=""):
+            if event.sender_id not in OWNER_IDS:
+                return
             if not event.is_reply:
-                await s_edit(event, "❌ Reply to a message to delete everything from there onwards.")
+                await s_edit(event, "❌ Reply to the first message to delete everything after it.")
                 return
             try:
                 reply_msg = await event.get_reply_message()
-                if not reply_msg: await s_edit(event, "❌ Could not fetch replied message."); return
-                from_id = reply_msg.id; cid = event.chat_id
-                await s_edit(event, f"🗑️ Deleting all messages from ID {from_id} onwards... (no limit)")
-                deleted_total = 0; batch_size = 100
-                while True:
-                    ids_to_delete = []
-                    async for msg in user_bot.iter_messages(cid, min_id=from_id - 1, reverse=True, limit=batch_size):
-                        if msg.id >= from_id: ids_to_delete.append(msg.id)
-                    if not ids_to_delete: break
-                    try:
-                        await user_bot.delete_messages(cid, ids_to_delete, revoke=True)
-                        deleted_total += len(ids_to_delete)
-                        from_id = max(ids_to_delete) + 1
-                    except FloodWaitError as e: await asyncio.sleep(e.seconds + 1); continue
-                    except Exception as e: print(f"[dltall] batch error: {e}"); break
-                    await asyncio.sleep(0.5)
-                    if len(ids_to_delete) < batch_size: break
-                await s_edit(event, f"✅ Deleted **{deleted_total}** messages from ID {reply_msg.id} onwards.")
-            except Exception as e: await s_edit(event, f"❌ Error: {str(e)[:100]}")
-
-        # ═══════════════════════════════════════════════════════════════════
-        # 11. CLEARME — Delete all private chat dialogs
-        # ═══════════════════════════════════════════════════════════════════
+                cid = event.chat_id
+                count = 0
+                async for msg in user_bot.iter_messages(cid, min_id=reply_msg.id - 1):
+                    if msg.out:
+                        try:
+                            await msg.delete()
+                            count += 1
+                        except:
+                            pass
+                await s_edit(event, f"✅ Deleted {count} message(s) from reply to end.")
+            except Exception as e:
+                await s_edit(event, f"❌ Error: {e}")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.clearme\b'))
         async def cmd_clearme(event, arg=""):
-            await s_edit(event, "🗑️ Deleting all private chats... This may take a while.")
-            deleted_count = 0
-            try:
-                async for dialog in user_bot.iter_dialogs():
+            if event.sender_id not in OWNER_ETS:
+                return
+            count = 0
+            async for dialog in user_bot.iter_dialogs():
+                if dialog.is_user and not dialog.entity.bot:
                     try:
-                        if dialog.is_user and not dialog.is_group and not dialog.is_channel:
-                            await user_bot.delete_dialog(dialog.id)
-                            deleted_count += 1
-                            await asyncio.sleep(0.3)
-                    except FloodWaitError as e: await asyncio.sleep(e.seconds + 1)
-                    except: pass
-                await s_edit(event, f"✅ Deleted **{deleted_count}** private chat(s) from your account.")
-            except Exception as e: await s_edit(event, f"❌ Error: {str(e)[:100]}")
-
+                        cid = dialog.id
+                        async for msg in user_bot.iter_messages(cid, from_user="me"):
+                            try:
+                                await msg.delete()
+                                count += 1
+                            except:
+                                pass
+                    except:
+                        pass
+            await s_edit(event, f"✅ Cleared {count} message(s) from all private chats.")
+            
         # ═══════════════════════════════════════════════════════════════════
         # 12. CLONE / REVERT
         # ═══════════════════════════════════════════════════════════════════
