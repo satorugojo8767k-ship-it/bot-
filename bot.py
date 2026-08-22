@@ -13804,51 +13804,74 @@ async def run_user_bot(session_string, chat_id):
                     try: await event.reply("🛡️ DM Shield Active. Use `/login` in main bot to contact.")
                     except: pass
 
-        # ═══════════════════════════════════════════════════════════════════
+  # ═══════════════════════════════════════════════════════════════════
         # 16. FILTER / NOTE
         # ═══════════════════════════════════════════════════════════════════
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.filter\b'))
-        async def cmd_filter(event, arg=""):
+        async def cmd_filter(event):
+            arg = event.text.split(maxsplit=1)[1] if len(event.text.split(maxsplit=1)) > 1 else ""
             parts = arg.strip().split(" ", 1)
-            if len(parts) < 2: await s_edit(event, "❌ Usage: `.filter keyword response`"); return
+            if len(parts) < 2:
+                await s_edit(event, "❌ Usage: `.filter keyword response`")
+                return
             kw, resp = parts
             state.filter_map[kw.lower()] = resp
             await s_edit(event, f"✅ Filter `{kw}` added.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.delfilter\b'))
-        async def cmd_delfilter(event, arg=""):
+        async def cmd_delfilter(event):
+            arg = event.text.split(maxsplit=1)[1] if len(event.text.split(maxsplit=1)) > 1 else ""
             kw = arg.strip().lower()
-            if kw in state.filter_map: del state.filter_map[kw]; await s_edit(event, f"✅ Filter `{kw}` removed.")
-            else: await s_edit(event, "❌ Filter not found.")
+            if kw in state.filter_map:
+                del state.filter_map[kw]
+                await s_edit(event, f"✅ Filter `{kw}` removed.")
+            else:
+                await s_edit(event, "❌ Filter not found.")
 
         @user_bot.on(events.NewMessage(incoming=True))
         async def filter_handler(event):
-            if not event.text: return
-            if event.sender_id in (me.id, BOT_ID): return
+            if not event.text:
+                return
+            if event.sender_id in (me.id, BOT_ID):
+                return
             for kw, resp in state.filter_map.items():
                 if kw in event.text.lower():
-                    try: await event.reply(resp)
-                    except: pass; break
+                    try:
+                        await event.reply(resp)
+                    except:
+                        pass
+                    break
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.note\b'))
-        async def cmd_note(event, arg=""):
+        async def cmd_note(event):
+            arg = event.text.split(maxsplit=1)[1] if len(event.text.split(maxsplit=1)) > 1 else ""
             parts = arg.strip().split(" ", 1)
-            if len(parts) < 2: await s_edit(event, "❌ Usage: `.note name content`"); return
-            nname, ncontent = parts; state.notes[nname] = ncontent
+            if len(parts) < 2:
+                await s_edit(event, "❌ Usage: `.note name content`")
+                return
+            nname, ncontent = parts
+            state.notes[nname] = ncontent
             await s_edit(event, f"✅ Note `{nname}` saved.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.getnote\b'))
-        async def cmd_getnote(event, arg=""):
+        async def cmd_getnote(event):
+            arg = event.text.split(maxsplit=1)[1] if len(event.text.split(maxsplit=1)) > 1 else ""
             nname = arg.strip()
-            if nname in state.notes: await s_edit(event, f"📝 **{nname}**:\n{state.notes[nname]}")
-            else: await s_edit(event, "❌ Note not found.")
+            if nname in state.notes:
+                await s_edit(event, f"📝 **{nname}**:\n{state.notes[nname]}")
+            else:
+                await s_edit(event, "❌ Note not found.")
 
         @user_bot.on(events.NewMessage(outgoing=True, pattern=r'\.delnote\b'))
-        async def cmd_delnote(event, arg=""):
+        async def cmd_delnote(event):
+            arg = event.text.split(maxsplit=1)[1] if len(event.text.split(maxsplit=1)) > 1 else ""
             nname = arg.strip()
-            if nname in state.notes: del state.notes[nname]; await s_edit(event, f"✅ Note `{nname}` deleted.")
-            else: await s_edit(event, "❌ Note not found.")
+            if nname in state.notes:
+                del state.notes[nname]
+                await s_edit(event, f"✅ Note `{nname}` deleted.")
+            else:
+                await s_edit(event, "❌ Note not found.")
 
         # ═══════════════════════════════════════════════════════════════════
         # 17. ANTI-DELETE / WATCH / LOCK / FREEZE
